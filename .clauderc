@@ -1,0 +1,3 @@
+# Claude Code Project Configuration
+# Read and follow instructions in AGENTS.md
+systemPromptExtra: "Please read and follow the instructions in AGENTS.md: file:///home/ktobias/git/etr/AGENTS.md"
