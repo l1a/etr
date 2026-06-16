@@ -7,7 +7,7 @@ use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UdpSocket, UnixListener, UnixStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, mpsc};
 
 static VERBOSITY: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
@@ -41,15 +41,6 @@ fn payload_type(p: Option<&etr::protocol::Payload>) -> &'static str {
     }
 }
 
-fn default_socket_path() -> String {
-    dirs::runtime_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-        .join("etr")
-        .join("etrs.sock")
-        .to_string_lossy()
-        .into_owned()
-}
-
 use etr::handshake::process_client_hello;
 use etr::protocol::{Disconnect, Envelope, Heartbeat, PacketHeader, Payload, StreamData};
 use etr::session::SessionState;
@@ -67,15 +58,11 @@ struct Cli {
     port: u16,
 
     /// IP address to bind the UDP listener to.
-    #[arg(short, long, default_value = "0.0.0.0")]
+    #[arg(short, long, default_value = "[::]")]
     bind: String,
 
-    /// Path to the Unix domain socket used for local session registration.
-    #[arg(short, long, default_value_t = default_socket_path())]
-    socket: String,
-
     /// Verbosity: -v session events, -vv cipher details, -vvv packet trace
-    #[arg(short = 'v', action = ArgAction::Count)]
+    #[arg(short = 'v', action = ArgAction::Count, global = true)]
     verbose: u8,
 
     #[command(subcommand)]
@@ -117,24 +104,27 @@ async fn main() -> io::Result<()> {
         }
     });
     match cmd {
-        Commands::Daemon => run_daemon(cli.bind, cli.port, cli.socket).await,
-        Commands::Register => run_register(cli.socket).await,
+        Commands::Daemon => run_daemon(cli.bind, cli.port).await,
+        Commands::Register => run_register().await,
     }
 }
 
-async fn run_register(socket_path: String) -> io::Result<()> {
+async fn run_register() -> io::Result<()> {
     // run_register is invoked via SSH; keep its output minimal.
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
     let input = input.trim();
     let parts: Vec<&str> = input.split('/').collect();
-    if parts.len() < 3 {
+    if parts.len() < 4 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "Expected SESSION_ID_HEX/PASSKEY/TERM",
+            "Expected SESSION_ID_HEX/PASSKEY/TERM/REG_PORT",
         ));
     }
-    let mut stream = UnixStream::connect(&socket_path).await?;
+    let reg_port: u16 = parts[3]
+        .parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid reg_port"))?;
+    let mut stream = TcpStream::connect(("127.0.0.1", reg_port)).await?;
     stream
         .write_all(format!("{}/{}/{}\n", parts[0], parts[1], parts[2]).as_bytes())
         .await?;
@@ -153,19 +143,21 @@ async fn run_register(socket_path: String) -> io::Result<()> {
     }
 }
 
-async fn run_daemon(bind_addr: String, port: u16, socket_path: String) -> io::Result<()> {
+async fn run_daemon(bind_addr: String, port: u16) -> io::Result<()> {
     eprintln!("Starting etrs daemon...");
     let sessions: SessionMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
-    if let Some(parent) = std::path::Path::new(&socket_path).parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let _ = std::fs::remove_file(&socket_path);
 
-    // Unix socket for SSH-bootstrapped registration.
-    let unix_listener = UnixListener::bind(&socket_path)?;
+    // TCP listener on localhost for SSH-bootstrapped registration.
+    // Port is fixed at UDP_port+1 so client and server always agree.
+    let reg_port = port + 1;
+    let reg_addr: SocketAddr = format!("127.0.0.1:{}", reg_port)
+        .parse()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let tcp_listener = TcpListener::bind(reg_addr).await?;
+    vlog!(1, "[etrs] Registration listener on {}", reg_addr);
     let sessions_reg = Arc::clone(&sessions);
     tokio::spawn(async move {
-        while let Ok((stream, _)) = unix_listener.accept().await {
+        while let Ok((stream, _)) = tcp_listener.accept().await {
             let sess = Arc::clone(&sessions_reg);
             tokio::spawn(async move {
                 if let Err(e) = handle_registration(stream, sess).await {
@@ -215,7 +207,7 @@ async fn run_daemon(bind_addr: String, port: u16, socket_path: String) -> io::Re
     }
 }
 
-async fn handle_registration(mut stream: UnixStream, sessions: SessionMap) -> io::Result<()> {
+async fn handle_registration(mut stream: TcpStream, sessions: SessionMap) -> io::Result<()> {
     let mut buf = vec![0u8; 1024];
     let n = stream.read(&mut buf).await?;
     let msg = String::from_utf8_lossy(&buf[..n]);
@@ -599,8 +591,7 @@ mod tests {
     fn test_cli_defaults() {
         let cli = Cli::try_parse_from(["etrs"]).unwrap();
         assert_eq!(cli.port, 2022);
-        assert_eq!(cli.bind, "0.0.0.0");
-        assert_eq!(cli.socket, default_socket_path());
+        assert_eq!(cli.bind, "[::]");
         assert_eq!(cli.verbose, 0);
     }
 

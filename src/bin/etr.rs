@@ -4,7 +4,7 @@ use clap_complete::Shell;
 use clap_complete_nushell::Nushell;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::net::SocketAddr;
 use std::process::Command;
 use std::sync::Arc;
@@ -14,13 +14,32 @@ use tokio::sync::{Mutex, mpsc};
 
 use etr::crypto::{CipherSuiteId, generate_session_id};
 
-/// Log to stderr if `$verbose >= $level`.
+/// When running interactively, verbose logs go here instead of stderr so they
+/// don't corrupt the raw-mode terminal display.
+static LOG_FILE: std::sync::OnceLock<std::sync::Mutex<std::fs::File>> = std::sync::OnceLock::new();
+
+/// Log at `$level` — writes to the log file in interactive mode, stderr otherwise.
 macro_rules! vlog {
     ($verbose:expr, $level:expr, $($arg:tt)*) => {
         if $verbose >= $level {
-            eprintln!($($arg)*);
+            if let Some(f) = LOG_FILE.get() {
+                let _ = writeln!(f.lock().unwrap(), $($arg)*);
+            } else {
+                eprintln!($($arg)*);
+            }
         }
     };
+}
+
+fn client_log_path() -> std::path::PathBuf {
+    dirs::state_dir()
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+                .join(".local/state")
+        })
+        .join("etr")
+        .join("etr.log")
 }
 
 fn payload_type(p: Option<&Payload>) -> &'static str {
@@ -64,6 +83,10 @@ struct Cli {
     /// Verbosity: -v connection events, -vv cipher details, -vvv packet trace
     #[arg(short = 'v', action = ArgAction::Count)]
     verbose: u8,
+
+    /// Path to the etrs binary on the remote host (default: relies on PATH)
+    #[arg(long, default_value = "etrs")]
+    server_path: String,
 
     /// Generate shell completions for the specified shell
     #[arg(long, value_enum, value_name = "SHELL")]
@@ -109,6 +132,27 @@ async fn main() -> io::Result<()> {
         return Ok(());
     }
 
+    // In interactive mode, route verbose logs to a file so they don't corrupt
+    // the raw-mode terminal display. Print the path once so the user knows
+    // where to look.
+    if cli.verbose > 0 && io::stdin().is_terminal() {
+        let log_path = client_log_path();
+        if let Some(parent) = log_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            Ok(f) => {
+                eprintln!("[etr] Verbose log → {}", log_path.display());
+                let _ = LOG_FILE.set(std::sync::Mutex::new(f));
+            }
+            Err(e) => eprintln!("[etr] Could not open log file: {e}"),
+        }
+    }
+
     let target_input = match cli.target {
         Some(t) => t,
         None => {
@@ -130,7 +174,15 @@ async fn main() -> io::Result<()> {
         target
     );
 
-    bootstrap_ssh(&target, cli.ssh_port, &session_id, &passkey, &term)?;
+    bootstrap_ssh(
+        &target,
+        cli.ssh_port,
+        &session_id,
+        &passkey,
+        &term,
+        &cli.server_path,
+        port + 1,
+    )?;
 
     let session = Arc::new(Mutex::new(SessionState::new(session_id, passkey.clone())));
 
@@ -181,14 +233,16 @@ fn bootstrap_ssh(
     session_id: &[u8; 16],
     passkey: &str,
     term: &str,
+    server_path: &str,
+    reg_port: u16,
 ) -> io::Result<()> {
     let session_id_hex = hex_encode(session_id);
-    let remote_command = "etrs register";
+    let remote_command = format!("{} register", server_path);
     let mut child = Command::new("ssh")
         .arg("-p")
         .arg(ssh_port.to_string())
         .arg(target)
-        .arg(remote_command)
+        .arg(&remote_command)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
@@ -198,7 +252,8 @@ fn bootstrap_ssh(
         .stdin
         .take()
         .ok_or_else(|| io::Error::other("Failed to open SSH stdin pipe"))?;
-    stdin.write_all(format!("{}/{}/{}\n", session_id_hex, passkey, term).as_bytes())?;
+    stdin
+        .write_all(format!("{}/{}/{}/{}\n", session_id_hex, passkey, term, reg_port).as_bytes())?;
     stdin.flush()?;
     drop(stdin);
 
@@ -225,9 +280,15 @@ async fn run_connection_loop(
     } else {
         &target
     };
-    let server_addr: SocketAddr = format!("{}:{}", host, port)
-        .parse()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let server_addr = tokio::net::lookup_host(format!("{}:{}", host, port))
+        .await?
+        .next()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("could not resolve host: {}", host),
+            )
+        })?;
 
     let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>(1000);
     let stdin_rx = Arc::new(Mutex::new(stdin_rx));
@@ -253,7 +314,12 @@ async fn run_connection_loop(
         }
         first = false;
 
-        let socket = match UdpSocket::bind("0.0.0.0:0").await {
+        let bind_addr = if server_addr.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
+        let socket = match UdpSocket::bind(bind_addr).await {
             Ok(s) => Arc::new(s),
             Err(e) => {
                 eprintln!("[etr] Bind error: {:?}", e);

@@ -7,7 +7,7 @@ ETR_REL   := justfile_directory() + "/target/release/etr"
 ETRS_REL  := justfile_directory() + "/target/release/etrs"
 INSTALL   := home_directory() + "/.cargo/bin"
 LOG_FILE  := `echo "${XDG_STATE_HOME:-$HOME/.local/state}/etr/etrs.log"`
-SOCK_FILE := `echo "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/etr/etrs.sock"`
+REG_PORT  := "2023"
 TMUX_SESS := "etr_test"
 
 # List available recipes
@@ -114,25 +114,23 @@ test-local: check-tools install
         echo "--- cleanup ---"
         [[ -n "$ETRS_PID" ]] && kill "$ETRS_PID" 2>/dev/null && echo "stopped etrs (pid $ETRS_PID)"
         tmux kill-session -t "{{TMUX_SESS}}" 2>/dev/null && echo "killed tmux session {{TMUX_SESS}}" || true
-        rm -f "{{SOCK_FILE}}"
     }
     trap cleanup EXIT
 
     # ── 1. Start daemon ───────────────────────────────────────────────────────
     echo "==> Starting etrs daemon..."
     mkdir -p "$(dirname "{{LOG_FILE}}")"
-    rm -f "{{SOCK_FILE}}"
-    "{{ETRS_BIN}}" daemon > "{{LOG_FILE}}" 2>&1 &
+    "{{INSTALL}}/etrs" daemon > "{{LOG_FILE}}" 2>&1 &
     ETRS_PID=$!
     echo "    etrs pid: $ETRS_PID  log: {{LOG_FILE}}"
 
-    # Wait for daemon to be ready (socket appears)
+    # Wait for daemon to be ready (TCP registration port opens)
     for i in $(seq 1 20); do
-        [[ -S "{{SOCK_FILE}}" ]] && break
+        timeout 1 bash -c ">/dev/tcp/127.0.0.1/{{REG_PORT}}" 2>/dev/null && break
         sleep 0.2
     done
-    if [[ ! -S "{{SOCK_FILE}}" ]]; then
-        echo "ERROR: daemon socket {{SOCK_FILE}} did not appear" >&2
+    if ! timeout 1 bash -c ">/dev/tcp/127.0.0.1/{{REG_PORT}}" 2>/dev/null; then
+        echo "ERROR: daemon registration port {{REG_PORT}} did not open" >&2
         cat "{{LOG_FILE}}" >&2
         exit 1
     fi
@@ -141,7 +139,7 @@ test-local: check-tools install
     # ── 2. Launch client in tmux ─────────────────────────────────────────────
     echo "==> Launching etr client in tmux session '{{TMUX_SESS}}'..."
     tmux new-session -d -s "{{TMUX_SESS}}" -x 200 -y 50
-    tmux send-keys -t "{{TMUX_SESS}}" "PATH=\"{{INSTALL}}:$PATH\" \"{{ETR_BIN}}\" -v localhost" Enter
+    tmux send-keys -t "{{TMUX_SESS}}" "\"{{INSTALL}}/etr\" -v localhost" Enter
     sleep 5  # allow SSH bootstrap + handshake
 
     # ── 3. Happy-path test ───────────────────────────────────────────────────
