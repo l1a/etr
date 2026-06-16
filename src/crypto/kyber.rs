@@ -7,8 +7,8 @@
 //! # Security level
 //! - **ML-KEM-768**: NIST category 3 (~AES-192 equivalent)
 //! - **ML-KEM-1024**: NIST category 5 (~AES-256 equivalent)
-use ml_kem::{KemCore, MlKem1024, MlKem768};
 use ml_kem::kem::{Decapsulate, Encapsulate};
+use ml_kem::{KemCore, MlKem768, MlKem1024};
 use rand_core::OsRng;
 
 use super::CryptoError;
@@ -40,10 +40,14 @@ impl MlKem768KeyPair {
     /// Recover the shared secret from the server's KEM ciphertext.
     pub fn decapsulate(&self, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
         use ml_kem::EncodedSizeUser;
-        let ct_encoded = <MlKem768 as KemCore>::CipherText::from_bytes(
-            ml_kem::Encoded::<<MlKem768 as KemCore>::CipherText>::from_slice(ciphertext),
-        );
-        let ss = self.dk.decapsulate(&ct_encoded).map_err(|_| CryptoError::AeadFailure)?;
+        let ct_encoded =
+            <MlKem768 as KemCore>::CipherText::from_bytes(ml_kem::Encoded::<
+                <MlKem768 as KemCore>::CipherText,
+            >::from_slice(ciphertext));
+        let ss = self
+            .dk
+            .decapsulate(&ct_encoded)
+            .map_err(|_| CryptoError::AeadFailure)?;
         use ml_kem::EncodedSizeUser;
         Ok(ss.as_bytes().as_slice().to_vec())
     }
@@ -55,11 +59,16 @@ impl MlKem768KeyPair {
 /// `(ciphertext_for_ServerHello, shared_secret)`.
 pub fn encapsulate_768(ek_bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
     use ml_kem::EncodedSizeUser;
-    let ek = <MlKem768 as KemCore>::EncapsulationKey::from_bytes(
-        ml_kem::Encoded::<<MlKem768 as KemCore>::EncapsulationKey>::from_slice(ek_bytes),
-    );
-    let (ct, ss) = ek.encapsulate(&mut OsRng).map_err(|_| CryptoError::AeadFailure)?;
-    Ok((ct.as_bytes().as_slice().to_vec(), ss.as_bytes().as_slice().to_vec()))
+    let ek = <MlKem768 as KemCore>::EncapsulationKey::from_bytes(ml_kem::Encoded::<
+        <MlKem768 as KemCore>::EncapsulationKey,
+    >::from_slice(ek_bytes));
+    let (ct, ss) = ek
+        .encapsulate(&mut OsRng)
+        .map_err(|_| CryptoError::AeadFailure)?;
+    Ok((
+        ct.as_bytes().as_slice().to_vec(),
+        ss.as_bytes().as_slice().to_vec(),
+    ))
 }
 
 // ── ML-KEM-1024 ──────────────────────────────────────────────────────────────
@@ -89,10 +98,14 @@ impl MlKem1024KeyPair {
     /// Recover the shared secret from the server's KEM ciphertext.
     pub fn decapsulate(&self, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
         use ml_kem::EncodedSizeUser;
-        let ct_encoded = <MlKem1024 as KemCore>::CipherText::from_bytes(
-            ml_kem::Encoded::<<MlKem1024 as KemCore>::CipherText>::from_slice(ciphertext),
-        );
-        let ss = self.dk.decapsulate(&ct_encoded).map_err(|_| CryptoError::AeadFailure)?;
+        let ct_encoded =
+            <MlKem1024 as KemCore>::CipherText::from_bytes(ml_kem::Encoded::<
+                <MlKem1024 as KemCore>::CipherText,
+            >::from_slice(ciphertext));
+        let ss = self
+            .dk
+            .decapsulate(&ct_encoded)
+            .map_err(|_| CryptoError::AeadFailure)?;
         Ok(ss.as_bytes().as_slice().to_vec())
     }
 }
@@ -103,11 +116,16 @@ impl MlKem1024KeyPair {
 /// `(ciphertext_for_ServerHello, shared_secret)`.
 pub fn encapsulate_1024(ek_bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
     use ml_kem::EncodedSizeUser;
-    let ek = <MlKem1024 as KemCore>::EncapsulationKey::from_bytes(
-        ml_kem::Encoded::<<MlKem1024 as KemCore>::EncapsulationKey>::from_slice(ek_bytes),
-    );
-    let (ct, ss) = ek.encapsulate(&mut OsRng).map_err(|_| CryptoError::AeadFailure)?;
-    Ok((ct.as_bytes().as_slice().to_vec(), ss.as_bytes().as_slice().to_vec()))
+    let ek = <MlKem1024 as KemCore>::EncapsulationKey::from_bytes(ml_kem::Encoded::<
+        <MlKem1024 as KemCore>::EncapsulationKey,
+    >::from_slice(ek_bytes));
+    let (ct, ss) = ek
+        .encapsulate(&mut OsRng)
+        .map_err(|_| CryptoError::AeadFailure)?;
+    Ok((
+        ct.as_bytes().as_slice().to_vec(),
+        ss.as_bytes().as_slice().to_vec(),
+    ))
 }
 
 #[cfg(test)]

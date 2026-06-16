@@ -15,7 +15,7 @@ use prost::Message;
 use tokio::net::UdpSocket;
 
 use crate::crypto::AeadCipher;
-use crate::protocol::{Envelope, PacketHeader, HEADER_SIZE};
+use crate::protocol::{Envelope, HEADER_SIZE, PacketHeader};
 
 /// Maximum UDP payload we will send.  Stays safely under common path MTUs
 /// while leaving room for the 26-byte header and UDP/IP overhead.
@@ -70,7 +70,11 @@ pub async fn recv_packet(socket: &UdpSocket) -> std::io::Result<Option<ReceivedP
         return Ok(None);
     };
     let payload_bytes = data[HEADER_SIZE..].to_vec();
-    Ok(Some(ReceivedPacket { peer, header, payload_bytes }))
+    Ok(Some(ReceivedPacket {
+        peer,
+        header,
+        payload_bytes,
+    }))
 }
 
 /// Decrypt and decode the payload of a DATA packet.
@@ -95,9 +99,10 @@ pub fn decode_plaintext_packet(payload_bytes: &[u8]) -> std::io::Result<Envelope
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::{AeadCipher, CipherSuiteId, KemKeyPair, derive_session_cipher,
-                        encapsulate, generate_nonce};
-    use crate::protocol::{Envelope, Heartbeat, Payload, PacketHeader};
+    use crate::crypto::{
+        AeadCipher, CipherSuiteId, KemKeyPair, derive_session_cipher, encapsulate, generate_nonce,
+    };
+    use crate::protocol::{Envelope, Heartbeat, PacketHeader, Payload};
 
     fn make_cipher() -> AeadCipher {
         let suite = CipherSuiteId::X25519Aes256GcmSha256;
@@ -112,7 +117,9 @@ mod tests {
     }
 
     fn heartbeat_envelope() -> Envelope {
-        Envelope { payload: Some(Payload::Heartbeat(Heartbeat {})) }
+        Envelope {
+            payload: Some(Payload::Heartbeat(Heartbeat {})),
+        }
     }
 
     // ── decode_data_packet ────────────────────────────────────────────────────
@@ -189,7 +196,9 @@ mod tests {
         let header = PacketHeader::new(0, session_id, 7);
         let envelope = heartbeat_envelope();
 
-        send_packet(&client, server_addr, &header, &envelope, None).await.unwrap();
+        send_packet(&client, server_addr, &header, &envelope, None)
+            .await
+            .unwrap();
 
         let pkt = recv_packet(&server).await.unwrap().unwrap();
         assert_eq!(pkt.header.session_id, session_id);
@@ -210,7 +219,9 @@ mod tests {
         let header = PacketHeader::new(0, session_id, 3);
         let envelope = heartbeat_envelope();
 
-        send_packet(&client_sock, server_addr, &header, &envelope, Some(&cipher)).await.unwrap();
+        send_packet(&client_sock, server_addr, &header, &envelope, Some(&cipher))
+            .await
+            .unwrap();
 
         let pkt = recv_packet(&server_sock).await.unwrap().unwrap();
         let decoded = decode_data_packet(&pkt.payload_bytes, 3, &cipher).unwrap();

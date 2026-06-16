@@ -25,23 +25,20 @@ macro_rules! vlog {
 
 fn payload_type(p: Option<&Payload>) -> &'static str {
     match p {
-        Some(Payload::ClientHello(_))   => "ClientHello",
-        Some(Payload::ServerHello(_))   => "ServerHello",
-        Some(Payload::StreamOpen(_))    => "StreamOpen",
-        Some(Payload::StreamClose(_))   => "StreamClose",
-        Some(Payload::StreamData(_))    => "StreamData",
-        Some(Payload::StreamAck(_))     => "StreamAck",
-        Some(Payload::TerminalResize(_))=> "TerminalResize",
-        Some(Payload::Heartbeat(_))     => "Heartbeat",
-        Some(Payload::Disconnect(_))    => "Disconnect",
-        None                            => "Empty",
+        Some(Payload::ClientHello(_)) => "ClientHello",
+        Some(Payload::ServerHello(_)) => "ServerHello",
+        Some(Payload::StreamOpen(_)) => "StreamOpen",
+        Some(Payload::StreamClose(_)) => "StreamClose",
+        Some(Payload::StreamData(_)) => "StreamData",
+        Some(Payload::StreamAck(_)) => "StreamAck",
+        Some(Payload::TerminalResize(_)) => "TerminalResize",
+        Some(Payload::Heartbeat(_)) => "Heartbeat",
+        Some(Payload::Disconnect(_)) => "Disconnect",
+        None => "Empty",
     }
 }
 use etr::handshake::ClientHandshake;
-use etr::protocol::{
-    Envelope, Payload, StreamData, TerminalResize,
-    Heartbeat, PacketHeader,
-};
+use etr::protocol::{Envelope, Heartbeat, PacketHeader, Payload, StreamData, TerminalResize};
 use etr::session::SessionState;
 use etr::transport::{decode_data_packet, decode_plaintext_packet, recv_packet, send_packet};
 use prost::Message as _;
@@ -90,12 +87,24 @@ async fn main() -> io::Result<()> {
     if let Some(shell) = cli.completions {
         let mut cmd = Cli::command();
         match shell {
-            ShellChoice::Bash => clap_complete::generate(Shell::Bash, &mut cmd, "etr", &mut io::stdout()),
-            ShellChoice::Elvish => clap_complete::generate(Shell::Elvish, &mut cmd, "etr", &mut io::stdout()),
-            ShellChoice::Fish => clap_complete::generate(Shell::Fish, &mut cmd, "etr", &mut io::stdout()),
-            ShellChoice::PowerShell => clap_complete::generate(Shell::PowerShell, &mut cmd, "etr", &mut io::stdout()),
-            ShellChoice::Zsh => clap_complete::generate(Shell::Zsh, &mut cmd, "etr", &mut io::stdout()),
-            ShellChoice::Nushell => clap_complete::generate(Nushell, &mut cmd, "etr", &mut io::stdout()),
+            ShellChoice::Bash => {
+                clap_complete::generate(Shell::Bash, &mut cmd, "etr", &mut io::stdout())
+            }
+            ShellChoice::Elvish => {
+                clap_complete::generate(Shell::Elvish, &mut cmd, "etr", &mut io::stdout())
+            }
+            ShellChoice::Fish => {
+                clap_complete::generate(Shell::Fish, &mut cmd, "etr", &mut io::stdout())
+            }
+            ShellChoice::PowerShell => {
+                clap_complete::generate(Shell::PowerShell, &mut cmd, "etr", &mut io::stdout())
+            }
+            ShellChoice::Zsh => {
+                clap_complete::generate(Shell::Zsh, &mut cmd, "etr", &mut io::stdout())
+            }
+            ShellChoice::Nushell => {
+                clap_complete::generate(Nushell, &mut cmd, "etr", &mut io::stdout())
+            }
         }
         return Ok(());
     }
@@ -114,13 +123,20 @@ async fn main() -> io::Result<()> {
     let passkey = generate_passkey();
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
 
-    vlog!(cli.verbose, 1, "[etr] Connecting to {} via SSH to bootstrap session...", target);
+    vlog!(
+        cli.verbose,
+        1,
+        "[etr] Connecting to {} via SSH to bootstrap session...",
+        target
+    );
 
     bootstrap_ssh(&target, cli.ssh_port, &session_id, &passkey, &term)?;
 
     let session = Arc::new(Mutex::new(SessionState::new(session_id, passkey.clone())));
 
-    if let Err(e) = run_connection_loop(target, port, passkey, session_id, session, cli.verbose).await {
+    if let Err(e) =
+        run_connection_loop(target, port, passkey, session_id, session, cli.verbose).await
+    {
         eprintln!("Session terminated: {:?}", e);
     }
 
@@ -137,12 +153,11 @@ fn parse_target(target_str: &str, default_port: u16) -> (String, u16) {
         }
         return (target_str.to_string(), default_port);
     }
-    if let Some(colon_idx) = target_str.find(':') {
-        if target_str.chars().filter(|&c| c == ':').count() == 1 {
-            if let Ok(p) = target_str[colon_idx + 1..].parse::<u16>() {
-                return (target_str[..colon_idx].to_string(), p);
-            }
-        }
+    if let Some(colon_idx) = target_str.find(':')
+        && target_str.chars().filter(|&c| c == ':').count() == 1
+        && let Ok(p) = target_str[colon_idx + 1..].parse::<u16>()
+    {
+        return (target_str[..colon_idx].to_string(), p);
     }
     (target_str.to_string(), default_port)
 }
@@ -170,7 +185,8 @@ fn bootstrap_ssh(
     let session_id_hex = hex_encode(session_id);
     let remote_command = "etrs register";
     let mut child = Command::new("ssh")
-        .arg("-p").arg(ssh_port.to_string())
+        .arg("-p")
+        .arg(ssh_port.to_string())
         .arg(target)
         .arg(remote_command)
         .stdin(std::process::Stdio::piped())
@@ -204,7 +220,11 @@ async fn run_connection_loop(
     session: Arc<Mutex<SessionState>>,
     verbose: u8,
 ) -> io::Result<()> {
-    let host = if let Some(idx) = target.find('@') { &target[idx + 1..] } else { &target };
+    let host = if let Some(idx) = target.find('@') {
+        &target[idx + 1..]
+    } else {
+        &target
+    };
     let server_addr: SocketAddr = format!("{}:{}", host, port)
         .parse()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
@@ -216,8 +236,12 @@ async fn run_connection_loop(
         use std::io::Read;
         let mut buf = [0u8; 1024];
         while let Ok(n) = std::io::stdin().read(&mut buf) {
-            if n == 0 { break; }
-            if stdin_tx.blocking_send(buf[..n].to_vec()).is_err() { break; }
+            if n == 0 {
+                break;
+            }
+            if stdin_tx.blocking_send(buf[..n].to_vec()).is_err() {
+                break;
+            }
         }
     });
 
@@ -231,7 +255,10 @@ async fn run_connection_loop(
 
         let socket = match UdpSocket::bind("0.0.0.0:0").await {
             Ok(s) => Arc::new(s),
-            Err(e) => { eprintln!("[etr] Bind error: {:?}", e); continue; }
+            Err(e) => {
+                eprintln!("[etr] Bind error: {:?}", e);
+                continue;
+            }
         };
 
         let last_received = {
@@ -239,13 +266,20 @@ async fn run_connection_loop(
             s.last_received_map()
         };
 
-        vlog!(verbose, 2, "[etr] Sending ClientHello  session={} suites={:?}",
-            hex_encode(&session_id), CipherSuiteId::client_preference());
+        vlog!(
+            verbose,
+            2,
+            "[etr] Sending ClientHello  session={} suites={:?}",
+            hex_encode(&session_id),
+            CipherSuiteId::client_preference()
+        );
 
         let (hs, hello_header, hello_envelope) =
             ClientHandshake::reconnect(session_id, passkey.clone(), last_received);
 
-        if let Err(e) = send_packet(&socket, server_addr, &hello_header, &hello_envelope, None).await {
+        if let Err(e) =
+            send_packet(&socket, server_addr, &hello_header, &hello_envelope, None).await
+        {
             vlog!(verbose, 1, "[etr] Failed to send ClientHello: {:?}", e);
             continue;
         }
@@ -253,7 +287,10 @@ async fn run_connection_loop(
         // Wait for ServerHello (with timeout).
         let pkt = match tokio::time::timeout(Duration::from_secs(10), recv_packet(&socket)).await {
             Ok(Ok(Some(p))) => p,
-            _ => { vlog!(verbose, 1, "[etr] ServerHello timeout"); continue; }
+            _ => {
+                vlog!(verbose, 1, "[etr] ServerHello timeout");
+                continue;
+            }
         };
 
         if !pkt.header.is_handshake() || pkt.header.session_id != session_id {
@@ -262,11 +299,19 @@ async fn run_connection_loop(
 
         let (cipher, suite, server_acks) = match hs.process_server_hello(&pkt.payload_bytes) {
             Ok(r) => r,
-            Err(e) => { vlog!(verbose, 1, "[etr] Handshake failed: {}", e); continue; }
+            Err(e) => {
+                vlog!(verbose, 1, "[etr] Handshake failed: {}", e);
+                continue;
+            }
         };
 
-        vlog!(verbose, 2, "[etr] Handshake complete  suite={}  session={}",
-            suite, hex_encode(&session_id));
+        vlog!(
+            verbose,
+            2,
+            "[etr] Handshake complete  suite={}  session={}",
+            suite,
+            hex_encode(&session_id)
+        );
 
         let cipher = Arc::new(cipher);
 
@@ -324,25 +369,29 @@ async fn run_session(
         let peer_acks: HashMap<u32, u64> = HashMap::new();
         for (stream_id, replays) in s.collect_replays(&peer_acks) {
             for (seq, data) in replays {
-                let _ = send_tx.send(Envelope {
-                    payload: Some(Payload::StreamData(StreamData {
-                        stream_id,
-                        seq_num: seq,
-                        data,
-                    })),
-                }).await;
+                let _ = send_tx
+                    .send(Envelope {
+                        payload: Some(Payload::StreamData(StreamData {
+                            stream_id,
+                            seq_num: seq,
+                            data,
+                        })),
+                    })
+                    .await;
             }
         }
     }
 
     // Send current terminal size.
     if let Ok((cols, rows)) = crossterm::terminal::size() {
-        let _ = send_tx.send(Envelope {
-            payload: Some(Payload::TerminalResize(TerminalResize {
-                rows: rows as u32,
-                cols: cols as u32,
-            })),
-        }).await;
+        let _ = send_tx
+            .send(Envelope {
+                payload: Some(Payload::TerminalResize(TerminalResize {
+                    rows: rows as u32,
+                    cols: cols as u32,
+                })),
+            })
+            .await;
     }
 
     // Task: write outbound packets to the socket.
@@ -351,12 +400,19 @@ async fn run_session(
     let session_w = Arc::clone(&session);
     let mut writer_task = tokio::spawn(async move {
         while let Some(envelope) = send_rx.recv().await {
-            let seq = { let mut s = session_w.lock().await; s.next_packet_seq() };
+            let seq = {
+                let mut s = session_w.lock().await;
+                s.next_packet_seq()
+            };
             let header = PacketHeader::new(0, session_id, seq);
-            vlog!(verbose, 3, "[etr] → {} seq={} {}b",
+            vlog!(
+                verbose,
+                3,
+                "[etr] → {} seq={} {}b",
                 payload_type(envelope.payload.as_ref()),
                 seq,
-                envelope.encoded_len());
+                envelope.encoded_len()
+            );
             let _ = send_packet(&socket_w, server_addr, &header, &envelope, Some(&cipher_w)).await;
         }
     });
@@ -381,13 +437,15 @@ async fn run_session(
                 st.record_send(seq, payload.clone());
                 seq
             };
-            let _ = send_tx_stdin.send(Envelope {
-                payload: Some(Payload::StreamData(StreamData {
-                    stream_id: 0,
-                    seq_num: seq,
-                    data: payload,
-                })),
-            }).await;
+            let _ = send_tx_stdin
+                .send(Envelope {
+                    payload: Some(Payload::StreamData(StreamData {
+                        stream_id: 0,
+                        seq_num: seq,
+                        data: payload,
+                    })),
+                })
+                .await;
         }
     });
 
@@ -398,14 +456,17 @@ async fn run_session(
     let mut reader_task = tokio::spawn(async move {
         let mut stdout = io::stdout();
         loop {
-            let pkt = match tokio::time::timeout(Duration::from_secs(15), recv_packet(&socket_r)).await {
-                Ok(Ok(Some(p))) => p,
-                Ok(Ok(None)) => continue,
-                Ok(Err(e)) => return Err(e),
-                Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "idle timeout")),
-            };
+            let pkt =
+                match tokio::time::timeout(Duration::from_secs(15), recv_packet(&socket_r)).await {
+                    Ok(Ok(Some(p))) => p,
+                    Ok(Ok(None)) => continue,
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "idle timeout")),
+                };
 
-            if pkt.header.session_id != session_id { continue; }
+            if pkt.header.session_id != session_id {
+                continue;
+            }
 
             let envelope = if pkt.header.is_handshake() {
                 decode_plaintext_packet(&pkt.payload_bytes)?
@@ -413,10 +474,14 @@ async fn run_session(
                 decode_data_packet(&pkt.payload_bytes, pkt.header.packet_seq, &cipher_r)?
             };
 
-            vlog!(verbose, 3, "[etr] ← {} seq={} {}b",
+            vlog!(
+                verbose,
+                3,
+                "[etr] ← {} seq={} {}b",
                 payload_type(envelope.payload.as_ref()),
                 pkt.header.packet_seq,
-                pkt.payload_bytes.len());
+                pkt.payload_bytes.len()
+            );
 
             match envelope.payload {
                 Some(Payload::StreamData(sd)) if sd.stream_id == 0 => {
@@ -451,12 +516,14 @@ async fn run_session(
         if let Ok(mut sigwinch) = signal(SignalKind::window_change()) {
             while sigwinch.recv().await.is_some() {
                 if let Ok((cols, rows)) = crossterm::terminal::size() {
-                    let _ = send_tx_resize.send(Envelope {
-                        payload: Some(Payload::TerminalResize(TerminalResize {
-                            rows: rows as u32,
-                            cols: cols as u32,
-                        })),
-                    }).await;
+                    let _ = send_tx_resize
+                        .send(Envelope {
+                            payload: Some(Payload::TerminalResize(TerminalResize {
+                                rows: rows as u32,
+                                cols: cols as u32,
+                            })),
+                        })
+                        .await;
                 }
             }
         }
@@ -467,7 +534,13 @@ async fn run_session(
     let mut hb_task = tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
-            if send_tx_hb.send(Envelope { payload: Some(Payload::Heartbeat(Heartbeat {})) }).await.is_err() {
+            if send_tx_hb
+                .send(Envelope {
+                    payload: Some(Payload::Heartbeat(Heartbeat {})),
+                })
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -518,10 +591,22 @@ mod tests {
     fn test_parse_target() {
         assert_eq!(parse_target("host", 2022), ("host".to_string(), 2022));
         assert_eq!(parse_target("host:1234", 2022), ("host".to_string(), 1234));
-        assert_eq!(parse_target("user@host:3000", 2022), ("user@host".to_string(), 3000));
+        assert_eq!(
+            parse_target("user@host:3000", 2022),
+            ("user@host".to_string(), 3000)
+        );
         assert_eq!(parse_target("::1", 2022), ("::1".to_string(), 2022));
-        assert_eq!(parse_target("[::1]:1234", 2022), ("[::1]".to_string(), 1234));
-        assert_eq!(parse_target("user@[::1]:1234", 2022), ("user@[::1]".to_string(), 1234));
-        assert_eq!(parse_target("user@[::1]", 2022), ("user@[::1]".to_string(), 2022));
+        assert_eq!(
+            parse_target("[::1]:1234", 2022),
+            ("[::1]".to_string(), 1234)
+        );
+        assert_eq!(
+            parse_target("user@[::1]:1234", 2022),
+            ("user@[::1]".to_string(), 1234)
+        );
+        assert_eq!(
+            parse_target("user@[::1]", 2022),
+            ("user@[::1]".to_string(), 2022)
+        );
     }
 }

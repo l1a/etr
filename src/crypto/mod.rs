@@ -13,9 +13,9 @@
 //! PQC suites (0x01, 0x02) require the `pqc` cargo feature.
 pub mod aead;
 pub mod kdf;
-pub mod x25519;
 #[cfg(feature = "pqc")]
 pub mod kyber;
+pub mod x25519;
 
 pub use aead::AeadCipher;
 
@@ -68,6 +68,7 @@ impl CipherSuiteId {
     }
 
     /// Client preference list, highest security first.
+    #[allow(clippy::vec_init_then_push)] // cfg-gated pushes can't use vec![]
     pub fn client_preference() -> Vec<u32> {
         let mut suites = Vec::new();
         #[cfg(feature = "pqc")]
@@ -93,7 +94,11 @@ impl CipherSuiteId {
     fn uses_sha3_kdf(self) -> bool {
         let _ = self;
         #[cfg(feature = "pqc")]
-        { if self == CipherSuiteId::MlKem1024Aes256GcmSha3 { return true; } }
+        {
+            if self == CipherSuiteId::MlKem1024Aes256GcmSha3 {
+                return true;
+            }
+        }
         false
     }
 
@@ -131,8 +136,7 @@ impl KemKeyPair {
             CipherSuiteId::MlKem768Aes256GcmSha256 => {
                 Self::MlKem768(kyber::MlKem768KeyPair::generate())
             }
-            CipherSuiteId::X25519Aes256GcmSha256
-            | CipherSuiteId::X25519ChaCha20Poly1305Sha256 => {
+            CipherSuiteId::X25519Aes256GcmSha256 | CipherSuiteId::X25519ChaCha20Poly1305Sha256 => {
                 Self::X25519(x25519::X25519KeyPair::generate())
             }
         }
@@ -175,8 +179,7 @@ pub fn encapsulate(
         CipherSuiteId::MlKem1024Aes256GcmSha3 => kyber::encapsulate_1024(peer_public_key),
         #[cfg(feature = "pqc")]
         CipherSuiteId::MlKem768Aes256GcmSha256 => kyber::encapsulate_768(peer_public_key),
-        CipherSuiteId::X25519Aes256GcmSha256
-        | CipherSuiteId::X25519ChaCha20Poly1305Sha256 => {
+        CipherSuiteId::X25519Aes256GcmSha256 | CipherSuiteId::X25519ChaCha20Poly1305Sha256 => {
             x25519::encapsulate(peer_public_key)
         }
     }
@@ -209,7 +212,7 @@ pub fn derive_session_cipher(
     if suite.uses_chacha20() {
         AeadCipher::ChaCha20Poly1305(aead::ChaCha20Cipher::new(&key))
     } else {
-        AeadCipher::Aes256Gcm(aead::Aes256GcmCipher::new(&key))
+        AeadCipher::Aes256Gcm(Box::new(aead::Aes256GcmCipher::new(&key)))
     }
 }
 
@@ -223,7 +226,7 @@ pub fn derive_session_cipher(
 pub fn derive_hello_cipher(passkey: &[u8], client_nonce: &[u8]) -> AeadCipher {
     let key_bytes = kdf::hkdf_sha256(passkey, client_nonce, b"etr-hello-v1", 32);
     let key: [u8; 32] = key_bytes.try_into().expect("KDF output is always 32 bytes");
-    AeadCipher::Aes256Gcm(aead::Aes256GcmCipher::new(&key))
+    AeadCipher::Aes256Gcm(Box::new(aead::Aes256GcmCipher::new(&key)))
 }
 
 /// Generate a cryptographically random 32-byte nonce.

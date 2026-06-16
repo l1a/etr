@@ -22,7 +22,9 @@ impl Aes256GcmCipher {
     /// Construct from a 32-byte key.
     pub fn new(key: &[u8; 32]) -> Self {
         let k = AesKey::<Aes256Gcm>::from_slice(key);
-        Self { inner: Aes256Gcm::new(k) }
+        Self {
+            inner: Aes256Gcm::new(k),
+        }
     }
 
     /// Encrypt `plaintext` under `packet_seq` as nonce.  Returns authenticated ciphertext.
@@ -51,7 +53,9 @@ impl ChaCha20Cipher {
     /// Construct from a 32-byte key.
     pub fn new(key: &[u8; 32]) -> Self {
         let k = ChaChaKey::from_slice(key);
-        Self { inner: ChaCha20Poly1305::new(k) }
+        Self {
+            inner: ChaCha20Poly1305::new(k),
+        }
     }
 
     /// Encrypt `plaintext` under `packet_seq` as nonce.  Returns authenticated ciphertext.
@@ -72,8 +76,11 @@ impl ChaCha20Cipher {
 }
 
 /// AEAD cipher bound to a derived session key — enum dispatch over the two supported algorithms.
+///
+/// `Aes256Gcm` is boxed to equalise the variant sizes (AES-256-GCM key schedule
+/// is ~1 KB; ChaCha20-Poly1305 is 32 bytes).
 pub enum AeadCipher {
-    Aes256Gcm(Aes256GcmCipher),
+    Aes256Gcm(Box<Aes256GcmCipher>),
     ChaCha20Poly1305(ChaCha20Cipher),
 }
 
@@ -109,9 +116,15 @@ fn seq_to_nonce(seq: u64) -> [u8; 12] {
 mod tests {
     use super::*;
 
-    fn aes_key() -> [u8; 32] { [0x42u8; 32] }
-    fn cha_key() -> [u8; 32] { [0x99u8; 32] }
-    fn alt_key() -> [u8; 32] { [0x01u8; 32] }
+    fn aes_key() -> [u8; 32] {
+        [0x42u8; 32]
+    }
+    fn cha_key() -> [u8; 32] {
+        [0x99u8; 32]
+    }
+    fn alt_key() -> [u8; 32] {
+        [0x01u8; 32]
+    }
 
     // ── AES-256-GCM ──────────────────────────────────────────────────────────
 
@@ -195,7 +208,7 @@ mod tests {
 
     #[test]
     fn aead_cipher_aes_dispatch() {
-        let c = AeadCipher::Aes256Gcm(Aes256GcmCipher::new(&aes_key()));
+        let c = AeadCipher::Aes256Gcm(Box::new(Aes256GcmCipher::new(&aes_key())));
         let ct = c.encrypt(5, b"dispatch").unwrap();
         assert_eq!(c.decrypt(5, &ct).unwrap(), b"dispatch");
     }

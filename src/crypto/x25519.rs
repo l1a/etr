@@ -49,7 +49,9 @@ impl X25519KeyPair {
 ///
 /// Returns `CryptoError::InvalidKey` if `client_pk_bytes` is not exactly 32 bytes.
 pub fn encapsulate(client_pk_bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
-    let arr: [u8; 32] = client_pk_bytes.try_into().map_err(|_| CryptoError::InvalidKey)?;
+    let arr: [u8; 32] = client_pk_bytes
+        .try_into()
+        .map_err(|_| CryptoError::InvalidKey)?;
     let client_pk = PublicKey::from(arr);
     let server_esk = StaticSecret::random_from_rng(OsRng);
     let server_epk = PublicKey::from(&server_esk);
@@ -104,10 +106,7 @@ mod tests {
             encapsulate(&[0u8; 31]),
             Err(CryptoError::InvalidKey)
         ));
-        assert!(matches!(
-            encapsulate(&[]),
-            Err(CryptoError::InvalidKey)
-        ));
+        assert!(matches!(encapsulate(&[]), Err(CryptoError::InvalidKey)));
     }
 
     #[test]

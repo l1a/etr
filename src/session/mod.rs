@@ -38,7 +38,9 @@ impl SessionState {
             next_packet_seq: 1,
         };
         // Stream 0 is always the terminal.
-        state.streams.insert(0, StreamState::new(0, StreamType::Terminal));
+        state
+            .streams
+            .insert(0, StreamState::new(0, StreamType::Terminal));
         state
     }
 
@@ -100,7 +102,11 @@ impl SessionState {
             .filter_map(|(&id, s)| {
                 let last = peer_last_received.get(&id).copied().unwrap_or(0);
                 let replays = s.replay_from(last);
-                if replays.is_empty() { None } else { Some((id, replays)) }
+                if replays.is_empty() {
+                    None
+                } else {
+                    Some((id, replays))
+                }
             })
             .collect()
     }
@@ -235,7 +241,7 @@ mod tests {
         let mut s = make_state();
         s.open_stream(2, StreamType::PortForward);
         s.open_stream(2, StreamType::PortForward); // second call is a no-op
-        assert_eq!(s.streams.contains_key(&2), true);
+        assert!(s.streams.contains_key(&2));
         assert_eq!(s.streams.iter().filter(|(id, _)| **id == 2).count(), 1);
     }
 }

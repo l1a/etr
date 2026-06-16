@@ -17,7 +17,7 @@
 //!
 //! ## Flag bits
 //! - `0x01` — HANDSHAKE: payload is plaintext (ClientHello) or hello-key-
-//!             encrypted (ServerHello); not encrypted with the session key.
+//!   encrypted (ServerHello); not encrypted with the session key.
 //!
 //! ## Versionability
 //! The `version` byte gates all parsing after the header.  A future protocol
@@ -46,7 +46,12 @@ pub struct PacketHeader {
 
 impl PacketHeader {
     pub fn new(flags: u8, session_id: [u8; 16], packet_seq: u64) -> Self {
-        Self { version: PROTOCOL_VERSION, flags, session_id, packet_seq }
+        Self {
+            version: PROTOCOL_VERSION,
+            flags,
+            session_id,
+            packet_seq,
+        }
     }
 
     pub fn is_handshake(&self) -> bool {
@@ -76,7 +81,12 @@ impl PacketHeader {
         let flags = buf[1];
         let session_id: [u8; 16] = buf[2..18].try_into().ok()?;
         let packet_seq = u64::from_be_bytes(buf[18..26].try_into().ok()?);
-        Some(Self { version, flags, session_id, packet_seq })
+        Some(Self {
+            version,
+            flags,
+            session_id,
+            packet_seq,
+        })
     }
 }
 
@@ -203,10 +213,7 @@ pub struct Disconnect {}
 /// Top-level protobuf envelope: exactly one payload per UDP datagram.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct Envelope {
-    #[prost(
-        oneof = "Payload",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9"
-    )]
+    #[prost(oneof = "Payload", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9")]
     pub payload: Option<Payload>,
 }
 
@@ -305,7 +312,13 @@ mod tests {
                 error_code: 0,
             })),
         };
-        assert_eq!(Envelope::decode(open.encode_to_vec().as_slice()).unwrap(), open);
-        assert_eq!(Envelope::decode(close.encode_to_vec().as_slice()).unwrap(), close);
+        assert_eq!(
+            Envelope::decode(open.encode_to_vec().as_slice()).unwrap(),
+            open
+        );
+        assert_eq!(
+            Envelope::decode(close.encode_to_vec().as_slice()).unwrap(),
+            close
+        );
     }
 }

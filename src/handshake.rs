@@ -31,7 +31,7 @@ use crate::crypto::{
     generate_nonce, generate_session_id,
 };
 use crate::protocol::{
-    ClientHello, Envelope, FLAG_HANDSHAKE, PROTOCOL_VERSION, Payload, PacketHeader, ServerHello,
+    ClientHello, Envelope, FLAG_HANDSHAKE, PROTOCOL_VERSION, PacketHeader, Payload, ServerHello,
 };
 
 // ── Client handshake ─────────────────────────────────────────────────────────
@@ -85,9 +85,16 @@ impl ClientHandshake {
         };
 
         let header = PacketHeader::new(FLAG_HANDSHAKE, session_id, 0);
-        let envelope = Envelope { payload: Some(Payload::ClientHello(hello)) };
+        let envelope = Envelope {
+            payload: Some(Payload::ClientHello(hello)),
+        };
 
-        let state = Self { session_id, passkey, client_nonce, kem_keypair };
+        let state = Self {
+            session_id,
+            passkey,
+            client_nonce,
+            kem_keypair,
+        };
         (state, header, envelope)
     }
 
@@ -165,8 +172,7 @@ pub fn process_client_hello<F>(
 where
     F: Fn(&[u8]) -> Option<String>,
 {
-    let envelope =
-        Envelope::decode(payload_bytes).map_err(|_| HandshakeError::MalformedPacket)?;
+    let envelope = Envelope::decode(payload_bytes).map_err(|_| HandshakeError::MalformedPacket)?;
 
     let client_hello = match envelope.payload {
         Some(Payload::ClientHello(ch)) => ch,
@@ -192,9 +198,8 @@ where
         .find_map(|&id| CipherSuiteId::from_u32(id))
         .ok_or(HandshakeError::UnsupportedSuite)?;
 
-    let (kem_ciphertext, kem_secret) =
-        crypto::encapsulate(suite, &client_hello.kem_public_key)
-            .map_err(|_| HandshakeError::AuthFailed)?;
+    let (kem_ciphertext, kem_secret) = crypto::encapsulate(suite, &client_hello.kem_public_key)
+        .map_err(|_| HandshakeError::AuthFailed)?;
 
     let server_nonce = generate_nonce();
 
@@ -283,11 +288,9 @@ mod tests {
         let client_payload = client_envelope.encode_to_vec();
 
         // Server processes it.
-        let outcome = process_client_hello(
-            &client_payload,
-            HashMap::new(),
-            |_sid| Some(passkey.clone()),
-        )
+        let outcome = process_client_hello(&client_payload, HashMap::new(), |_sid| {
+            Some(passkey.clone())
+        })
         .expect("server handshake should succeed");
 
         // Client processes ServerHello.
@@ -312,11 +315,9 @@ mod tests {
             ClientHandshake::new("correct".to_string(), HashMap::new());
         let client_payload = client_envelope.encode_to_vec();
 
-        let result = process_client_hello(
-            &client_payload,
-            HashMap::new(),
-            |_| Some("wrong".to_string()),
-        );
+        let result = process_client_hello(&client_payload, HashMap::new(), |_| {
+            Some("wrong".to_string())
+        });
         // Server will succeed (it doesn't know the key is wrong at this point),
         // but the client will fail to decrypt the ServerHello.
         let outcome = result.expect("server produces a response");
@@ -329,7 +330,9 @@ mod tests {
         // In practice the client's nonce won't match so decryption fails.
         let tampered = {
             let mut b = outcome.response_payload_bytes.clone();
-            if !b.is_empty() { b[0] ^= 0xFF; }
+            if !b.is_empty() {
+                b[0] ^= 0xFF;
+            }
             b
         };
         let result = client_hs2.process_server_hello(&tampered);
@@ -346,7 +349,9 @@ mod tests {
 
     #[test]
     fn test_malformed_packet_rejected() {
-        let result = process_client_hello(b"\xFF\xFF\xFF garbage", HashMap::new(), |_| Some("pk".into()));
+        let result = process_client_hello(b"\xFF\xFF\xFF garbage", HashMap::new(), |_| {
+            Some("pk".into())
+        });
         assert!(matches!(result, Err(HandshakeError::MalformedPacket)));
     }
 
@@ -361,7 +366,9 @@ mod tests {
     fn test_unexpected_packet_type_rejected() {
         use crate::protocol::{Heartbeat, Payload};
         // Send a Heartbeat where a ClientHello is expected.
-        let env = Envelope { payload: Some(Payload::Heartbeat(Heartbeat {})) };
+        let env = Envelope {
+            payload: Some(Payload::Heartbeat(Heartbeat {})),
+        };
         let payload = env.encode_to_vec();
         let result = process_client_hello(&payload, HashMap::new(), |_| Some("pk".into()));
         assert!(matches!(result, Err(HandshakeError::UnexpectedPacket)));
@@ -374,13 +381,16 @@ mod tests {
         let hello = ClientHello {
             protocol_version: crate::protocol::PROTOCOL_VERSION as u32,
             session_id: vec![0u8; 16],
-            cipher_suites: vec![0xDEAD_BEEF],  // unknown suite
+            cipher_suites: vec![0xDEAD_BEEF], // unknown suite
             client_nonce: vec![0u8; 32],
             kem_public_key: vec![0u8; 32],
             last_received_seq: HashMap::new(),
         };
-        let env = Envelope { payload: Some(Payload::ClientHello(hello)) };
-        let result = process_client_hello(&env.encode_to_vec(), HashMap::new(), |_| Some("pk".into()));
+        let env = Envelope {
+            payload: Some(Payload::ClientHello(hello)),
+        };
+        let result =
+            process_client_hello(&env.encode_to_vec(), HashMap::new(), |_| Some("pk".into()));
         assert!(matches!(result, Err(HandshakeError::UnsupportedSuite)));
     }
 
@@ -391,11 +401,10 @@ mod tests {
         let client_last: HashMap<u32, u64> = [(0, 5)].into();
         let (_hs, _hdr, env) = ClientHandshake::new(passkey.clone(), client_last.clone());
 
-        let outcome = process_client_hello(
-            &env.encode_to_vec(),
-            HashMap::new(),
-            |_| Some(passkey.clone()),
-        ).unwrap();
+        let outcome = process_client_hello(&env.encode_to_vec(), HashMap::new(), |_| {
+            Some(passkey.clone())
+        })
+        .unwrap();
 
         assert_eq!(outcome.client_last_received, client_last);
     }
@@ -406,11 +415,10 @@ mod tests {
         let server_last: HashMap<u32, u64> = [(0, 10)].into();
         let (_hs, _hdr, env) = ClientHandshake::new(passkey.clone(), HashMap::new());
 
-        let outcome = process_client_hello(
-            &env.encode_to_vec(),
-            server_last.clone(),
-            |_| Some(passkey.clone()),
-        ).unwrap();
+        let outcome = process_client_hello(&env.encode_to_vec(), server_last.clone(), |_| {
+            Some(passkey.clone())
+        })
+        .unwrap();
 
         // The server's last_received map must appear in ServerHello so the client
         // can trim its send history — verify it survives the encode/decode cycle.
