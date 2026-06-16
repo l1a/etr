@@ -263,11 +263,11 @@ async fn run_connection_loop(
         match run_result {
             Ok(_) => {
                 println!("\r\n[etr] Connection closed cleanly.");
-                return Ok(());
+                std::process::exit(0);
             }
             Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
                 println!("\r\n[etr] Connection closed cleanly.");
-                return Ok(());
+                std::process::exit(0);
             }
             Err(e) => {
                 eprintln!("\r\n[etr] Session connection dropped: {:?}", e);
