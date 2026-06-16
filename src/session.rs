@@ -233,4 +233,53 @@ mod tests {
             "Reading should have timed out due to inactivity"
         );
     }
+
+    #[tokio::test]
+    async fn test_disconnect_during_handshake() {
+        // Bind a local listener on a random port
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Should bind to local port");
+        let local_addr = listener.local_addr().unwrap();
+
+        // Spawn accept task simulating server rejecting session and sending Disconnect
+        let accept_handle = tokio::spawn(async move {
+            let (mut server_stream, _) = listener.accept().await.unwrap();
+            let req_bytes = read_frame(&mut server_stream).await.unwrap();
+            let req: Packet = bincode::deserialize(&req_bytes).unwrap();
+            assert!(matches!(req, Packet::ConnectRequest { .. }));
+
+            let disconnect_packet = Packet::Disconnect;
+            let disconnect_bytes = bincode::serialize(&disconnect_packet).unwrap();
+            write_frame(&mut server_stream, &disconnect_bytes)
+                .await
+                .unwrap();
+        });
+
+        // Client connects
+        let mut client_stream = TcpStream::connect(local_addr)
+            .await
+            .expect("Should connect to local listener");
+
+        // Write ConnectRequest
+        let client_nonce = [0u8; 16];
+        let request = Packet::ConnectRequest {
+            client_id: "stale-session-id".to_string(),
+            client_nonce,
+        };
+        let request_bytes = bincode::serialize(&request).unwrap();
+        write_frame(&mut client_stream, &request_bytes)
+            .await
+            .unwrap();
+
+        // Read response frame
+        let response_bytes = read_frame(&mut client_stream).await.unwrap();
+        let response: Packet = bincode::deserialize(&response_bytes).unwrap();
+
+        // Verify that the server rejected the connection with Disconnect
+        assert!(matches!(response, Packet::Disconnect));
+
+        // Wait for server task to finish
+        accept_handle.await.unwrap();
+    }
 }

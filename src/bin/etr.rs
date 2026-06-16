@@ -32,6 +32,10 @@ struct Cli {
     #[arg(short = 's', long, default_value = "22")]
     ssh_port: u16,
 
+    /// Enable verbose logging of connection events and status messages
+    #[arg(short, long)]
+    verbose: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -106,7 +110,9 @@ async fn main() -> io::Result<()> {
     let passkey = generate_passkey();
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
 
-    println!("Connecting to {} via SSH to bootstrap session...", target);
+    if cli.verbose {
+        println!("Connecting to {} via SSH to bootstrap session...", target);
+    }
 
     // 2. Perform SSH handshake to register session
     bootstrap_ssh(&target, cli.ssh_port, &client_id, &passkey, &term)?;
@@ -115,7 +121,7 @@ async fn main() -> io::Result<()> {
     let session_state = Arc::new(Mutex::new(SessionState::new(client_id.clone(), passkey)));
 
     // 4. Run persistent connection loop
-    if let Err(e) = run_connection_loop(target, cli.port, session_state).await {
+    if let Err(e) = run_connection_loop(target, cli.port, session_state, cli.verbose).await {
         eprintln!("Session connection loop terminated: {:?}", e);
     }
 
@@ -191,6 +197,7 @@ async fn run_connection_loop(
     target: String,
     port: u16,
     session_state: Arc<Mutex<SessionState>>,
+    verbose: bool,
 ) -> io::Result<()> {
     // Strip user prefix to get just host for TCP connection
     let host = if let Some(idx) = target.find('@') {
@@ -223,7 +230,9 @@ async fn run_connection_loop(
 
     loop {
         if !is_first_connect {
-            println!("\r\n[etr] Connection lost. Reconnecting to {}...", addr);
+            if verbose {
+                println!("\r\n[etr] Connection lost. Reconnecting to {}...", addr);
+            }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
         is_first_connect = false;
@@ -237,12 +246,16 @@ async fn run_connection_loop(
         let (cipher, replays) = match perform_handshake(&mut stream, &session_state).await {
             Ok(res) => res,
             Err(e) => {
-                eprintln!("\r\n[etr] Handshake failed: {:?}", e);
+                if verbose {
+                    eprintln!("\r\n[etr] Handshake failed: {:?}", e);
+                }
                 continue;
             }
         };
 
-        println!("\r\n[etr] Connected. Session active.");
+        if verbose {
+            println!("\r\n[etr] Connected. Session active.");
+        }
 
         // Enable terminal raw mode
         enable_raw_mode().unwrap();
@@ -262,15 +275,24 @@ async fn run_connection_loop(
 
         match run_result {
             Ok(_) => {
-                println!("\r\n[etr] Connection closed cleanly.");
+                if verbose {
+                    println!("[etr] Connection closed cleanly.\r");
+                    let _ = io::stdout().flush();
+                }
                 std::process::exit(0);
             }
             Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
-                println!("\r\n[etr] Connection closed cleanly.");
+                if verbose {
+                    println!("[etr] Connection closed cleanly.\r");
+                    let _ = io::stdout().flush();
+                }
                 std::process::exit(0);
             }
             Err(e) => {
-                eprintln!("\r\n[etr] Session connection dropped: {:?}", e);
+                if verbose {
+                    eprintln!("[etr] Session connection dropped: {:?}\r", e);
+                    let _ = io::stderr().flush();
+                }
             }
         }
     }
@@ -303,6 +325,12 @@ async fn perform_handshake(
 
     let server_nonce = match response {
         Packet::ConnectResponse { server_nonce } => server_nonce,
+        Packet::Disconnect => {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "Session terminated by server",
+            ));
+        }
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

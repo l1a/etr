@@ -49,12 +49,12 @@ struct ActiveSession {
     pty_write_tx: mpsc::Sender<Vec<u8>>,
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     // Active channel to send packets to the TCP writer task (sender and connection ID)
-    tcp_tx: Arc<Mutex<ActiveChannel>>,
+    tcp_tx: Arc<std::sync::Mutex<ActiveChannel>>,
     // Next connection ID to assign
     next_conn_id: Arc<Mutex<u64>>,
 }
 
-type SessionMap = Arc<Mutex<HashMap<String, Arc<ActiveSession>>>>;
+type SessionMap = Arc<std::sync::Mutex<HashMap<String, Arc<ActiveSession>>>>;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -115,7 +115,7 @@ async fn run_register(socket_path: String) -> io::Result<()> {
 async fn run_daemon(bind_addr: String, port: u16, socket_path: String) -> io::Result<()> {
     println!("Starting etrs daemon...");
 
-    let sessions: SessionMap = Arc::new(Mutex::new(HashMap::new()));
+    let sessions: SessionMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
     // Clean up old socket if it exists
     let _ = std::fs::remove_file(&socket_path);
@@ -187,7 +187,7 @@ async fn handle_registration(mut stream: UnixStream, sessions: SessionMap) -> io
     let mut cmd = CommandBuilder::new(shell);
     cmd.env("TERM", term);
 
-    let mut _child = pair.slave.spawn_command(cmd).map_err(io::Error::other)?;
+    let mut child = pair.slave.spawn_command(cmd).map_err(io::Error::other)?;
 
     let master = pair.master;
     let mut pty_reader = master.try_clone_reader().map_err(io::Error::other)?;
@@ -208,7 +208,7 @@ async fn handle_registration(mut stream: UnixStream, sessions: SessionMap) -> io
 
     let master_shared = Arc::new(Mutex::new(master));
     let session_state = Arc::new(Mutex::new(SessionState::new(client_id.clone(), passkey)));
-    let tcp_tx = Arc::new(Mutex::new(None));
+    let tcp_tx = Arc::new(std::sync::Mutex::new(None));
     let next_conn_id = Arc::new(Mutex::new(1));
 
     let active_session = Arc::new(ActiveSession {
@@ -218,6 +218,32 @@ async fn handle_registration(mut stream: UnixStream, sessions: SessionMap) -> io
         master: Arc::clone(&master_shared),
         tcp_tx: Arc::clone(&tcp_tx),
         next_conn_id: Arc::clone(&next_conn_id),
+    });
+
+    // Spawn task to wait on child process exit
+    let tcp_tx_child = Arc::clone(&tcp_tx);
+    let sessions_cleanup_child = Arc::clone(&sessions);
+    let client_id_cleanup_child = client_id.clone();
+    tokio::task::spawn_blocking(move || {
+        let _ = child.wait();
+        println!("Shell child process exited. Cleaning up session.");
+
+        // Remove session from map
+        let mut map = sessions_cleanup_child.lock().unwrap();
+        if map.remove(&client_id_cleanup_child).is_some() {
+            println!(
+                "Session client_id={} removed on child exit.",
+                client_id_cleanup_child
+            );
+        }
+        drop(map);
+
+        // Signal the client to disconnect cleanly
+        let mut tcp_tx_guard = tcp_tx_child.lock().unwrap();
+        if let Some((tx, _)) = &*tcp_tx_guard {
+            let _ = tx.blocking_send(Packet::Disconnect);
+        }
+        *tcp_tx_guard = None;
     });
 
     // Spawn a task to read from PTY master and forward it to client
@@ -249,7 +275,7 @@ async fn handle_registration(mut stream: UnixStream, sessions: SessionMap) -> io
             };
 
             // If we have an active TCP connection, send it
-            let tcp_tx_guard = futures::executor::block_on(tcp_tx_reader.lock());
+            let tcp_tx_guard = tcp_tx_reader.lock().unwrap();
             if let Some((tx, _)) = &*tcp_tx_guard {
                 let _ = tx.blocking_send(packet);
             }
@@ -258,12 +284,17 @@ async fn handle_registration(mut stream: UnixStream, sessions: SessionMap) -> io
         println!("PTY reader exited. Cleaning up session.");
 
         // Remove session from map when PTY exits (logout)
-        let mut map = futures::executor::block_on(sessions_cleanup.lock());
-        map.remove(&client_id_cleanup);
+        let mut map = sessions_cleanup.lock().unwrap();
+        if map.remove(&client_id_cleanup).is_some() {
+            println!(
+                "Session client_id={} removed on PTY reader exit.",
+                client_id_cleanup
+            );
+        }
         drop(map);
 
         // Also signal the client to disconnect cleanly
-        let mut tcp_tx_guard = futures::executor::block_on(tcp_tx_reader.lock());
+        let mut tcp_tx_guard = tcp_tx_reader.lock().unwrap();
         if let Some((tx, _)) = &*tcp_tx_guard {
             let _ = tx.blocking_send(Packet::Disconnect);
         }
@@ -271,7 +302,7 @@ async fn handle_registration(mut stream: UnixStream, sessions: SessionMap) -> io
     });
 
     // Add session to map
-    sessions.lock().await.insert(client_id, active_session);
+    sessions.lock().unwrap().insert(client_id, active_session);
 
     stream.write_all(b"OK").await?;
     Ok(())
@@ -298,7 +329,7 @@ async fn handle_client_tcp(mut stream: TcpStream, sessions: SessionMap) -> io::R
 
     // 2. Lookup session
     let session = {
-        let guard = sessions.lock().await;
+        let guard = sessions.lock().unwrap();
         guard.get(&client_id).cloned()
     };
 
@@ -306,6 +337,11 @@ async fn handle_client_tcp(mut stream: TcpStream, sessions: SessionMap) -> io::R
         Some(s) => s,
         None => {
             eprintln!("Session not found: {}", client_id);
+            // Send Disconnect packet to client before closing to let them know the session is dead
+            let response = Packet::Disconnect;
+            if let Ok(response_bytes) = bincode::serialize(&response) {
+                let _ = write_frame(&mut stream, &response_bytes).await;
+            }
             return Ok(());
         }
     };
@@ -391,9 +427,10 @@ async fn handle_client_tcp(mut stream: TcpStream, sessions: SessionMap) -> io::R
     }
 
     // Register the new TCP writer channel in the active session along with the connection ID
-    let mut active_tx = session.tcp_tx.lock().await;
-    *active_tx = Some((tcp_send_tx, conn_id));
-    drop(active_tx);
+    {
+        let mut active_tx = session.tcp_tx.lock().unwrap();
+        *active_tx = Some((tcp_send_tx, conn_id));
+    }
 
     // Split TCP stream
     let (mut reader, mut writer) = stream.into_split();
@@ -495,14 +532,22 @@ async fn handle_client_tcp(mut stream: TcpStream, sessions: SessionMap) -> io::R
     let mut heartbeat_task = tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            let tx_guard = tcp_send_tx_heartbeat.lock().await;
-            if let Some((tx, id)) = &*tx_guard {
-                if *id == conn_id {
-                    if tx.send(Packet::Heartbeat).await.is_err() {
-                        break;
+            let tx_opt = {
+                let tx_guard = tcp_send_tx_heartbeat.lock().unwrap();
+                if let Some((tx, id)) = &*tx_guard {
+                    if *id == conn_id {
+                        Some(tx.clone())
+                    } else {
+                        None
                     }
                 } else {
-                    break; // Replaced by newer connection, terminate this heartbeat task
+                    None
+                }
+            };
+
+            if let Some(tx) = tx_opt {
+                if tx.send(Packet::Heartbeat).await.is_err() {
+                    break;
                 }
             } else {
                 break;
@@ -522,22 +567,23 @@ async fn handle_client_tcp(mut stream: TcpStream, sessions: SessionMap) -> io::R
     reader_task.abort();
     heartbeat_task.abort();
 
-    let mut active_tx = session.tcp_tx.lock().await;
-    if let Some((_, active_id)) = &*active_tx {
-        if *active_id == conn_id {
-            *active_tx = None;
-            println!(
-                "Client connection lost for client_id={}, cleaning up active channel.",
-                session.client_id
-            );
-        } else {
-            println!(
-                "Client connection for client_id={} was replaced by a newer connection (conn_id={}), skipping cleanup.",
-                session.client_id, active_id
-            );
+    {
+        let mut active_tx = session.tcp_tx.lock().unwrap();
+        if let Some((_, active_id)) = &*active_tx {
+            if *active_id == conn_id {
+                *active_tx = None;
+                println!(
+                    "Client connection lost for client_id={}, cleaning up active channel.",
+                    session.client_id
+                );
+            } else {
+                println!(
+                    "Client connection for client_id={} was replaced by a newer connection (conn_id={}), skipping cleanup.",
+                    session.client_id, active_id
+                );
+            }
         }
     }
-    drop(active_tx);
 
     Ok(())
 }
