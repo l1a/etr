@@ -234,20 +234,26 @@ and the server has no port-forwarding logic.
 
 ## Known gaps / next steps
 
+- **`just test-local` reconnect test broken**: the happy-path test passes but the
+  reconnect step fails because `pgrep -x etr` cannot find the `etr` process when
+  launched from a non-interactive context (e.g. from within Claude Code / a tool
+  harness). Root cause unresolved — the session works, but the process is not visible
+  to pgrep in that environment. Needs investigation; reconnect can be verified manually
+  in a real terminal.
+- **Benchmarking**: no performance benchmarks exist. Key areas to measure: handshake
+  latency, per-packet encrypt/decrypt throughput (all four cipher suites), PTY
+  round-trip latency, and throughput under reconnect. Consider `criterion` for
+  micro-benchmarks and a `just bench-local` recipe for end-to-end latency.
 - **Mode 2 — port forwarding**: add `-L`/`-R` CLI flags to `etr` and implement the
   forwarding logic in `etrs`. The stream layer already supports it structurally.
-- **`--server-path`**: available if `etrs` is not in the SSH session PATH, but not
-  normally needed when `~/.cargo/bin` is in PATH.
-- **Multiple simultaneous sessions**: the daemon supports them (keyed by `session_id`)
-  but there is no way to list or attach to existing sessions from the CLI.
-- **Client log path**: not yet configurable via CLI flag.
+- **Multiple simultaneous sessions**: each `etr` invocation starts its own `etrs`
+  child; there is no way to list or re-attach to an existing session from a new client.
+  Session state (ID + passkey) is in-memory only.
+- **Re-attach from a new client machine**: the `session_id` and `passkey` are not
+  persisted anywhere, so a new machine cannot reconnect to an existing session.
+- **Client/server log path**: not yet configurable via CLI flag.
 - **Windows / macOS**: the PTY layer uses `portable-pty` (cross-platform) but has
   only been tested on Linux.
-- **PQC**: ML-KEM-768/1024 is compiled in and on by default (suite 1 negotiated).
-  Opt out with `--no-default-features`.
-- **Re-attach from a new client machine**: session state lives in the daemon process;
-  a new machine would need the original `session_id` and `passkey`, which are not
-  persisted anywhere.
 
 ---
 
