@@ -13,7 +13,10 @@ Welcome! This file contains project-specific guidelines, constraints, and instru
 * **Safety First:** Avoid `unsafe` Rust unless absolutely necessary for low-level system integrations (like PTY allocation). If `unsafe` is used, it must be thoroughly documented with safety comments.
 * **Idiomatic Rust:** Follow standard Rust styling, formatting (`rustfmt`), and linting (`clippy`). Prefer standard library constructs and robust, well-established crates (e.g., `tokio` for async, `clap` for CLI parsing).
 * **Architecture:** The design should support a client-server architecture similar to the original Eternal Terminal.
-* **Testing:** All new features must include unit or integration tests where applicable.
+* **Testing & Documentation Mandates:**
+  * When writing code, always write the corresponding tests to go with it.
+  * Always document the code clearly as you go.
+  * All new features must include unit or integration tests where applicable.
 
 ---
 
