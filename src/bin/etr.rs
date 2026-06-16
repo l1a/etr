@@ -234,8 +234,18 @@ async fn run_connection_loop(
         // Restore terminal state
         let _ = disable_raw_mode();
 
-        if let Err(e) = run_result {
-            eprintln!("\r\n[etr] Session connection dropped: {:?}", e);
+        match run_result {
+            Ok(_) => {
+                println!("\r\n[etr] Connection closed cleanly.");
+                return Ok(());
+            }
+            Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
+                println!("\r\n[etr] Connection closed cleanly.");
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("\r\n[etr] Session connection dropped: {:?}", e);
+            }
         }
     }
 }
@@ -347,7 +357,7 @@ async fn run_session(
 
     // Task to write data to server socket
     let cipher_clone = Arc::clone(&cipher);
-    let writer_task = tokio::spawn(async move {
+    let mut writer_task = tokio::spawn(async move {
         let mut transport_out_seq = 1;
         while let Some(packet) = tcp_send_rx.recv().await {
             if send_encrypted_writer(&mut writer, &cipher_clone, transport_out_seq, &packet)
@@ -363,7 +373,7 @@ async fn run_session(
     // Task to read data from local stdin and queue it to write
     let session_state_stdin = Arc::clone(session_state);
     let tcp_send_tx_stdin = tcp_send_tx.clone();
-    let stdin_task = tokio::task::spawn_blocking(move || {
+    let mut stdin_task = tokio::task::spawn_blocking(move || {
         use std::io::Read;
         let mut stdin = std::io::stdin();
         let mut buf = [0u8; 1024];
@@ -393,7 +403,7 @@ async fn run_session(
 
     // Task to read data from server TCP socket and write to local stdout
     let session_state_reader = Arc::clone(session_state);
-    let reader_task = tokio::spawn(async move {
+    let mut reader_task = tokio::spawn(async move {
         let mut expected_seq = {
             let guard = session_state_reader.lock().await;
             guard.next_in_seq
@@ -409,46 +419,61 @@ async fn run_session(
                     .await
                 {
                     Ok(Ok(bytes)) => bytes,
-                    Ok(Err(_)) => break, // Socket error or EOF
+                    Ok(Err(e)) => return Err(e), // Propagate socket EOF / read error
                     Err(_) => {
-                        eprintln!("\r\n[etr] Connection idle timeout. Reconnecting...");
-                        break;
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "Connection idle timeout",
+                        ));
                     }
                 };
 
             let decrypted = match cipher.decrypt(transport_in_seq, &encrypted) {
                 Ok(bytes) => bytes,
                 Err(e) => {
-                    eprintln!(
-                        "Decryption failed on client at transport_seq={}: {:?}",
-                        transport_in_seq, e
-                    );
-                    break;
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Decryption failed on client: {:?}", e),
+                    ));
                 }
             };
             transport_in_seq += 1;
 
             let packet: Packet = match bincode::deserialize(&decrypted) {
                 Ok(p) => p,
-                Err(_) => break,
+                Err(e) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Deserialization failed on client: {:?}", e),
+                    ));
+                }
             };
 
-            if let Packet::TerminalData { seq_num, data } = packet
-                && seq_num == expected_seq
-            {
-                let _ = stdout.write_all(&data);
-                let _ = stdout.flush();
-                expected_seq += 1;
+            match packet {
+                Packet::TerminalData { seq_num, data } => {
+                    if seq_num == expected_seq {
+                        let _ = stdout.write_all(&data);
+                        let _ = stdout.flush();
+                        expected_seq += 1;
 
-                let mut guard = session_state_reader.lock().await;
-                guard.next_in_seq = expected_seq;
+                        let mut guard = session_state_reader.lock().await;
+                        guard.next_in_seq = expected_seq;
+                    }
+                }
+                Packet::Disconnect => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "Clean disconnect from server",
+                    ));
+                }
+                _ => {}
             }
         }
     });
 
     // Task to poll terminal resize events
     let tcp_send_tx_resize = tcp_send_tx.clone();
-    let resize_task = tokio::spawn(async move {
+    let mut resize_task = tokio::spawn(async move {
         use tokio::signal::unix::{SignalKind, signal};
         if let Ok(mut sigwinch) = signal(SignalKind::window_change()) {
             while sigwinch.recv().await.is_some() {
@@ -464,7 +489,7 @@ async fn run_session(
 
     // Task to periodically send heartbeats every 5 seconds to prevent idle timeout
     let tcp_send_tx_heartbeat = tcp_send_tx.clone();
-    let heartbeat_task = tokio::spawn(async move {
+    let mut heartbeat_task = tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
             if tcp_send_tx_heartbeat.send(Packet::Heartbeat).await.is_err() {
@@ -474,15 +499,30 @@ async fn run_session(
     });
 
     // Wait for critical stream tasks to complete
-    tokio::select! {
-        _ = writer_task => {},
-        _ = stdin_task => {},
-        _ = reader_task => {},
-        _ = resize_task => {},
-        _ = heartbeat_task => {},
-    }
+    let reader_result = tokio::select! {
+        _ = &mut writer_task => Ok(()),
+        _ = &mut stdin_task => Ok(()),
+        res = &mut reader_task => {
+            match res {
+                Ok(result) => result,
+                Err(e) => Err(io::Error::other(format!(
+                    "Reader task panicked: {:?}",
+                    e
+                ))),
+            }
+        }
+        _ = &mut resize_task => Ok(()),
+        _ = &mut heartbeat_task => Ok(()),
+    };
 
-    Ok(())
+    // Abort all spawned tasks to clean up resources cleanly and prevent hangs
+    writer_task.abort();
+    stdin_task.abort();
+    reader_task.abort();
+    resize_task.abort();
+    heartbeat_task.abort();
+
+    reader_result
 }
 
 async fn send_encrypted_writer(

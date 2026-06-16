@@ -223,6 +223,8 @@ async fn handle_registration(mut stream: UnixStream, sessions: SessionMap) -> io
     // Spawn a task to read from PTY master and forward it to client
     let session_state_reader = Arc::clone(&session_state);
     let tcp_tx_reader = Arc::clone(&tcp_tx);
+    let sessions_cleanup = Arc::clone(&sessions);
+    let client_id_cleanup = client_id.clone();
     tokio::task::spawn_blocking(move || {
         let mut buf = [0u8; 4096];
         while let Ok(n) = pty_reader.read(&mut buf) {
@@ -254,6 +256,18 @@ async fn handle_registration(mut stream: UnixStream, sessions: SessionMap) -> io
             drop(tcp_tx_guard);
         }
         println!("PTY reader exited. Cleaning up session.");
+
+        // Remove session from map when PTY exits (logout)
+        let mut map = futures::executor::block_on(sessions_cleanup.lock());
+        map.remove(&client_id_cleanup);
+        drop(map);
+
+        // Also signal the client to disconnect cleanly
+        let mut tcp_tx_guard = futures::executor::block_on(tcp_tx_reader.lock());
+        if let Some((tx, _)) = &*tcp_tx_guard {
+            let _ = tx.blocking_send(Packet::Disconnect);
+        }
+        *tcp_tx_guard = None;
     });
 
     // Add session to map
@@ -385,7 +399,7 @@ async fn handle_client_tcp(mut stream: TcpStream, sessions: SessionMap) -> io::R
 
     // Task to write data to client TCP socket
     let cipher_clone = Arc::clone(&cipher);
-    let writer_task = tokio::spawn(async move {
+    let mut writer_task = tokio::spawn(async move {
         let mut transport_out_seq = 1;
         while let Some(packet) = tcp_send_rx.recv().await {
             if let Err(e) =
@@ -402,7 +416,7 @@ async fn handle_client_tcp(mut stream: TcpStream, sessions: SessionMap) -> io::R
     let session_state_writer = Arc::clone(&session.session_state);
     let pty_write_tx = session.pty_write_tx.clone();
     let master_clone = Arc::clone(&session.master);
-    let reader_task = tokio::spawn(async move {
+    let mut reader_task = tokio::spawn(async move {
         let mut expected_seq = {
             let guard = session_state_writer.lock().await;
             guard.next_in_seq
@@ -477,7 +491,7 @@ async fn handle_client_tcp(mut stream: TcpStream, sessions: SessionMap) -> io::R
 
     // Task to periodically send heartbeats every 5 seconds to prevent idle timeout
     let tcp_send_tx_heartbeat = session.tcp_tx.clone();
-    let heartbeat_task = tokio::spawn(async move {
+    let mut heartbeat_task = tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             let tx_guard = tcp_send_tx_heartbeat.lock().await;
@@ -497,10 +511,15 @@ async fn handle_client_tcp(mut stream: TcpStream, sessions: SessionMap) -> io::R
 
     // Wait for reader, writer or heartbeat task to finish (indicates connection drop)
     tokio::select! {
-        _ = writer_task => {},
-        _ = reader_task => {},
-        _ = heartbeat_task => {},
+        _ = &mut writer_task => {},
+        _ = &mut reader_task => {},
+        _ = &mut heartbeat_task => {},
     }
+
+    // Abort all spawned tasks to clean up socket resources cleanly and prevent task leakage
+    writer_task.abort();
+    reader_task.abort();
+    heartbeat_task.abort();
 
     let mut active_tx = session.tcp_tx.lock().await;
     if let Some((_, active_id)) = &*active_tx {
