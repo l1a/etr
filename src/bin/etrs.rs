@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use clap::{ArgAction, Parser, Subcommand};
-use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
-use std::collections::HashMap;
-use std::io::IsTerminal;
+use clap::{ArgAction, Parser};
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::{self, Read, Write};
-use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use std::time::Duration;
+use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, mpsc};
 
 static VERBOSITY: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
@@ -16,12 +13,9 @@ fn verbosity() -> u8 {
     *VERBOSITY.get().unwrap_or(&0)
 }
 
-/// Log to stderr if the global verbosity level is >= `$level`.
 macro_rules! vlog {
     ($level:expr, $($arg:tt)*) => {
-        if verbosity() >= $level {
-            eprintln!($($arg)*);
-        }
+        if verbosity() >= $level { eprintln!($($arg)*); }
     };
 }
 
@@ -50,185 +44,128 @@ use etr::transport::{ReceivedPacket, decode_data_packet, recv_packet, send_packe
 #[command(
     name = "etrs",
     version = "0.2.0",
-    about = "Eternal Terminal Server Daemon in Rust"
+    about = "Eternal Terminal Server — started per-session by etr via SSH"
 )]
 struct Cli {
-    /// UDP port the daemon listens on.
-    #[arg(short, long, default_value = "2022")]
+    /// UDP port to bind (0 = random)
+    #[arg(short, long, default_value = "0")]
     port: u16,
 
-    /// IP address to bind the UDP listener to.
+    /// IP address to bind
     #[arg(short, long, default_value = "[::]")]
     bind: String,
 
     /// Verbosity: -v session events, -vv cipher details, -vvv packet trace
-    #[arg(short = 'v', action = ArgAction::Count, global = true)]
+    #[arg(short = 'v', action = ArgAction::Count)]
     verbose: u8,
-
-    #[command(subcommand)]
-    command: Option<Commands>,
 }
 
-#[derive(Subcommand)]
-enum Commands {
-    /// Start the persistent background daemon
-    Daemon,
-    /// Register a new session (typically invoked via SSH)
-    Register,
-}
-
-/// State shared between the registration path and the UDP demux loop for one session.
-struct ActiveSession {
-    passkey: String,
-    session_state: Arc<Mutex<SessionState>>,
-    pty_write_tx: mpsc::Sender<Vec<u8>>,
-    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
-    /// Inbound packet channel: the demux loop sends here; the connection handler reads here.
-    /// Replaced on each reconnect, which drops the old Sender and closes the old Receiver.
-    inbound_tx: std::sync::Mutex<Option<mpsc::Sender<ReceivedPacket>>>,
-    /// Outbound envelope channel: PTY reader sends here; the connection handler encrypts + sends.
-    outbound_tx: std::sync::Mutex<Option<mpsc::Sender<Envelope>>>,
-}
-
-type SessionMap = Arc<std::sync::Mutex<HashMap<[u8; 16], Arc<ActiveSession>>>>;
-
-#[tokio::main]
-async fn main() -> io::Result<()> {
+fn main() -> io::Result<()> {
     let cli = Cli::parse();
     let _ = VERBOSITY.set(cli.verbose);
-    let cmd = cli.command.unwrap_or_else(|| {
-        if !io::stdin().is_terminal() {
-            Commands::Register
-        } else {
-            Commands::Daemon
-        }
-    });
-    match cmd {
-        Commands::Daemon => run_daemon(cli.bind, cli.port).await,
-        Commands::Register => run_register().await,
-    }
-}
 
-async fn run_register() -> io::Result<()> {
-    // run_register is invoked via SSH; keep its output minimal.
+    // Read session bootstrap line from SSH stdin: SESSION_ID_HEX/PASSKEY/TERM
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
     let input = input.trim();
     let parts: Vec<&str> = input.split('/').collect();
-    if parts.len() < 4 {
+    if parts.len() < 3 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "Expected SESSION_ID_HEX/PASSKEY/TERM/REG_PORT",
+            "Expected SESSION_ID_HEX/PASSKEY/TERM on stdin",
         ));
     }
-    let reg_port: u16 = parts[3]
-        .parse()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid reg_port"))?;
-    let mut stream = TcpStream::connect(("127.0.0.1", reg_port)).await?;
-    stream
-        .write_all(format!("{}/{}/{}\n", parts[0], parts[1], parts[2]).as_bytes())
-        .await?;
-    stream.flush().await?;
-    let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await?;
-    let response = String::from_utf8_lossy(&buf);
-    if response.trim() == "OK" {
-        vlog!(1, "Session registered successfully.");
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "Registration failed: {}",
-            response
-        )))
-    }
-}
-
-async fn run_daemon(bind_addr: String, port: u16) -> io::Result<()> {
-    eprintln!("Starting etrs daemon...");
-    let sessions: SessionMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
-
-    // TCP listener on localhost for SSH-bootstrapped registration.
-    // Port is fixed at UDP_port+1 so client and server always agree.
-    let reg_port = port + 1;
-    let reg_addr: SocketAddr = format!("127.0.0.1:{}", reg_port)
-        .parse()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    let tcp_listener = TcpListener::bind(reg_addr).await?;
-    vlog!(1, "[etrs] Registration listener on {}", reg_addr);
-    let sessions_reg = Arc::clone(&sessions);
-    tokio::spawn(async move {
-        while let Ok((stream, _)) = tcp_listener.accept().await {
-            let sess = Arc::clone(&sessions_reg);
-            tokio::spawn(async move {
-                if let Err(e) = handle_registration(stream, sess).await {
-                    eprintln!("[etrs] Registration error: {:?}", e);
-                }
-            });
-        }
-    });
-
-    // Single UDP socket — this loop is the exclusive reader.
-    let addr: SocketAddr = format!("{}:{}", bind_addr, port)
-        .parse()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    let socket = Arc::new(UdpSocket::bind(&addr).await?);
-    eprintln!("Listening on UDP {}", addr);
-
-    loop {
-        let pkt = match recv_packet(&socket).await? {
-            Some(p) => p,
-            None => continue, // unknown protocol version; skip
-        };
-
-        if pkt.header.is_handshake() {
-            // New connection or reconnect: spawn a handler for the handshake.
-            let sess = Arc::clone(&sessions);
-            let sock = Arc::clone(&socket);
-            tokio::spawn(async move {
-                if let Err(e) =
-                    handle_client_hello(pkt.peer, pkt.header, pkt.payload_bytes, sess, sock).await
-                {
-                    vlog!(1, "[etrs] Handshake error from {}: {:?}", pkt.peer, e);
-                }
-            });
-        } else {
-            // Data packet: route to the session's inbound channel.
-            let session_id = pkt.header.session_id;
-            let tx = sessions
-                .lock()
-                .unwrap()
-                .get(&session_id)
-                .and_then(|s| s.inbound_tx.lock().unwrap().clone());
-            if let Some(tx) = tx {
-                // Non-blocking: drop the packet if the handler is behind.
-                let _ = tx.try_send(pkt);
-            }
-        }
-    }
-}
-
-async fn handle_registration(mut stream: TcpStream, sessions: SessionMap) -> io::Result<()> {
-    let mut buf = vec![0u8; 1024];
-    let n = stream.read(&mut buf).await?;
-    let msg = String::from_utf8_lossy(&buf[..n]);
-    let parts: Vec<&str> = msg.trim().split('/').collect();
-    if parts.len() < 3 {
-        stream.write_all(b"ERROR: Invalid format").await?;
-        return Ok(());
-    }
-    let session_id: [u8; 16] = hex_decode(parts[0])
-        .and_then(|b| b.try_into().ok())
-        .ok_or_else(|| io::Error::other("Invalid session_id hex"))?;
+    let session_id = hex_decode(parts[0])
+        .and_then(|b| <[u8; 16]>::try_from(b).ok())
+        .ok_or_else(|| io::Error::other("invalid session_id hex"))?;
     let passkey = parts[1].to_string();
     let term = parts[2].to_string();
 
+    // Bind UDP socket synchronously so we know the actual port before fork.
+    let bind_str = format!("{}:{}", cli.bind, cli.port);
+    let std_socket = std::net::UdpSocket::bind(&bind_str)?;
+    std_socket.set_nonblocking(true)?;
+    let actual_port = std_socket.local_addr()?.port();
+
+    // Tell the client which port we bound so it can connect.
+    println!("PORT {actual_port}");
+    io::stdout().flush()?;
+
+    // Fork: parent exits (SSH session closes cleanly); child runs the session.
+    use nix::unistd::{ForkResult, fork, setsid};
+    match unsafe { fork() }.map_err(|e| io::Error::other(e.to_string()))? {
+        ForkResult::Parent { .. } => return Ok(()),
+        ForkResult::Child => {
+            setsid().ok();
+            detach_stdio()?;
+        }
+    }
+
+    // Child: build the Tokio runtime and run.
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run_session(std_socket, session_id, passkey, term))
+}
+
+/// Redirect stdin/stdout to /dev/null and stderr to the session log file.
+fn detach_stdio() -> io::Result<()> {
+    use nix::unistd::dup2;
+    use std::os::unix::io::IntoRawFd;
+
+    let null_fd = std::fs::File::open("/dev/null")
+        .map(|f| f.into_raw_fd())
+        .unwrap_or(-1);
+
+    let log_path = session_log_path();
+    if let Some(p) = log_path.parent() {
+        std::fs::create_dir_all(p).ok();
+    }
+    let log_fd = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .map(|f| f.into_raw_fd())
+        .unwrap_or(null_fd);
+
+    if null_fd >= 0 {
+        dup2(null_fd, 0).ok();
+        dup2(null_fd, 1).ok();
+    }
+    if log_fd >= 0 {
+        dup2(log_fd, 2).ok();
+    }
+    Ok(())
+}
+
+fn session_log_path() -> std::path::PathBuf {
+    dirs::state_dir()
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+                .join(".local/state")
+        })
+        .join("etr")
+        .join("etrs.log")
+}
+
+/// Run one reconnect-aware session until the client cleanly disconnects
+/// or the 30-minute reconnect window expires.
+async fn run_session(
+    std_socket: std::net::UdpSocket,
+    session_id: [u8; 16],
+    passkey: String,
+    term: String,
+) -> io::Result<()> {
+    let socket = Arc::new(UdpSocket::from_std(std_socket)?);
     vlog!(
         1,
-        "[etrs] Registering session id={} term={}",
-        parts[0],
-        term
+        "[etrs] session {} port={}",
+        hex_encode(&session_id),
+        socket.local_addr()?.port()
     );
 
+    // --- PTY setup ---
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -240,17 +177,18 @@ async fn handle_registration(mut stream: TcpStream, sessions: SessionMap) -> io:
         .map_err(io::Error::other)?;
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-    let mut cmd = CommandBuilder::new(shell);
-    cmd.env("TERM", term);
+    let mut cmd = CommandBuilder::new(&shell);
+    cmd.env("TERM", &term);
     let mut child = pair.slave.spawn_command(cmd).map_err(io::Error::other)?;
 
-    let master = pair.master;
-    let mut pty_reader = master.try_clone_reader().map_err(io::Error::other)?;
-    let mut pty_writer = master.take_writer().map_err(io::Error::other)?;
+    // These must be called before pair.master is moved into the Arc<Mutex<>>.
+    let mut pty_reader = pair.master.try_clone_reader().map_err(io::Error::other)?;
+    let mut pty_writer = pair.master.take_writer().map_err(io::Error::other)?;
+    let master = Arc::new(Mutex::new(pair.master));
 
-    let (pty_write_tx, mut pty_write_rx) = mpsc::channel::<Vec<u8>>(1000);
+    let (pty_in_tx, mut pty_in_rx) = mpsc::channel::<Vec<u8>>(1000);
     tokio::task::spawn_blocking(move || {
-        while let Some(data) = pty_write_rx.blocking_recv() {
+        while let Some(data) = pty_in_rx.blocking_recv() {
             if pty_writer.write_all(&data).is_err() {
                 break;
             }
@@ -258,288 +196,270 @@ async fn handle_registration(mut stream: TcpStream, sessions: SessionMap) -> io:
         }
     });
 
-    let master_shared = Arc::new(Mutex::new(master));
     let session_state = Arc::new(Mutex::new(SessionState::new(session_id, passkey.clone())));
 
-    let active = Arc::new(ActiveSession {
-        passkey,
-        session_state: Arc::clone(&session_state),
-        pty_write_tx,
-        master: Arc::clone(&master_shared),
-        inbound_tx: std::sync::Mutex::new(None),
-        outbound_tx: std::sync::Mutex::new(None),
-    });
+    // Pointer to the outbound channel for the current connection (None when disconnected).
+    let outbound_tx: Arc<std::sync::Mutex<Option<mpsc::Sender<Envelope>>>> =
+        Arc::new(std::sync::Mutex::new(None));
 
-    // Clean up on shell exit.
-    let sessions_cleanup = Arc::clone(&sessions);
-    let active_cleanup = Arc::clone(&active);
-    tokio::task::spawn_blocking(move || {
-        let _ = child.wait();
-        vlog!(
-            1,
-            "[etrs] Shell exited for session {}, cleaning up.",
-            hex_encode(&session_id)
-        );
-        sessions_cleanup.lock().unwrap().remove(&session_id);
-        // Signal any connected client to disconnect.
-        let tx = active_cleanup.outbound_tx.lock().unwrap().clone();
-        if let Some(tx) = tx {
-            let _ = tx.blocking_send(Envelope {
-                payload: Some(Payload::Disconnect(Disconnect {})),
-            });
-        }
-    });
+    // PTY reader: forwards PTY output into the session state and the outbound channel.
+    {
+        let outbound_tx = Arc::clone(&outbound_tx);
+        let session_state = Arc::clone(&session_state);
+        tokio::task::spawn_blocking(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match pty_reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let data = buf[..n].to_vec();
+                        let seq = {
+                            let mut s = futures::executor::block_on(session_state.lock());
+                            let st = s.stream_mut(0).expect("stream 0 always exists");
+                            let seq = st.next_out_seq;
+                            st.next_out_seq += 1;
+                            st.record_send(seq, data.clone());
+                            seq
+                        };
+                        let tx = outbound_tx.lock().unwrap().clone();
+                        if let Some(tx) = tx {
+                            let _ = tx.blocking_send(Envelope {
+                                payload: Some(Payload::StreamData(StreamData {
+                                    stream_id: 0,
+                                    seq_num: seq,
+                                    data,
+                                })),
+                            });
+                        }
+                    }
+                }
+            }
+        });
+    }
 
-    // Forward PTY output to any connected client via the outbound channel.
-    let session_state_pty = Arc::clone(&session_state);
-    let active_pty = Arc::clone(&active);
-    let sessions_pty = Arc::clone(&sessions);
-    tokio::task::spawn_blocking(move || {
-        let mut buf = [0u8; 4096];
-        while let Ok(n) = pty_reader.read(&mut buf) {
-            if n == 0 {
+    // Shell-exit watcher: sends Disconnect to the client when the shell exits.
+    {
+        let outbound_tx = Arc::clone(&outbound_tx);
+        let session_id_copy = session_id;
+        tokio::task::spawn_blocking(move || {
+            let _ = child.wait();
+            vlog!(
+                1,
+                "[etrs] shell exited for {}",
+                hex_encode(&session_id_copy)
+            );
+            if let Some(tx) = outbound_tx.lock().unwrap().clone() {
+                let _ = tx.blocking_send(Envelope {
+                    payload: Some(Payload::Disconnect(Disconnect {})),
+                });
+            }
+        });
+    }
+
+    // Pointer to the inbound channel for the current connection.
+    let inbound_tx: Arc<std::sync::Mutex<Option<mpsc::Sender<ReceivedPacket>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+
+    // Channel on which the routing task delivers ClientHello packets.
+    let (hello_tx, mut hello_rx) = mpsc::channel::<ReceivedPacket>(4);
+
+    // Routing task: reads the UDP socket and routes handshake vs. data packets.
+    {
+        let inbound_tx = Arc::clone(&inbound_tx);
+        let socket = Arc::clone(&socket);
+        tokio::spawn(async move {
+            loop {
+                let pkt = match recv_packet(&socket).await {
+                    Ok(Some(p)) => p,
+                    Ok(None) => continue,
+                    Err(_) => break,
+                };
+                if pkt.header.session_id != session_id {
+                    continue;
+                }
+                if pkt.header.is_handshake() {
+                    let _ = hello_tx.send(pkt).await;
+                } else {
+                    let tx = inbound_tx.lock().unwrap().clone();
+                    if let Some(tx) = tx {
+                        let _ = tx.try_send(pkt);
+                    }
+                }
+            }
+        });
+    }
+
+    // --- Reconnect loop ---
+    const RECONNECT_WINDOW: Duration = Duration::from_secs(30 * 60);
+
+    loop {
+        let hello_pkt = match tokio::time::timeout(RECONNECT_WINDOW, hello_rx.recv()).await {
+            Ok(Some(p)) => p,
+            _ => {
+                vlog!(1, "[etrs] reconnect window expired, shutting down");
                 break;
             }
-            let payload = buf[..n].to_vec();
-            let seq = {
-                let mut s = futures::executor::block_on(session_state_pty.lock());
-                let st = s.stream_mut(0).expect("stream 0 always exists");
-                let seq = st.next_out_seq;
-                st.next_out_seq += 1;
-                st.record_send(seq, payload.clone());
-                seq
-            };
-            let tx = active_pty.outbound_tx.lock().unwrap().clone();
-            if let Some(tx) = tx {
-                let _ = tx.blocking_send(Envelope {
+        };
+
+        let peer = hello_pkt.peer;
+        vlog!(
+            1,
+            "[etrs] ClientHello from {} session={}",
+            peer,
+            hex_encode(&session_id)
+        );
+
+        let server_last = session_state.lock().await.last_received_map();
+        let outcome = match process_client_hello(&hello_pkt.payload_bytes, server_last, |_| {
+            Some(passkey.clone())
+        }) {
+            Ok(o) => o,
+            Err(e) => {
+                vlog!(1, "[etrs] handshake failed from {}: {}", peer, e);
+                continue;
+            }
+        };
+
+        vlog!(
+            2,
+            "[etrs] handshake complete suite={} peer={}",
+            outcome.chosen_suite,
+            peer
+        );
+
+        let replays = {
+            let mut s = session_state.lock().await;
+            s.apply_server_acks(&outcome.client_last_received);
+            s.collect_replays(&outcome.client_last_received)
+        };
+
+        // Send ServerHello.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&outcome.response_header.encode());
+        buf.extend_from_slice(&outcome.response_payload_bytes);
+        socket.send_to(&buf, peer).await?;
+
+        let cipher = Arc::new(outcome.cipher);
+
+        // Create per-connection channels.
+        let (ob_tx, mut ob_rx) = mpsc::channel::<Envelope>(1000);
+        *outbound_tx.lock().unwrap() = Some(ob_tx.clone());
+
+        let (ib_tx, mut ib_rx) = mpsc::channel::<ReceivedPacket>(256);
+        *inbound_tx.lock().unwrap() = Some(ib_tx);
+
+        // Queue replays ahead of live data.
+        for (stream_id, packets) in replays {
+            for (seq, data) in packets {
+                let _ = ob_tx.try_send(Envelope {
                     payload: Some(Payload::StreamData(StreamData {
-                        stream_id: 0,
+                        stream_id,
                         seq_num: seq,
-                        data: payload,
+                        data,
                     })),
                 });
             }
         }
-        vlog!(
-            2,
-            "[etrs] PTY reader exited for session {}.",
-            hex_encode(&session_id)
-        );
-        sessions_pty.lock().unwrap().remove(&session_id);
-    });
 
-    sessions.lock().unwrap().insert(session_id, active);
-    stream.write_all(b"OK").await?;
-    Ok(())
-}
+        // Writer task.
+        let socket_w = Arc::clone(&socket);
+        let cipher_w = Arc::clone(&cipher);
+        let session_w = Arc::clone(&session_state);
+        let mut writer = tokio::spawn(async move {
+            use prost::Message as _;
+            while let Some(env) = ob_rx.recv().await {
+                let seq = {
+                    let mut s = session_w.lock().await;
+                    s.next_packet_seq()
+                };
+                vlog!(
+                    3,
+                    "[etrs] → {} seq={} {}b peer={}",
+                    payload_type(env.payload.as_ref()),
+                    seq,
+                    env.encoded_len(),
+                    peer
+                );
+                let header = PacketHeader::new(0, session_id, seq);
+                let _ = send_packet(&socket_w, peer, &header, &env, Some(&cipher_w)).await;
+            }
+        });
 
-async fn handle_client_hello(
-    peer: SocketAddr,
-    header: PacketHeader,
-    payload_bytes: Vec<u8>,
-    sessions: SessionMap,
-    socket: Arc<UdpSocket>,
-) -> io::Result<()> {
-    let session_id = header.session_id;
-
-    // Look up passkey and active session — drop the std Mutex guard before any .await.
-    let (passkey, active) = {
-        let guard = sessions.lock().unwrap();
-        let s = guard
-            .get(&session_id)
-            .ok_or_else(|| io::Error::other("unknown session"))?;
-        (s.passkey.clone(), Arc::clone(s))
-        // guard dropped here
-    };
-    let server_last_received = active.session_state.lock().await.last_received_map();
-
-    vlog!(
-        1,
-        "[etrs] ClientHello from {}  session={}",
-        peer,
-        hex_encode(&session_id)
-    );
-
-    let outcome = process_client_hello(&payload_bytes, server_last_received, |_| {
-        Some(passkey.clone())
-    })
-    .map_err(|e| io::Error::other(e.to_string()))?;
-
-    vlog!(
-        2,
-        "[etrs] Handshake complete  suite={}  session={}  peer={}",
-        outcome.chosen_suite,
-        hex_encode(&outcome.session_id),
-        peer
-    );
-
-    // Apply client acks and collect replay packets.
-    let replays = {
-        let mut s = active.session_state.lock().await;
-        s.apply_server_acks(&outcome.client_last_received);
-        s.collect_replays(&outcome.client_last_received)
-    };
-
-    // Send ServerHello (pre-encrypted with the hello key).
-    let mut buf =
-        Vec::with_capacity(etr::protocol::HEADER_SIZE + outcome.response_payload_bytes.len());
-    buf.extend_from_slice(&outcome.response_header.encode());
-    buf.extend_from_slice(&outcome.response_payload_bytes);
-    socket.send_to(&buf, peer).await?;
-
-    let cipher = Arc::new(outcome.cipher);
-
-    // Create per-connection inbound channel and register it so the demux loop
-    // can route data packets here.  Replacing the Sender closes the previous
-    // Receiver, which cleanly terminates any prior connection's reader task.
-    let (inbound_tx, mut inbound_rx) = mpsc::channel::<ReceivedPacket>(256);
-    *active.inbound_tx.lock().unwrap() = Some(inbound_tx);
-
-    // Create per-connection outbound channel and wire the PTY reader into it.
-    let (outbound_tx, mut outbound_rx) = mpsc::channel::<Envelope>(1000);
-    *active.outbound_tx.lock().unwrap() = Some(outbound_tx);
-
-    // Queue replay packets ahead of live data.
-    for (stream_id, packets) in replays {
-        for (seq, data) in packets {
-            if active
-                .outbound_tx
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|tx| {
-                    tx.try_send(Envelope {
-                        payload: Some(Payload::StreamData(StreamData {
-                            stream_id,
-                            seq_num: seq,
-                            data,
-                        })),
-                    })
-                    .is_ok()
-                })
-                .unwrap_or(false)
-            {}
-        }
-    }
-
-    let session_id = outcome.session_id;
-    let socket_w = Arc::clone(&socket);
-    let cipher_w = Arc::clone(&cipher);
-    let session_w = Arc::clone(&active.session_state);
-
-    // Writer task: encrypt and send each outbound envelope to the client.
-    let mut writer = tokio::spawn(async move {
-        use prost::Message as _;
-        while let Some(envelope) = outbound_rx.recv().await {
-            let seq = {
-                let mut s = session_w.lock().await;
-                s.next_packet_seq()
-            };
-            vlog!(
-                3,
-                "[etrs] → {} seq={} {}b  peer={}",
-                payload_type(envelope.payload.as_ref()),
-                seq,
-                envelope.encoded_len(),
-                peer
-            );
-            let header = PacketHeader::new(0, session_id, seq);
-            let _ = send_packet(&socket_w, peer, &header, &envelope, Some(&cipher_w)).await;
-        }
-    });
-
-    // Reader task: drain the inbound channel (filled by the demux loop) and
-    // dispatch to PTY / resize / control handlers.
-    let cipher_r = Arc::clone(&cipher);
-    let session_r = Arc::clone(&active.session_state);
-    let pty_tx = active.pty_write_tx.clone();
-    let master = Arc::clone(&active.master);
-    let mut reader = tokio::spawn(async move {
-        loop {
-            let pkt =
-                match tokio::time::timeout(std::time::Duration::from_secs(15), inbound_rx.recv())
-                    .await
-                {
-                    Ok(Some(p)) => p,
-                    Ok(None) => {
+        // Reader task — returns true on clean Disconnect, false on timeout/replacement.
+        let cipher_r = Arc::clone(&cipher);
+        let session_r = Arc::clone(&session_state);
+        let pty_tx = pty_in_tx.clone();
+        let master_r = Arc::clone(&master);
+        let mut reader = tokio::spawn(async move {
+            loop {
+                match tokio::time::timeout(Duration::from_secs(15), ib_rx.recv()).await {
+                    Ok(Some(pkt)) => {
+                        if pkt.header.is_handshake() {
+                            return false;
+                        }
+                        let env = match decode_data_packet(
+                            &pkt.payload_bytes,
+                            pkt.header.packet_seq,
+                            &cipher_r,
+                        ) {
+                            Ok(e) => e,
+                            Err(_) => continue,
+                        };
                         vlog!(
-                            1,
-                            "[etrs] Connection replaced for {}  session={}",
-                            peer,
-                            hex_encode(&session_id)
+                            3,
+                            "[etrs] ← {} seq={} {}b peer={}",
+                            payload_type(env.payload.as_ref()),
+                            pkt.header.packet_seq,
+                            pkt.payload_bytes.len(),
+                            peer
                         );
-                        break; // channel replaced by a reconnect; exit cleanly
+                        match env.payload {
+                            Some(Payload::StreamData(sd)) if sd.stream_id == 0 => {
+                                let expected = {
+                                    let s = session_r.lock().await;
+                                    s.stream(0).map(|st| st.next_in_seq).unwrap_or(1)
+                                };
+                                if sd.seq_num == expected {
+                                    let _ = pty_tx.send(sd.data).await;
+                                    let mut s = session_r.lock().await;
+                                    if let Some(st) = s.stream_mut(0) {
+                                        st.next_in_seq += 1;
+                                    }
+                                }
+                            }
+                            Some(Payload::TerminalResize(tr)) => {
+                                let m = master_r.lock().await;
+                                let _ = m.resize(PtySize {
+                                    rows: tr.rows as u16,
+                                    cols: tr.cols as u16,
+                                    pixel_width: 0,
+                                    pixel_height: 0,
+                                });
+                            }
+                            Some(Payload::Disconnect(_)) => return true,
+                            Some(Payload::Heartbeat(_)) => {}
+                            _ => {}
+                        }
                     }
+                    Ok(None) => return false,
                     Err(_) => {
                         vlog!(
                             1,
-                            "[etrs] Client {} timed out  session={}",
-                            peer,
-                            hex_encode(&session_id)
+                            "[etrs] client {} heartbeat timeout, awaiting reconnect",
+                            peer
                         );
-                        break;
-                    }
-                };
-
-            // A handshake packet arriving here means the client is reconnecting;
-            // the new handle_client_hello call will replace our inbound channel.
-            if pkt.header.is_handshake() {
-                break;
-            }
-
-            let envelope =
-                match decode_data_packet(&pkt.payload_bytes, pkt.header.packet_seq, &cipher_r) {
-                    Ok(e) => e,
-                    Err(_) => continue,
-                };
-
-            vlog!(
-                3,
-                "[etrs] ← {} seq={} {}b  peer={}",
-                payload_type(envelope.payload.as_ref()),
-                pkt.header.packet_seq,
-                pkt.payload_bytes.len(),
-                peer
-            );
-
-            match envelope.payload {
-                Some(Payload::StreamData(sd)) if sd.stream_id == 0 => {
-                    let expected = {
-                        let s = session_r.lock().await;
-                        s.stream(0).map(|st| st.next_in_seq).unwrap_or(1)
-                    };
-                    if sd.seq_num == expected {
-                        let _ = pty_tx.send(sd.data).await;
-                        let mut s = session_r.lock().await;
-                        if let Some(st) = s.stream_mut(0) {
-                            st.next_in_seq += 1;
-                        }
+                        return false;
                     }
                 }
-                Some(Payload::TerminalResize(tr)) => {
-                    let m = master.lock().await;
-                    let _ = m.resize(PtySize {
-                        rows: tr.rows as u16,
-                        cols: tr.cols as u16,
-                        pixel_width: 0,
-                        pixel_height: 0,
-                    });
-                }
-                Some(Payload::Disconnect(_)) => break,
-                Some(Payload::Heartbeat(_)) => {}
-                _ => {}
             }
-        }
-        Ok::<_, io::Error>(())
-    });
+        });
 
-    // Heartbeat task.
-    let outbound_hb = active.outbound_tx.lock().unwrap().clone();
-    let mut hb_task = tokio::spawn(async move {
-        if let Some(tx) = outbound_hb {
+        // Heartbeat task.
+        let ob_hb = ob_tx.clone();
+        let mut hb = tokio::spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                if tx
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                if ob_hb
                     .send(Envelope {
                         payload: Some(Payload::Heartbeat(Heartbeat {})),
                     })
@@ -549,27 +469,30 @@ async fn handle_client_hello(
                     break;
                 }
             }
+        });
+
+        let clean_disconnect = tokio::select! {
+            r = &mut reader => r.unwrap_or(false),
+            _ = &mut writer => false,
+            _ = &mut hb    => false,
+        };
+        writer.abort();
+        reader.abort();
+        hb.abort();
+        *outbound_tx.lock().unwrap() = None;
+        *inbound_tx.lock().unwrap() = None;
+
+        if clean_disconnect {
+            vlog!(1, "[etrs] client disconnected cleanly, shutting down");
+            break;
         }
-    });
-
-    tokio::select! {
-        _ = &mut writer  => {}
-        _ = &mut reader  => {}
-        _ = &mut hb_task => {}
     }
-    writer.abort();
-    reader.abort();
-    hb_task.abort();
-
-    // Clear the channels so the PTY reader stops queuing into the dead connection.
-    *active.inbound_tx.lock().unwrap() = None;
-    *active.outbound_tx.lock().unwrap() = None;
 
     Ok(())
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
@@ -590,7 +513,7 @@ mod tests {
     #[test]
     fn test_cli_defaults() {
         let cli = Cli::try_parse_from(["etrs"]).unwrap();
-        assert_eq!(cli.port, 2022);
+        assert_eq!(cli.port, 0);
         assert_eq!(cli.bind, "[::]");
         assert_eq!(cli.verbose, 0);
     }
@@ -605,18 +528,6 @@ mod tests {
     fn test_cli_custom_port() {
         let cli = Cli::try_parse_from(["etrs", "--port", "3000"]).unwrap();
         assert_eq!(cli.port, 3000);
-    }
-
-    #[test]
-    fn test_cli_daemon_subcommand() {
-        let cli = Cli::try_parse_from(["etrs", "daemon"]).unwrap();
-        assert!(matches!(cli.command, Some(Commands::Daemon)));
-    }
-
-    #[test]
-    fn test_cli_register_subcommand() {
-        let cli = Cli::try_parse_from(["etrs", "register"]).unwrap();
-        assert!(matches!(cli.command, Some(Commands::Register)));
     }
 
     #[test]

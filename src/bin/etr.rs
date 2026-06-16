@@ -77,12 +77,8 @@ use prost::Message as _;
     about = "Eternal Terminal Client in Rust"
 )]
 struct Cli {
-    /// Remote host target (e.g. user@host[:port] or host[:port])
+    /// Remote host (e.g. user@host or host)
     target: Option<String>,
-
-    /// Remote UDP port of etr server
-    #[arg(short, long, default_value = "2022")]
-    port: u16,
 
     /// SSH port for initial authentication
     #[arg(short = 's', long, default_value = "22")]
@@ -169,7 +165,7 @@ async fn main() -> io::Result<()> {
         }
     };
 
-    let (target, port) = parse_target(&target_input, cli.port);
+    let target = target_input;
 
     let session_id = generate_session_id();
     let passkey = generate_passkey();
@@ -182,44 +178,33 @@ async fn main() -> io::Result<()> {
         target
     );
 
-    bootstrap_ssh(
+    let server_port = bootstrap_ssh(
         &target,
         cli.ssh_port,
         &session_id,
         &passkey,
         &term,
         &cli.server_path,
-        port + 1,
     )?;
+
+    vlog!(cli.verbose, 2, "[etr] etrs bound to port {}", server_port);
 
     let session = Arc::new(Mutex::new(SessionState::new(session_id, passkey.clone())));
 
-    if let Err(e) =
-        run_connection_loop(target, port, passkey, session_id, session, cli.verbose).await
+    if let Err(e) = run_connection_loop(
+        target,
+        server_port,
+        passkey,
+        session_id,
+        session,
+        cli.verbose,
+    )
+    .await
     {
         eprintln!("Session terminated: {:?}", e);
     }
 
     Ok(())
-}
-
-fn parse_target(target_str: &str, default_port: u16) -> (String, u16) {
-    if let Some(r_bracket_idx) = target_str.rfind(']') {
-        if let Some(colon_idx) = target_str[r_bracket_idx..].find(':') {
-            let abs = r_bracket_idx + colon_idx;
-            if let Ok(p) = target_str[abs + 1..].parse::<u16>() {
-                return (target_str[..abs].to_string(), p);
-            }
-        }
-        return (target_str.to_string(), default_port);
-    }
-    if let Some(colon_idx) = target_str.find(':')
-        && target_str.chars().filter(|&c| c == ':').count() == 1
-        && let Ok(p) = target_str[colon_idx + 1..].parse::<u16>()
-    {
-        return (target_str[..colon_idx].to_string(), p);
-    }
-    (target_str.to_string(), default_port)
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -235,6 +220,8 @@ fn generate_passkey() -> String {
         .collect()
 }
 
+/// SSH to the target, start `etrs`, send session credentials via stdin,
+/// and read back the UDP port that `etrs` bound.
 fn bootstrap_ssh(
     target: &str,
     ssh_port: u16,
@@ -242,15 +229,13 @@ fn bootstrap_ssh(
     passkey: &str,
     term: &str,
     server_path: &str,
-    reg_port: u16,
-) -> io::Result<()> {
+) -> io::Result<u16> {
     let session_id_hex = hex_encode(session_id);
-    let remote_command = format!("{} register", server_path);
     let mut child = Command::new("ssh")
         .arg("-p")
         .arg(ssh_port.to_string())
         .arg(target)
-        .arg(&remote_command)
+        .arg(server_path)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
@@ -260,8 +245,8 @@ fn bootstrap_ssh(
         .stdin
         .take()
         .ok_or_else(|| io::Error::other("Failed to open SSH stdin pipe"))?;
-    stdin
-        .write_all(format!("{}/{}/{}/{}\n", session_id_hex, passkey, term, reg_port).as_bytes())?;
+    // Format: SESSION_ID_HEX/PASSKEY/TERM  (3 fields, no reg_port)
+    stdin.write_all(format!("{}/{}/{}\n", session_id_hex, passkey, term).as_bytes())?;
     stdin.flush()?;
     drop(stdin);
 
@@ -269,10 +254,23 @@ fn bootstrap_ssh(
     if !output.status.success() {
         return Err(io::Error::other(format!(
             "SSH bootstrap failed: {}",
-            String::from_utf8_lossy(&output.stdout).trim()
+            String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    Ok(())
+
+    // Parse "PORT <number>" from etrs stdout.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if let Some(port_str) = line.trim().strip_prefix("PORT ")
+            && let Ok(port) = port_str.trim().parse::<u16>()
+        {
+            return Ok(port);
+        }
+    }
+    Err(io::Error::other(format!(
+        "etrs did not report a port (stdout: {:?})",
+        stdout.trim()
+    )))
 }
 
 async fn run_connection_loop(
@@ -414,15 +412,15 @@ async fn run_connection_loop(
 
         match result {
             Ok(_) => {
-                vlog!(verbose, 1, "[etr] Connection closed cleanly.\r");
+                vlog!(verbose, 1, "[etr] Connection closed cleanly.");
                 std::process::exit(0);
             }
             Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
-                vlog!(verbose, 1, "[etr] Connection closed cleanly.\r");
+                vlog!(verbose, 1, "[etr] Connection closed cleanly.");
                 std::process::exit(0);
             }
             Err(e) => {
-                vlog!(verbose, 1, "[etr] Session dropped: {:?}\r", e);
+                vlog!(verbose, 1, "[etr] Session dropped: {:?}", e);
             }
         }
     }
@@ -580,6 +578,9 @@ async fn run_session(
                         "clean disconnect from server",
                     ));
                 }
+                Some(Payload::Heartbeat(_)) => {
+                    vlog!(verbose, 3, "[etr] ← heartbeat");
+                }
                 _ => {}
             }
         }
@@ -608,8 +609,11 @@ async fn run_session(
     // Task: heartbeats every 5 s.
     let send_tx_hb = send_tx.clone();
     let mut hb_task = tokio::spawn(async move {
+        let mut hb_count: u64 = 0;
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
+            hb_count += 1;
+            vlog!(verbose, 3, "[etr] → heartbeat #{}", hb_count);
             if send_tx_hb
                 .send(Envelope {
                     payload: Some(Payload::Heartbeat(Heartbeat {})),
@@ -664,25 +668,11 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_target() {
-        assert_eq!(parse_target("host", 2022), ("host".to_string(), 2022));
-        assert_eq!(parse_target("host:1234", 2022), ("host".to_string(), 1234));
-        assert_eq!(
-            parse_target("user@host:3000", 2022),
-            ("user@host".to_string(), 3000)
-        );
-        assert_eq!(parse_target("::1", 2022), ("::1".to_string(), 2022));
-        assert_eq!(
-            parse_target("[::1]:1234", 2022),
-            ("[::1]".to_string(), 1234)
-        );
-        assert_eq!(
-            parse_target("user@[::1]:1234", 2022),
-            ("user@[::1]".to_string(), 1234)
-        );
-        assert_eq!(
-            parse_target("user@[::1]", 2022),
-            ("user@[::1]".to_string(), 2022)
-        );
+    fn test_target_passthrough() {
+        // target is now passed as-is to SSH; no port stripping needed.
+        let cli = Cli::try_parse_from(["etr", "user@host"]).unwrap();
+        assert_eq!(cli.target.as_deref(), Some("user@host"));
+        let cli = Cli::try_parse_from(["etr", "localhost"]).unwrap();
+        assert_eq!(cli.target.as_deref(), Some("localhost"));
     }
 }

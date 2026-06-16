@@ -10,9 +10,9 @@ a custom handshake, and modern cryptography.
 
 ## Current state: working end-to-end on localhost
 
-The full round-trip works: `etrs daemon` on the server, `etr <host>` on the client,
-SSH bootstrap, UDP handshake, live PTY session, heartbeat keepalive, and transparent
-reconnect after network loss. All verified by `just test-local`.
+The full round-trip works: `etr <host>` on the client, SSH bootstrap that starts
+`etrs` on the fly, UDP handshake, live PTY session, heartbeat keepalive, and
+transparent reconnect after network loss. All verified by `just test-local`.
 
 ---
 
@@ -22,7 +22,7 @@ reconnect after network loss. All verified by `just test-local`.
 
 | Binary | Role |
 |--------|------|
-| `etrs` | Server daemon — listens on UDP, manages sessions, spawns PTYs |
+| `etrs` | Per-session server — started by `etr` via SSH, forks after binding a port, exits on clean disconnect |
 | `etr`  | Client — SSH bootstrap, UDP connection loop, raw-mode terminal |
 
 ### Connection lifecycle
@@ -33,48 +33,46 @@ reconnect after network loss. All verified by `just test-local`.
    │
    ├─ 1. generate session_id + passkey (random)
    │
-   ├─ 2. ssh target "etrs register"
-   │       stdin: session_id_hex/passkey/term/reg_port
+   ├─ 2. ssh target "etrs"
+   │       stdin: session_id_hex/passkey/term
    │                                         │
-   │                                   etrs register
-   │                                         │ TCP 127.0.0.1:2023
-   │                                         ▼
-   │                                   etrs daemon
-   │                                   (stores session)
+   │                                        etrs
+   │                                         │ binds UDP port 0 (OS assigns)
+   │                                         │ prints "PORT <n>" to stdout
+   │                                         │ forks → parent exits (SSH returns)
+   │                                         │ child: detaches stdio, runs session
+   │◄── reads "PORT <n>" from SSH stdout ────┘
    │
-   └─ 3. UDP ClientHello ──────────────────► etrs daemon
+   └─ 3. UDP ClientHello ──────────────────► etrs child
           (encrypted with hello_key         ServerHello ◄──┘
            derived from passkey)
                                              KEM key exchange
                                              session key derived
    ◄──────────────── UDP data ──────────────►
          (AEAD encrypted, seq-numbered)
+
+   (on clean Disconnect: etrs child exits; no daemon remains)
 ```
 
 ### SSH bootstrap detail
 
-`etr` runs `ssh -p <ssh_port> <target> etrs register` and writes
-`session_id_hex/passkey/term/reg_port\n` to stdin. The `etrs register` subcommand
-reads this from stdin and forwards it to the daemon over a local TCP connection on
-`127.0.0.1:(udp_port+1)` (default: 2023). This gives the daemon the passkey it needs
-to decrypt the first `ClientHello` before the UDP client arrives.
+`etr` runs `ssh -p <ssh_port> <target> etrs` and writes
+`session_id_hex/passkey/term\n` to stdin. `etrs` reads this, binds a random UDP port,
+prints `PORT <actual_port>` to stdout (which `etr` reads), then forks:
 
-**Why TCP not Unix socket**: A Unix domain socket path depends on `$XDG_RUNTIME_DIR`,
-which is set in interactive sessions (by PAM/systemd-logind) but may not be set in
-non-interactive SSH sessions. A TCP loopback port has no such environment dependency.
+- **Parent**: exits immediately, allowing the SSH connection to close cleanly.
+- **Child**: calls `setsid()`, redirects stdio to `/dev/null` (stderr → session log),
+  then builds a Tokio runtime and runs the session loop.
 
-**Why `reg_port = udp_port + 1`**: No CLI flags needed on `etrs register` (clap
-global-arg propagation to subcommands is unreliable after the subcommand name); the
-port is passed through the existing stdin channel instead, and the daemon derives it
-from its own UDP port so both sides always agree.
+`etr` learns the port from SSH stdout before the connection closes.
 
 ### Reconnect
 
 The client detects a dropped connection via a 15-second idle timeout on heartbeats.
 It loops: re-handshake, replay any unacknowledged sends, resume the PTY stream.
 The server keeps session state (cipher, stream history, PTY) alive across reconnects
-indefinitely. A new UDP port/address is fine — the session is keyed by `session_id`,
-not the peer address.
+for up to 30 minutes. A new UDP source address is fine — the session is keyed by
+`session_id`, not the peer address. On clean disconnect, `etrs` exits immediately.
 
 ---
 
@@ -89,11 +87,12 @@ not the peer address.
 | 3 | X25519      | AES-256-GCM | HKDF-SHA-256  | (default) |
 | 4 | X25519      | ChaCha20-Poly1305 | HKDF-SHA-256 | (default) |
 
-Without `--features pqc`, suites 1 and 2 are compiled out and the client advertises
-`[3, 4]`. Suite 3 (X25519+AES-256-GCM) is selected in normal use. To enable PQC:
+PQC suites are **on by default**. Without `--no-default-features`, the client
+advertises `[1, 2, 3, 4]` and negotiates ML-KEM-1024 (suite 1). To build without
+PQC (smaller binary, no post-quantum crypto):
 ```
-cargo build --features pqc
-cargo install --path . --features pqc
+cargo build --no-default-features
+cargo install --path . --no-default-features
 ```
 
 ### Key derivation
@@ -133,9 +132,9 @@ Both binaries support `-v` / `-vv` / `-vvv` (SSH-style count):
 
 | Level | `etrs` shows | `etr` shows |
 |-------|-------------|-------------|
-| `-v`  | session lifecycle (register, handshake, timeout, disconnect) | connection events |
-| `-vv` | cipher suite negotiated, session ID | cipher suite, session ID |
-| `-vvv` | every packet (type, seq, size, peer) | every packet send/recv |
+| `-v`  | session lifecycle (register, handshake, timeout, disconnect) | connection events (connect, reconnect, disconnect) |
+| `-vv` | cipher suite negotiated, session ID | cipher suite, session ID, connection parameters |
+| `-vvv` | every packet (type, seq, size, peer) | every packet send/recv, heartbeats |
 
 **Client log file**: when `etr` is run interactively with `-v` or higher, logs go to
 `$XDG_STATE_HOME/etr/etr.log` (default: `~/.local/state/etr/etr.log`) rather than
@@ -143,8 +142,8 @@ stderr, to avoid corrupting the raw-mode terminal display. A single line on stde
 tells you where to look. Watch it live with `tail -f ~/.local/state/etr/etr.log` or
 `just log` (which tails the server log; add a client equivalent if needed).
 
-**Server log file**: `etrs daemon` writes to stderr; redirect it yourself or use the
-`just test-local` recipe which captures it to `$XDG_STATE_HOME/etr/etrs.log`.
+**Server log file**: `etrs` writes to `$XDG_STATE_HOME/etr/etrs.log` (default:
+`~/.local/state/etr/etrs.log`) after forking. Watch with `just log`.
 
 ---
 
@@ -152,9 +151,8 @@ tells you where to look. Watch it live with `tail -f ~/.local/state/etr/etr.log`
 
 | Resource | Default | Override |
 |----------|---------|----------|
-| UDP data port | 2022 | `etrs -p PORT` / `etr -p PORT` |
-| TCP registration port | udp+1 = 2023 | (derived, not configurable separately) |
-| Server log | stderr | redirect manually |
+| UDP data port | OS-assigned (random high port) | `etrs -p PORT` |
+| Server log | `~/.local/state/etr/etrs.log` | (not yet configurable) |
 | Client log | `~/.local/state/etr/etr.log` | (not yet configurable) |
 | Server bind address | `[::]` (dual-stack) | `etrs -b ADDR` |
 
@@ -174,8 +172,8 @@ just install          # copies target/debug/{etr,etrs} to ~/.cargo/bin
 cargo build --release
 just install-release  # copies target/release/{etr,etrs} to ~/.cargo/bin
 
-# With post-quantum crypto
-cargo install --path . --features pqc
+# Without post-quantum crypto (opt out)
+cargo install --path . --no-default-features
 
 # Code quality gate (run before pushing)
 just check            # cargo fmt --check + cargo clippy -D warnings
@@ -187,15 +185,15 @@ just test             # cargo test (91 tests as of this writing)
 ## Running
 
 ```bash
-# On the server (or localhost for testing)
-etrs daemon               # listens UDP [::]:2022, TCP reg 127.0.0.1:2023
-etrs daemon -vvv          # with full packet trace
+# No pre-started server needed — etr starts etrs on the fly via SSH.
 
 # On the client
 etr user@host             # standard connect
 etr localhost             # localhost testing (SSH to localhost must be configured)
 etr -vvv host             # verbose — shown on stderr before session, then logged to
                           #   ~/.local/state/etr/etr.log during raw-mode session
+
+# Server logs land in ~/.local/state/etr/etrs.log on the server.
 
 # Prerequisites for localhost testing
 ssh-copy-id localhost     # or append ~/.ssh/id_*.pub to ~/.ssh/authorized_keys
@@ -211,18 +209,12 @@ just test-local
 
 ### Mode 1 — Persistent reconnecting shell (like mosh)
 
-The primary use case. `etr user@host` should work with **no pre-configuration on the
-server** — analogous to how mosh works. The client SSHes to the server, uses that SSH
-connection to start `etrs` on the fly (not a pre-running daemon), and then hands off
-to UDP for the persistent session.
+The primary use case. `etr user@host` works with **no pre-configuration on the
+server** — analogous to how mosh works. The client SSHes to the server, `etrs` is
+started on the fly, binds a random UDP port, forks, and the SSH connection closes.
+`etr` then connects to the UDP port for the persistent session.
 
-**Current state**: requires `etrs daemon` to be running on the server beforehand.
-**Required change**: `etr` should SSH in and run `etrs daemon --background` (or
-equivalent) if no daemon is already listening, rather than assuming one exists. The
-daemon should daemonize, write a PID file, and exit the SSH foreground process, then
-`etrs register` completes as now. On subsequent connections to the same host, `etr`
-detects the daemon is already running (via the registration port) and skips starting
-a new one.
+**Current state**: fully implemented.
 
 ### Mode 2 — Persistent port forwarding (like `ssh -L`/`-R`)
 
@@ -242,9 +234,6 @@ and the server has no port-forwarding logic.
 
 ## Known gaps / next steps
 
-- **Mode 1 — auto-start daemon**: `etr` should start `etrs` on the server via SSH if
-  no daemon is running, rather than requiring it to be pre-started. This is the most
-  important missing piece for the mosh-like UX.
 - **Mode 2 — port forwarding**: add `-L`/`-R` CLI flags to `etr` and implement the
   forwarding logic in `etrs`. The stream layer already supports it structurally.
 - **`--server-path`**: available if `etrs` is not in the SSH session PATH, but not
@@ -254,15 +243,15 @@ and the server has no port-forwarding logic.
 - **Client log path**: not yet configurable via CLI flag.
 - **Windows / macOS**: the PTY layer uses `portable-pty` (cross-platform) but has
   only been tested on Linux.
-- **PQC**: ML-KEM-768/1024 is implemented and tested but not compiled in by default.
-  Enable with `--features pqc`.
+- **PQC**: ML-KEM-768/1024 is compiled in and on by default (suite 1 negotiated).
+  Opt out with `--no-default-features`.
 - **Re-attach from a new client machine**: session state lives in the daemon process;
   a new machine would need the original `session_id` and `passkey`, which are not
   persisted anywhere.
 
 ---
 
-## Test coverage (91 tests)
+## Test coverage (94 tests)
 
 | Module | What's tested |
 |--------|--------------|

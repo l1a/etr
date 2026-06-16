@@ -72,8 +72,12 @@ impl ClientHandshake {
         last_received_seq: HashMap<u32, u64>,
     ) -> (Self, PacketHeader, Envelope) {
         let client_nonce = generate_nonce();
-        // Generate an X25519 ephemeral key for the ClientHello; the server picks the suite.
-        let kem_keypair = KemKeyPair::generate(CipherSuiteId::X25519Aes256GcmSha256);
+        // Generate a keypair for the most-preferred suite (the first in the preference list).
+        // The server must choose that suite because the KEM public key is suite-specific.
+        let preferred_suites = CipherSuiteId::client_preference();
+        let preferred_suite = CipherSuiteId::from_u32(preferred_suites[0])
+            .unwrap_or(CipherSuiteId::X25519Aes256GcmSha256);
+        let kem_keypair = KemKeyPair::generate(preferred_suite);
 
         let hello = ClientHello {
             protocol_version: PROTOCOL_VERSION as u32,

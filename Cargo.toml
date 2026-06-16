@@ -7,7 +7,7 @@ license = "GPL-3.0-only"
 repository = "https://github.com/l1a/etr"
 
 [features]
-default = []
+default = ["pqc"]
 pqc = ["dep:ml-kem"]
 
 [dependencies]
@@ -24,7 +24,7 @@ hkdf = "0.12"
 sha2 = "0.10"
 sha3 = "0.10"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
-ml-kem = { version = "0.3", optional = true }
+ml-kem = { version = "0.3", features = ["getrandom"], optional = true }
 rand = "0.8"
 rand_core = "0.6"
 crossterm = "0.27"

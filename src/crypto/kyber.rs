@@ -7,9 +7,10 @@
 //! # Security level
 //! - **ML-KEM-768**: NIST category 3 (~AES-192 equivalent)
 //! - **ML-KEM-1024**: NIST category 5 (~AES-256 equivalent)
-use ml_kem::kem::{Decapsulate, Encapsulate};
-use ml_kem::{KemCore, MlKem768, MlKem1024};
-use rand_core::OsRng;
+use ml_kem::{
+    Decapsulate, DecapsulationKey, Encapsulate, EncapsulationKey, Kem, Key, KeyExport, MlKem768,
+    MlKem1024,
+};
 
 use super::CryptoError;
 
@@ -20,36 +21,29 @@ use super::CryptoError;
 /// The encapsulation key bytes are sent in `ClientHello`; call [`decapsulate`]
 /// with the server's ciphertext to recover the shared secret.
 pub struct MlKem768KeyPair {
-    dk: <MlKem768 as KemCore>::DecapsulationKey,
-    ek: <MlKem768 as KemCore>::EncapsulationKey,
+    dk: DecapsulationKey<MlKem768>,
+    ek: EncapsulationKey<MlKem768>,
 }
 
 impl MlKem768KeyPair {
     /// Generate a fresh ephemeral ML-KEM-768 keypair.
     pub fn generate() -> Self {
-        let (dk, ek) = MlKem768::generate(&mut OsRng);
+        let (dk, ek) = MlKem768::generate_keypair();
         Self { dk, ek }
     }
 
     /// Serialise the encapsulation key for inclusion in `ClientHello`.
     pub fn encapsulation_key_bytes(&self) -> Vec<u8> {
-        use ml_kem::EncodedSizeUser;
-        self.ek.as_bytes().as_slice().to_vec()
+        self.ek.to_bytes().as_slice().to_vec()
     }
 
     /// Recover the shared secret from the server's KEM ciphertext.
     pub fn decapsulate(&self, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        use ml_kem::EncodedSizeUser;
-        let ct_encoded =
-            <MlKem768 as KemCore>::CipherText::from_bytes(ml_kem::Encoded::<
-                <MlKem768 as KemCore>::CipherText,
-            >::from_slice(ciphertext));
         let ss = self
             .dk
-            .decapsulate(&ct_encoded)
+            .decapsulate_slice(ciphertext)
             .map_err(|_| CryptoError::AeadFailure)?;
-        use ml_kem::EncodedSizeUser;
-        Ok(ss.as_bytes().as_slice().to_vec())
+        Ok(ss.as_slice().to_vec())
     }
 }
 
@@ -58,17 +52,11 @@ impl MlKem768KeyPair {
 /// Encapsulates to the client's public key and returns
 /// `(ciphertext_for_ServerHello, shared_secret)`.
 pub fn encapsulate_768(ek_bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
-    use ml_kem::EncodedSizeUser;
-    let ek = <MlKem768 as KemCore>::EncapsulationKey::from_bytes(ml_kem::Encoded::<
-        <MlKem768 as KemCore>::EncapsulationKey,
-    >::from_slice(ek_bytes));
-    let (ct, ss) = ek
-        .encapsulate(&mut OsRng)
-        .map_err(|_| CryptoError::AeadFailure)?;
-    Ok((
-        ct.as_bytes().as_slice().to_vec(),
-        ss.as_bytes().as_slice().to_vec(),
-    ))
+    let key: &Key<EncapsulationKey<MlKem768>> =
+        ek_bytes.try_into().map_err(|_| CryptoError::AeadFailure)?;
+    let ek = EncapsulationKey::<MlKem768>::new(key).map_err(|_| CryptoError::AeadFailure)?;
+    let (ct, ss) = ek.encapsulate();
+    Ok((ct.as_slice().to_vec(), ss.as_slice().to_vec()))
 }
 
 // ── ML-KEM-1024 ──────────────────────────────────────────────────────────────
@@ -78,35 +66,29 @@ pub fn encapsulate_768(ek_bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>), CryptoErro
 /// The encapsulation key bytes are sent in `ClientHello`; call [`decapsulate`]
 /// with the server's ciphertext to recover the shared secret.
 pub struct MlKem1024KeyPair {
-    dk: <MlKem1024 as KemCore>::DecapsulationKey,
-    ek: <MlKem1024 as KemCore>::EncapsulationKey,
+    dk: DecapsulationKey<MlKem1024>,
+    ek: EncapsulationKey<MlKem1024>,
 }
 
 impl MlKem1024KeyPair {
     /// Generate a fresh ephemeral ML-KEM-1024 keypair.
     pub fn generate() -> Self {
-        let (dk, ek) = MlKem1024::generate(&mut OsRng);
+        let (dk, ek) = MlKem1024::generate_keypair();
         Self { dk, ek }
     }
 
     /// Serialise the encapsulation key for inclusion in `ClientHello`.
     pub fn encapsulation_key_bytes(&self) -> Vec<u8> {
-        use ml_kem::EncodedSizeUser;
-        self.ek.as_bytes().as_slice().to_vec()
+        self.ek.to_bytes().as_slice().to_vec()
     }
 
     /// Recover the shared secret from the server's KEM ciphertext.
     pub fn decapsulate(&self, ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        use ml_kem::EncodedSizeUser;
-        let ct_encoded =
-            <MlKem1024 as KemCore>::CipherText::from_bytes(ml_kem::Encoded::<
-                <MlKem1024 as KemCore>::CipherText,
-            >::from_slice(ciphertext));
         let ss = self
             .dk
-            .decapsulate(&ct_encoded)
+            .decapsulate_slice(ciphertext)
             .map_err(|_| CryptoError::AeadFailure)?;
-        Ok(ss.as_bytes().as_slice().to_vec())
+        Ok(ss.as_slice().to_vec())
     }
 }
 
@@ -115,17 +97,11 @@ impl MlKem1024KeyPair {
 /// Encapsulates to the client's public key and returns
 /// `(ciphertext_for_ServerHello, shared_secret)`.
 pub fn encapsulate_1024(ek_bytes: &[u8]) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
-    use ml_kem::EncodedSizeUser;
-    let ek = <MlKem1024 as KemCore>::EncapsulationKey::from_bytes(ml_kem::Encoded::<
-        <MlKem1024 as KemCore>::EncapsulationKey,
-    >::from_slice(ek_bytes));
-    let (ct, ss) = ek
-        .encapsulate(&mut OsRng)
-        .map_err(|_| CryptoError::AeadFailure)?;
-    Ok((
-        ct.as_bytes().as_slice().to_vec(),
-        ss.as_bytes().as_slice().to_vec(),
-    ))
+    let key: &Key<EncapsulationKey<MlKem1024>> =
+        ek_bytes.try_into().map_err(|_| CryptoError::AeadFailure)?;
+    let ek = EncapsulationKey::<MlKem1024>::new(key).map_err(|_| CryptoError::AeadFailure)?;
+    let (ct, ss) = ek.encapsulate();
+    Ok((ct.as_slice().to_vec(), ss.as_slice().to_vec()))
 }
 
 #[cfg(test)]
