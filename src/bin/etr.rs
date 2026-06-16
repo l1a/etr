@@ -3,29 +3,35 @@ use clap::{CommandFactory, Parser, ValueEnum};
 use clap_complete::Shell;
 use clap_complete_nushell::Nushell;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use std::collections::HashMap;
 use std::io::{self, Write};
+use std::net::SocketAddr;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, mpsc};
 
-use etr::crypto::{SessionCipher, generate_nonce};
-use etr::protocol::Packet;
-use etr::session::{SessionState, read_frame, recv_encrypted, send_encrypted, write_frame};
+use etr::crypto::generate_session_id;
+use etr::handshake::ClientHandshake;
+use etr::protocol::{
+    Envelope, FLAG_HANDSHAKE, Payload, StreamData, StreamOpen, StreamType, TerminalResize,
+    Heartbeat, Disconnect, PacketHeader, PROTOCOL_VERSION,
+};
+use etr::session::SessionState;
+use etr::transport::{decode_data_packet, decode_plaintext_packet, recv_packet, send_packet};
 
 #[derive(Parser, Debug)]
 #[command(
     name = "etr",
-    version = "0.1.2",
+    version = "0.2.0",
     about = "Eternal Terminal Client in Rust"
 )]
 struct Cli {
     /// Remote host target (e.g. user@host[:port] or host[:port])
     target: Option<String>,
 
-    /// Remote TCP port of etr server
+    /// Remote UDP port of etr server
     #[arg(short, long, default_value = "2022")]
     port: u16,
 
@@ -59,24 +65,12 @@ async fn main() -> io::Result<()> {
     if let Some(shell) = cli.completions {
         let mut cmd = Cli::command();
         match shell {
-            ShellChoice::Bash => {
-                clap_complete::generate(Shell::Bash, &mut cmd, "etr", &mut io::stdout())
-            }
-            ShellChoice::Elvish => {
-                clap_complete::generate(Shell::Elvish, &mut cmd, "etr", &mut io::stdout())
-            }
-            ShellChoice::Fish => {
-                clap_complete::generate(Shell::Fish, &mut cmd, "etr", &mut io::stdout())
-            }
-            ShellChoice::PowerShell => {
-                clap_complete::generate(Shell::PowerShell, &mut cmd, "etr", &mut io::stdout())
-            }
-            ShellChoice::Zsh => {
-                clap_complete::generate(Shell::Zsh, &mut cmd, "etr", &mut io::stdout())
-            }
-            ShellChoice::Nushell => {
-                clap_complete::generate(Nushell, &mut cmd, "etr", &mut io::stdout())
-            }
+            ShellChoice::Bash => clap_complete::generate(Shell::Bash, &mut cmd, "etr", &mut io::stdout()),
+            ShellChoice::Elvish => clap_complete::generate(Shell::Elvish, &mut cmd, "etr", &mut io::stdout()),
+            ShellChoice::Fish => clap_complete::generate(Shell::Fish, &mut cmd, "etr", &mut io::stdout()),
+            ShellChoice::PowerShell => clap_complete::generate(Shell::PowerShell, &mut cmd, "etr", &mut io::stdout()),
+            ShellChoice::Zsh => clap_complete::generate(Shell::Zsh, &mut cmd, "etr", &mut io::stdout()),
+            ShellChoice::Nushell => clap_complete::generate(Nushell, &mut cmd, "etr", &mut io::stdout()),
         }
         return Ok(());
     }
@@ -84,16 +78,14 @@ async fn main() -> io::Result<()> {
     let target_input = match cli.target {
         Some(t) => t,
         None => {
-            let mut cmd = Cli::command();
-            let _ = cmd.print_help();
+            let _ = Cli::command().print_help();
             return Ok(());
         }
     };
 
     let (target, port) = parse_target(&target_input, cli.port);
 
-    // 1. Generate credentials
-    let client_id = generate_id();
+    let session_id = generate_session_id();
     let passkey = generate_passkey();
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
 
@@ -101,15 +93,12 @@ async fn main() -> io::Result<()> {
         println!("Connecting to {} via SSH to bootstrap session...", target);
     }
 
-    // 2. Perform SSH handshake to register session
-    bootstrap_ssh(&target, cli.ssh_port, &client_id, &passkey, &term)?;
+    bootstrap_ssh(&target, cli.ssh_port, &session_id, &passkey, &term)?;
 
-    // 3. Setup persistent session state
-    let session_state = Arc::new(Mutex::new(SessionState::new(client_id.clone(), passkey)));
+    let session = Arc::new(Mutex::new(SessionState::new(session_id, passkey.clone())));
 
-    // 4. Run persistent connection loop
-    if let Err(e) = run_connection_loop(target, port, session_state, cli.verbose).await {
-        eprintln!("Session connection loop terminated: {:?}", e);
+    if let Err(e) = run_connection_loop(target, port, passkey, session_id, session, cli.verbose).await {
+        eprintln!("Session terminated: {:?}", e);
     }
 
     Ok(())
@@ -118,62 +107,47 @@ async fn main() -> io::Result<()> {
 fn parse_target(target_str: &str, default_port: u16) -> (String, u16) {
     if let Some(r_bracket_idx) = target_str.rfind(']') {
         if let Some(colon_idx) = target_str[r_bracket_idx..].find(':') {
-            let absolute_colon_idx = r_bracket_idx + colon_idx;
-            let port_str = &target_str[absolute_colon_idx + 1..];
-            if let Ok(parsed_port) = port_str.parse::<u16>() {
-                return (target_str[..absolute_colon_idx].to_string(), parsed_port);
+            let abs = r_bracket_idx + colon_idx;
+            if let Ok(p) = target_str[abs + 1..].parse::<u16>() {
+                return (target_str[..abs].to_string(), p);
             }
         }
         return (target_str.to_string(), default_port);
     }
-
     if let Some(colon_idx) = target_str.find(':') {
-        let colons_count = target_str.chars().filter(|&c| c == ':').count();
-        if colons_count == 1 {
-            let port_str = &target_str[colon_idx + 1..];
-            if let Ok(parsed_port) = port_str.parse::<u16>() {
-                return (target_str[..colon_idx].to_string(), parsed_port);
+        if target_str.chars().filter(|&c| c == ':').count() == 1 {
+            if let Ok(p) = target_str[colon_idx + 1..].parse::<u16>() {
+                return (target_str[..colon_idx].to_string(), p);
             }
         }
     }
-
     (target_str.to_string(), default_port)
 }
 
-fn generate_id() -> String {
-    use rand::Rng;
-    let s: String = rand::thread_rng()
-        .sample_iter(&rand::distributions::Alphanumeric)
-        .take(16)
-        .map(char::from)
-        .collect();
-    s
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 fn generate_passkey() -> String {
     use rand::Rng;
-    let s: String = rand::thread_rng()
+    rand::thread_rng()
         .sample_iter(&rand::distributions::Alphanumeric)
         .take(32)
         .map(char::from)
-        .collect();
-    s
+        .collect()
 }
 
 fn bootstrap_ssh(
     target: &str,
     ssh_port: u16,
-    client_id: &str,
+    session_id: &[u8; 16],
     passkey: &str,
     term: &str,
 ) -> io::Result<()> {
-    // Construct the remote command to run etrs
+    let session_id_hex = hex_encode(session_id);
     let remote_command = "etrs register";
-
-    // Spawn SSH process
     let mut child = Command::new("ssh")
-        .arg("-p")
-        .arg(ssh_port.to_string())
+        .arg("-p").arg(ssh_port.to_string())
         .arg(target)
         .arg(remote_command)
         .stdin(std::process::Stdio::piped())
@@ -181,354 +155,250 @@ fn bootstrap_ssh(
         .stderr(std::process::Stdio::inherit())
         .spawn()?;
 
-    // Write the registration handshake CLIENT_ID/PASSKEY/TERM to SSH stdin
     let mut stdin = child
         .stdin
         .take()
         .ok_or_else(|| io::Error::other("Failed to open SSH stdin pipe"))?;
-
-    let handshake = format!("{}/{}/{}\n", client_id, passkey, term);
-    stdin.write_all(handshake.as_bytes())?;
+    stdin.write_all(format!("{}/{}/{}\n", session_id_hex, passkey, term).as_bytes())?;
     stdin.flush()?;
-    drop(stdin); // Close stdin to signal EOF to the remote process
+    drop(stdin);
 
-    // Wait for SSH to complete
     let output = child.wait_with_output()?;
     if !output.status.success() {
-        let err_msg = String::from_utf8_lossy(&output.stdout);
         return Err(io::Error::other(format!(
             "SSH bootstrap failed: {}",
-            err_msg.trim()
+            String::from_utf8_lossy(&output.stdout).trim()
         )));
     }
-
     Ok(())
 }
 
 async fn run_connection_loop(
     target: String,
     port: u16,
-    session_state: Arc<Mutex<SessionState>>,
+    passkey: String,
+    session_id: [u8; 16],
+    session: Arc<Mutex<SessionState>>,
     verbose: bool,
 ) -> io::Result<()> {
-    // Strip user prefix to get just host for TCP connection
-    let host = if let Some(idx) = target.find('@') {
-        &target[idx + 1..]
-    } else {
-        &target
-    };
-    let addr = format!("{}:{}", host, port);
+    let host = if let Some(idx) = target.find('@') { &target[idx + 1..] } else { &target };
+    let server_addr: SocketAddr = format!("{}:{}", host, port)
+        .parse()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
-    // Create a long-lived channel for stdin reading to avoid spawning multiple competing threads
     let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>(1000);
-    let stdin_rx_shared = Arc::new(Mutex::new(stdin_rx));
+    let stdin_rx = Arc::new(Mutex::new(stdin_rx));
 
-    // Spawn a single long-lived thread to read from std::io::stdin
-    let _global_stdin_task = tokio::task::spawn_blocking(move || {
+    let _stdin_reader = tokio::task::spawn_blocking(move || {
         use std::io::Read;
-        let mut stdin = std::io::stdin();
         let mut buf = [0u8; 1024];
-        while let Ok(n) = stdin.read(&mut buf) {
-            if n == 0 {
-                break;
-            }
-            if stdin_tx.blocking_send(buf[0..n].to_vec()).is_err() {
-                break;
-            }
+        while let Ok(n) = std::io::stdin().read(&mut buf) {
+            if n == 0 { break; }
+            if stdin_tx.blocking_send(buf[..n].to_vec()).is_err() { break; }
         }
     });
 
-    let mut is_first_connect = true;
-
+    let mut first = true;
     loop {
-        if !is_first_connect {
-            if verbose {
-                println!("\r\n[etr] Connection lost. Reconnecting to {}...", addr);
-            }
+        if !first {
+            if verbose { eprintln!("\r\n[etr] Reconnecting to {}...", server_addr); }
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
-        is_first_connect = false;
+        first = false;
 
-        let mut stream = match TcpStream::connect(&addr).await {
-            Ok(s) => s,
-            Err(_) => continue,
+        let socket = match UdpSocket::bind("0.0.0.0:0").await {
+            Ok(s) => Arc::new(s),
+            Err(e) => { eprintln!("[etr] Bind error: {:?}", e); continue; }
         };
 
-        // Complete handshake & auth
-        let (cipher, replays) = match perform_handshake(&mut stream, &session_state).await {
-            Ok(res) => res,
-            Err(e) => {
-                if verbose {
-                    eprintln!("\r\n[etr] Handshake failed: {:?}", e);
-                }
-                continue;
-            }
+        let last_received = {
+            let s = session.lock().await;
+            s.last_received_map()
         };
 
-        if verbose {
-            println!("\r\n[etr] Connected. Session active.");
+        let (hs, hello_header, hello_envelope) =
+            ClientHandshake::reconnect(session_id, passkey.clone(), last_received);
+
+        if let Err(e) = send_packet(&socket, server_addr, &hello_header, &hello_envelope, None).await {
+            if verbose { eprintln!("[etr] Failed to send ClientHello: {:?}", e); }
+            continue;
         }
 
-        // Enable terminal raw mode
-        enable_raw_mode().unwrap();
+        // Wait for ServerHello (with timeout).
+        let pkt = match tokio::time::timeout(Duration::from_secs(10), recv_packet(&socket)).await {
+            Ok(Ok(Some(p))) => p,
+            _ => { if verbose { eprintln!("[etr] ServerHello timeout"); } continue; }
+        };
 
-        // Run session loops
-        let run_result = run_session(
-            stream,
-            cipher,
-            &session_state,
-            replays,
-            Arc::clone(&stdin_rx_shared),
+        if !pkt.header.is_handshake() || pkt.header.session_id != session_id {
+            continue;
+        }
+
+        let (cipher, server_acks) = match hs.process_server_hello(&pkt.payload_bytes) {
+            Ok(r) => r,
+            Err(e) => { if verbose { eprintln!("[etr] Handshake failed: {}", e); } continue; }
+        };
+
+        let cipher = Arc::new(cipher);
+
+        if verbose { println!("\r\n[etr] Connected. Session active."); }
+
+        {
+            let mut s = session.lock().await;
+            s.apply_server_acks(&server_acks);
+            s.cipher = None; // replaced below per-connection
+        }
+
+        enable_raw_mode().unwrap();
+        let result = run_session(
+            socket,
+            server_addr,
+            session_id,
+            Arc::clone(&cipher),
+            Arc::clone(&session),
+            Arc::clone(&stdin_rx),
+            verbose,
         )
         .await;
-
-        // Restore terminal state
         let _ = disable_raw_mode();
 
-        match run_result {
+        match result {
             Ok(_) => {
-                if verbose {
-                    println!("[etr] Connection closed cleanly.\r");
-                    let _ = io::stdout().flush();
-                }
+                if verbose { println!("[etr] Connection closed cleanly.\r"); }
                 std::process::exit(0);
             }
             Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
-                if verbose {
-                    println!("[etr] Connection closed cleanly.\r");
-                    let _ = io::stdout().flush();
-                }
+                if verbose { println!("[etr] Connection closed cleanly.\r"); }
                 std::process::exit(0);
             }
             Err(e) => {
-                if verbose {
-                    eprintln!("[etr] Session connection dropped: {:?}\r", e);
-                    let _ = io::stderr().flush();
-                }
+                if verbose { eprintln!("[etr] Session dropped: {:?}\r", e); }
             }
         }
     }
-}
-
-async fn perform_handshake(
-    stream: &mut TcpStream,
-    session_state: &Arc<Mutex<SessionState>>,
-) -> io::Result<(Arc<SessionCipher>, Vec<(u64, Vec<u8>)>)> {
-    let state_guard = session_state.lock().await;
-    let client_id = state_guard.client_id.clone();
-    let passkey = state_guard.passkey.clone();
-    let client_last_received = state_guard.next_in_seq - 1;
-    drop(state_guard);
-
-    // 1. Send ConnectRequest
-    let client_nonce = generate_nonce();
-    let request = Packet::ConnectRequest {
-        client_id,
-        client_nonce,
-    };
-    let request_bytes =
-        bincode::serialize(&request).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    write_frame(stream, &request_bytes).await?;
-
-    // 2. Read ConnectResponse
-    let response_bytes = read_frame(stream).await?;
-    let response: Packet = bincode::deserialize(&response_bytes)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-
-    let server_nonce = match response {
-        Packet::ConnectResponse { server_nonce } => server_nonce,
-        Packet::Disconnect => {
-            return Err(io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                "Session terminated by server",
-            ));
-        }
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Expected ConnectResponse",
-            ));
-        }
-    };
-
-    // 3. Derive Cipher
-    let cipher = Arc::new(SessionCipher::new(&passkey, &client_nonce, &server_nonce));
-
-    // 4. Send encrypted Auth
-    send_encrypted(stream, &cipher, 0, &Packet::Auth { mac: [0u8; 32] }).await?;
-
-    // 5. Read encrypted Auth response
-    let server_auth = recv_encrypted(stream, &cipher, 0).await?;
-    if !matches!(server_auth, Packet::Auth { .. }) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Handshake Server Auth failed",
-        ));
-    }
-
-    // 6. Send SyncRequest
-    send_encrypted(
-        stream,
-        &cipher,
-        0,
-        &Packet::SyncRequest {
-            last_received_seq: client_last_received,
-        },
-    )
-    .await?;
-
-    // 7. Read SyncResponse
-    let sync_res = recv_encrypted(stream, &cipher, 0).await?;
-    let server_last_received = match sync_res {
-        Packet::SyncResponse { last_received_seq } => last_received_seq,
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Expected SyncResponse",
-            ));
-        }
-    };
-
-    // 8. Get replay packets
-    let mut state = session_state.lock().await;
-    state.acknowledge_up_to(server_last_received);
-    let replays = state.get_replay_packets(server_last_received);
-
-    Ok((cipher, replays))
 }
 
 async fn run_session(
-    stream: TcpStream,
-    cipher: Arc<SessionCipher>,
-    session_state: &Arc<Mutex<SessionState>>,
-    replays: Vec<(u64, Vec<u8>)>,
+    socket: Arc<UdpSocket>,
+    server_addr: SocketAddr,
+    session_id: [u8; 16],
+    cipher: Arc<etr::crypto::AeadCipher>,
+    session: Arc<Mutex<SessionState>>,
     stdin_rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
+    verbose: bool,
 ) -> io::Result<()> {
-    let (tcp_send_tx, mut tcp_send_rx) = mpsc::channel::<Packet>(1000);
+    let (send_tx, mut send_rx) = mpsc::channel::<Envelope>(1000);
 
-    // Queue catch-up packets to the sender channel to be encrypted with transport sequence numbers
-    for (seq, data) in replays {
-        let packet = Packet::TerminalData { seq_num: seq, data };
-        let _ = tcp_send_tx.send(packet).await;
-    }
-
-    // Send initial terminal size to server
-    if let Ok((cols, rows)) = crossterm::terminal::size() {
-        let _ = tcp_send_tx
-            .send(Packet::TerminalResize { rows, cols })
-            .await;
-    }
-
-    let (mut reader, mut writer) = stream.into_split();
-
-    // Task to write data to server socket
-    let cipher_clone = Arc::clone(&cipher);
-    let mut writer_task = tokio::spawn(async move {
-        let mut transport_out_seq = 1;
-        while let Some(packet) = tcp_send_rx.recv().await {
-            if send_encrypted_writer(&mut writer, &cipher_clone, transport_out_seq, &packet)
-                .await
-                .is_err()
-            {
-                break;
+    // Replay any unacknowledged outbound data.
+    {
+        let s = session.lock().await;
+        let peer_acks: HashMap<u32, u64> = HashMap::new();
+        for (stream_id, replays) in s.collect_replays(&peer_acks) {
+            for (seq, data) in replays {
+                let _ = send_tx.send(Envelope {
+                    payload: Some(Payload::StreamData(StreamData {
+                        stream_id,
+                        seq_num: seq,
+                        data,
+                    })),
+                }).await;
             }
-            transport_out_seq += 1;
+        }
+    }
+
+    // Send current terminal size.
+    if let Ok((cols, rows)) = crossterm::terminal::size() {
+        let _ = send_tx.send(Envelope {
+            payload: Some(Payload::TerminalResize(TerminalResize {
+                rows: rows as u32,
+                cols: cols as u32,
+            })),
+        }).await;
+    }
+
+    // Task: write outbound packets to the socket.
+    let socket_w = Arc::clone(&socket);
+    let cipher_w = Arc::clone(&cipher);
+    let session_w = Arc::clone(&session);
+    let mut writer_task = tokio::spawn(async move {
+        while let Some(envelope) = send_rx.recv().await {
+            let seq = { let mut s = session_w.lock().await; s.next_packet_seq() };
+            let header = PacketHeader::new(0, session_id, seq);
+            let _ = send_packet(&socket_w, server_addr, &header, &envelope, Some(&cipher_w)).await;
         }
     });
 
-    // Task to forward data from long-lived stdin channel to server
-    let session_state_stdin = Arc::clone(session_state);
-    let tcp_send_tx_stdin = tcp_send_tx.clone();
+    // Task: forward stdin to the server as StreamData on stream 0.
+    let session_stdin = Arc::clone(&session);
+    let send_tx_stdin = send_tx.clone();
     let mut stdin_task = tokio::spawn(async move {
         loop {
             let payload = {
-                let mut rx_guard = stdin_rx.lock().await;
-                match rx_guard.recv().await {
+                let mut rx = stdin_rx.lock().await;
+                match rx.recv().await {
                     Some(p) => p,
                     None => break,
                 }
             };
-
-            let mut state = session_state_stdin.lock().await;
-            let seq = state.next_out_seq;
-            state.next_out_seq += 1;
-            state.record_send(seq, payload.clone());
-            drop(state);
-
-            let packet = Packet::TerminalData {
-                seq_num: seq,
-                data: payload,
+            let seq = {
+                let mut s = session_stdin.lock().await;
+                let st = s.stream_mut(0).expect("stream 0 always exists");
+                let seq = st.next_out_seq;
+                st.next_out_seq += 1;
+                st.record_send(seq, payload.clone());
+                seq
             };
-
-            if tcp_send_tx_stdin.send(packet).await.is_err() {
-                break;
-            }
+            let _ = send_tx_stdin.send(Envelope {
+                payload: Some(Payload::StreamData(StreamData {
+                    stream_id: 0,
+                    seq_num: seq,
+                    data: payload,
+                })),
+            }).await;
         }
     });
 
-    // Task to read data from server TCP socket and write to local stdout
-    let session_state_reader = Arc::clone(session_state);
+    // Task: receive packets from the server and write terminal output to stdout.
+    let socket_r = Arc::clone(&socket);
+    let cipher_r = Arc::clone(&cipher);
+    let session_r = Arc::clone(&session);
     let mut reader_task = tokio::spawn(async move {
-        let mut expected_seq = {
-            let guard = session_state_reader.lock().await;
-            guard.next_in_seq
-        };
-
         let mut stdout = io::stdout();
-
-        let mut transport_in_seq = 1;
         loop {
-            // Read length-framed packet from socket with a 15-second idle timeout
-            let encrypted =
-                match tokio::time::timeout(Duration::from_secs(15), read_frame_reader(&mut reader))
-                    .await
-                {
-                    Ok(Ok(bytes)) => bytes,
-                    Ok(Err(e)) => return Err(e), // Propagate socket EOF / read error
-                    Err(_) => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "Connection idle timeout",
-                        ));
-                    }
-                };
-
-            let decrypted = match cipher.decrypt(transport_in_seq, &encrypted) {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("Decryption failed on client: {:?}", e),
-                    ));
-                }
-            };
-            transport_in_seq += 1;
-
-            let packet: Packet = match bincode::deserialize(&decrypted) {
-                Ok(p) => p,
-                Err(e) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("Deserialization failed on client: {:?}", e),
-                    ));
-                }
+            let pkt = match tokio::time::timeout(Duration::from_secs(15), recv_packet(&socket_r)).await {
+                Ok(Ok(Some(p))) => p,
+                Ok(Ok(None)) => continue,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "idle timeout")),
             };
 
-            match packet {
-                Packet::TerminalData { seq_num, data } => {
-                    if seq_num == expected_seq {
-                        let _ = stdout.write_all(&data);
+            if pkt.header.session_id != session_id { continue; }
+
+            let envelope = if pkt.header.is_handshake() {
+                decode_plaintext_packet(&pkt.payload_bytes)?
+            } else {
+                decode_data_packet(&pkt.payload_bytes, pkt.header.packet_seq, &cipher_r)?
+            };
+
+            match envelope.payload {
+                Some(Payload::StreamData(sd)) if sd.stream_id == 0 => {
+                    let expected = {
+                        let s = session_r.lock().await;
+                        s.stream(0).map(|st| st.next_in_seq).unwrap_or(1)
+                    };
+                    if sd.seq_num == expected {
+                        let _ = stdout.write_all(&sd.data);
                         let _ = stdout.flush();
-                        expected_seq += 1;
-
-                        let mut guard = session_state_reader.lock().await;
-                        guard.next_in_seq = expected_seq;
+                        let mut s = session_r.lock().await;
+                        if let Some(st) = s.stream_mut(0) {
+                            st.next_in_seq += 1;
+                        }
                     }
                 }
-                Packet::Disconnect => {
+                Some(Payload::Disconnect(_)) => {
                     return Err(io::Error::new(
                         io::ErrorKind::ConnectionAborted,
-                        "Clean disconnect from server",
+                        "clean disconnect from server",
                     ));
                 }
                 _ => {}
@@ -536,91 +406,50 @@ async fn run_session(
         }
     });
 
-    // Task to poll terminal resize events
-    let tcp_send_tx_resize = tcp_send_tx.clone();
+    // Task: send SIGWINCH resize events.
+    let send_tx_resize = send_tx.clone();
     let mut resize_task = tokio::spawn(async move {
         use tokio::signal::unix::{SignalKind, signal};
         if let Ok(mut sigwinch) = signal(SignalKind::window_change()) {
             while sigwinch.recv().await.is_some() {
                 if let Ok((cols, rows)) = crossterm::terminal::size() {
-                    let packet = Packet::TerminalResize { rows, cols };
-                    if tcp_send_tx_resize.send(packet).await.is_err() {
-                        break;
-                    }
+                    let _ = send_tx_resize.send(Envelope {
+                        payload: Some(Payload::TerminalResize(TerminalResize {
+                            rows: rows as u32,
+                            cols: cols as u32,
+                        })),
+                    }).await;
                 }
             }
         }
     });
 
-    // Task to periodically send heartbeats every 5 seconds to prevent idle timeout
-    let tcp_send_tx_heartbeat = tcp_send_tx.clone();
-    let mut heartbeat_task = tokio::spawn(async move {
+    // Task: heartbeats every 5 s.
+    let send_tx_hb = send_tx.clone();
+    let mut hb_task = tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
-            if tcp_send_tx_heartbeat.send(Packet::Heartbeat).await.is_err() {
+            if send_tx_hb.send(Envelope { payload: Some(Payload::Heartbeat(Heartbeat {})) }).await.is_err() {
                 break;
             }
         }
     });
 
-    // Wait for critical stream tasks to complete
-    let reader_result = tokio::select! {
-        _ = &mut writer_task => Ok(()),
-        _ = &mut stdin_task => Ok(()),
-        res = &mut reader_task => {
-            match res {
-                Ok(result) => result,
-                Err(e) => Err(io::Error::other(format!(
-                    "Reader task panicked: {:?}",
-                    e
-                ))),
-            }
-        }
-        _ = &mut resize_task => Ok(()),
-        _ = &mut heartbeat_task => Ok(()),
+    let result = tokio::select! {
+        _ = &mut writer_task  => Ok(()),
+        _ = &mut stdin_task   => Ok(()),
+        r = &mut reader_task  => r.unwrap_or_else(|e| Err(io::Error::other(e.to_string()))),
+        _ = &mut resize_task  => Ok(()),
+        _ = &mut hb_task      => Ok(()),
     };
 
-    // Abort all spawned tasks to clean up resources cleanly and prevent hangs
     writer_task.abort();
     stdin_task.abort();
     reader_task.abort();
     resize_task.abort();
-    heartbeat_task.abort();
+    hb_task.abort();
 
-    reader_result
-}
-
-async fn send_encrypted_writer(
-    writer: &mut tokio::net::tcp::OwnedWriteHalf,
-    cipher: &SessionCipher,
-    seq_num: u64,
-    packet: &Packet,
-) -> io::Result<()> {
-    let raw_bytes =
-        bincode::serialize(packet).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    let encrypted = cipher
-        .encrypt(seq_num, &raw_bytes)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{:?}", e)))?;
-    let len = encrypted.len() as u32;
-    writer.write_all(&len.to_be_bytes()).await?;
-    writer.write_all(&encrypted).await?;
-    writer.flush().await?;
-    Ok(())
-}
-
-async fn read_frame_reader(reader: &mut tokio::net::tcp::OwnedReadHalf) -> io::Result<Vec<u8>> {
-    let mut len_buf = [0u8; 4];
-    reader.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > 10 * 1024 * 1024 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Frame too large",
-        ));
-    }
-    let mut buf = vec![0u8; len];
-    reader.read_exact(&mut buf).await?;
-    Ok(buf)
+    result
 }
 
 #[cfg(test)]
@@ -631,22 +460,10 @@ mod tests {
     fn test_parse_target() {
         assert_eq!(parse_target("host", 2022), ("host".to_string(), 2022));
         assert_eq!(parse_target("host:1234", 2022), ("host".to_string(), 1234));
-        assert_eq!(
-            parse_target("user@host:3000", 2022),
-            ("user@host".to_string(), 3000)
-        );
+        assert_eq!(parse_target("user@host:3000", 2022), ("user@host".to_string(), 3000));
         assert_eq!(parse_target("::1", 2022), ("::1".to_string(), 2022));
-        assert_eq!(
-            parse_target("[::1]:1234", 2022),
-            ("[::1]".to_string(), 1234)
-        );
-        assert_eq!(
-            parse_target("user@[::1]:1234", 2022),
-            ("user@[::1]".to_string(), 1234)
-        );
-        assert_eq!(
-            parse_target("user@[::1]", 2022),
-            ("user@[::1]".to_string(), 2022)
-        );
+        assert_eq!(parse_target("[::1]:1234", 2022), ("[::1]".to_string(), 1234));
+        assert_eq!(parse_target("user@[::1]:1234", 2022), ("user@[::1]".to_string(), 1234));
+        assert_eq!(parse_target("user@[::1]", 2022), ("user@[::1]".to_string(), 2022));
     }
 }

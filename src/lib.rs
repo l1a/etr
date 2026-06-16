@@ -1,12 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! `etr` — Eternal Terminal in Rust.
 //!
-//! This crate provides the shared library used by both the `etr` client and
-//! `etrs` server. It is split into three modules:
+//! This crate is the shared library used by both the `etr` client and `etrs`
+//! server.  It is organised into five modules:
 //!
-//! - [`crypto`]: AES-256-GCM session encryption and HKDF key derivation.
-//! - [`protocol`]: Wire-format packet types shared between client and server.
-//! - [`session`]: Persistent session state and length-prefixed TCP framing helpers.
+//! - [`crypto`]: Cipher suite negotiation, KEM key exchange (X25519 / ML-KEM),
+//!               and AEAD session encryption (AES-256-GCM / ChaCha20-Poly1305).
+//! - [`protocol`]: Versioned UDP wire format — fixed [`protocol::PacketHeader`]
+//!                 plus protobuf [`protocol::Envelope`] with stream multiplexing.
+//! - [`session`]: Per-session and per-stream state that survives reconnections.
+//! - [`transport`]: Async UDP send/receive helpers.
+//! - [`handshake`]: 1-RTT client and server handshake state machines.
 pub mod crypto;
+pub mod handshake;
 pub mod protocol;
 pub mod session;
+pub mod transport;
