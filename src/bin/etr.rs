@@ -336,6 +336,11 @@ async fn run_session(
 
     let (tcp_send_tx, mut tcp_send_rx) = mpsc::channel::<Packet>(1000);
 
+    // Send initial terminal size to server
+    if let Ok((cols, rows)) = crossterm::terminal::size() {
+        let _ = tcp_send_tx.send(Packet::TerminalResize { rows, cols }).await;
+    }
+
     let (mut reader, mut writer) = stream.into_split();
 
     // Task to write data to server socket
