@@ -5,7 +5,7 @@ ETR_BIN   := justfile_directory() + "/target/debug/etr"
 ETRS_BIN  := justfile_directory() + "/target/debug/etrs"
 ETR_REL   := justfile_directory() + "/target/release/etr"
 ETRS_REL  := justfile_directory() + "/target/release/etrs"
-INSTALL   := home_directory() + "/.local/bin"
+INSTALL   := home_directory() + "/.cargo/bin"
 LOG_FILE  := "/tmp/etrs.log"
 SOCK_FILE := "/tmp/etrs.sock"
 TMUX_SESS := "etr_test"
@@ -58,7 +58,7 @@ build-release:
 
 # ── Install ───────────────────────────────────────────────────────────────────
 
-# Install debug binaries to ~/.local/bin (no sudo)
+# Install debug binaries to ~/.cargo/bin (no sudo)
 install: build
     #!/usr/bin/env bash
     set -euo pipefail
@@ -66,12 +66,8 @@ install: build
     cp "{{ETRS_BIN}}" "{{INSTALL}}/etrs"
     cp "{{ETR_BIN}}"  "{{INSTALL}}/etr"
     echo "Installed etrs and etr (debug) to {{INSTALL}}"
-    if [[ ":$PATH:" != *":{{INSTALL}}:"* ]]; then
-        echo "NOTE: Add {{INSTALL}} to your PATH so SSH finds etrs:" >&2
-        echo "  export PATH=\"{{INSTALL}}:\$PATH\"" >&2
-    fi
 
-# Install release binaries to ~/.local/bin (no sudo)
+# Install release binaries to ~/.cargo/bin (no sudo)
 install-release: build-release
     #!/usr/bin/env bash
     set -euo pipefail
@@ -79,10 +75,6 @@ install-release: build-release
     cp "{{ETRS_REL}}" "{{INSTALL}}/etrs"
     cp "{{ETR_REL}}"  "{{INSTALL}}/etr"
     echo "Installed etrs and etr (release) to {{INSTALL}}"
-    if [[ ":$PATH:" != *":{{INSTALL}}:"* ]]; then
-        echo "NOTE: Add {{INSTALL}} to your PATH so SSH finds etrs:" >&2
-        echo "  export PATH=\"{{INSTALL}}:\$PATH\"" >&2
-    fi
 
 # ── Local end-to-end testing ─────────────────────────────────────────────────
 
@@ -105,7 +97,7 @@ check-tools:
     if ! ssh -q -o BatchMode=yes -o ConnectTimeout=3 localhost true 2>/dev/null; then
         echo "WARNING: SSH to localhost failed." >&2
         echo "  etr's SSH bootstrap requires passwordless SSH to the target host." >&2
-        echo "  Run: ssh-copy-id localhost  (or add your key to ~/.ssh/authorized_keys)" >&2
+        echo "  Run: ssh-copy-id localhost  (or append ~/.ssh/id_*.pub to ~/.ssh/authorized_keys)" >&2
         exit 1
     fi
     echo "All required tools present and SSH to localhost is functional."
