@@ -3,6 +3,8 @@
 
 ETR_BIN   := justfile_directory() + "/target/debug/etr"
 ETRS_BIN  := justfile_directory() + "/target/debug/etrs"
+ETR_REL   := justfile_directory() + "/target/release/etr"
+ETRS_REL  := justfile_directory() + "/target/release/etrs"
 INSTALL   := home_directory() + "/.local/bin"
 LOG_FILE  := "/tmp/etrs.log"
 SOCK_FILE := "/tmp/etrs.sock"
@@ -12,7 +14,79 @@ TMUX_SESS := "etr_test"
 default:
     @just --list
 
-# Verify all required tools are available (no sudo required)
+# ── Code quality ──────────────────────────────────────────────────────────────
+
+# Format source files
+fmt:
+    cargo fmt
+
+# Check formatting without modifying files
+fmt-check:
+    cargo fmt --check
+
+# Run Clippy (deny warnings, check all targets)
+clippy:
+    cargo clippy --all-targets -- -D warnings
+
+# Run unit and integration tests
+test:
+    cargo test
+
+# Run security audit on dependencies (installs cargo-audit if absent)
+audit:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! cargo audit --version >/dev/null 2>&1; then
+        echo "==> Installing cargo-audit..."
+        cargo install cargo-audit
+    fi
+    cargo audit
+
+# Run all static checks: fmt + clippy (suitable as a pre-push gate)
+check: fmt-check clippy
+    @echo "All checks passed."
+
+# ── Build ─────────────────────────────────────────────────────────────────────
+
+# Build debug binaries
+build:
+    cargo build
+
+# Build optimised release binaries
+build-release:
+    cargo build --release
+
+# ── Install ───────────────────────────────────────────────────────────────────
+
+# Install debug binaries to ~/.local/bin (no sudo)
+install: build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p "{{INSTALL}}"
+    cp "{{ETRS_BIN}}" "{{INSTALL}}/etrs"
+    cp "{{ETR_BIN}}"  "{{INSTALL}}/etr"
+    echo "Installed etrs and etr (debug) to {{INSTALL}}"
+    if [[ ":$PATH:" != *":{{INSTALL}}:"* ]]; then
+        echo "NOTE: Add {{INSTALL}} to your PATH so SSH finds etrs:" >&2
+        echo "  export PATH=\"{{INSTALL}}:\$PATH\"" >&2
+    fi
+
+# Install release binaries to ~/.local/bin (no sudo)
+install-release: build-release
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p "{{INSTALL}}"
+    cp "{{ETRS_REL}}" "{{INSTALL}}/etrs"
+    cp "{{ETR_REL}}"  "{{INSTALL}}/etr"
+    echo "Installed etrs and etr (release) to {{INSTALL}}"
+    if [[ ":$PATH:" != *":{{INSTALL}}:"* ]]; then
+        echo "NOTE: Add {{INSTALL}} to your PATH so SSH finds etrs:" >&2
+        echo "  export PATH=\"{{INSTALL}}:\$PATH\"" >&2
+    fi
+
+# ── Local end-to-end testing ─────────────────────────────────────────────────
+
+# Verify tools needed for test-local (tmux, ssh, passwordless localhost access)
 check-tools:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -36,25 +110,8 @@ check-tools:
     fi
     echo "All required tools present and SSH to localhost is functional."
 
-# Build debug binaries
-build: check-tools
-    cargo build
-
-# Install binaries to ~/.local/bin (no sudo)
-install: build
-    #!/usr/bin/env bash
-    set -euo pipefail
-    mkdir -p "{{INSTALL}}"
-    cp "{{ETRS_BIN}}" "{{INSTALL}}/etrs"
-    cp "{{ETR_BIN}}"  "{{INSTALL}}/etr"
-    echo "Installed etrs and etr to {{INSTALL}}"
-    if [[ ":$PATH:" != *":{{INSTALL}}:"* ]]; then
-        echo "NOTE: Add {{INSTALL}} to your PATH so SSH finds etrs:" >&2
-        echo "  export PATH=\"{{INSTALL}}:\$PATH\"" >&2
-    fi
-
 # Run the full local end-to-end test (happy path + reconnect)
-test-local: install
+test-local: check-tools install
     #!/usr/bin/env bash
     set -euo pipefail
 
