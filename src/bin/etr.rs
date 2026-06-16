@@ -369,21 +369,20 @@ async fn run_session(
         }
     });
 
-    // Task to read data from local stdin and queue it to write
+    // Task to read data from local stdin and queue it to write using non-blocking async tokio::io::stdin
     let session_state_stdin = Arc::clone(session_state);
     let tcp_send_tx_stdin = tcp_send_tx.clone();
-    let mut stdin_task = tokio::task::spawn_blocking(move || {
-        use std::io::Read;
-        let mut stdin = std::io::stdin();
+    let mut stdin_task = tokio::spawn(async move {
+        let mut stdin = tokio::io::stdin();
         let mut buf = [0u8; 1024];
 
-        while let Ok(n) = stdin.read(&mut buf) {
+        while let Ok(n) = stdin.read(&mut buf).await {
             if n == 0 {
                 break;
             }
             let payload = buf[0..n].to_vec();
 
-            let mut state = futures::executor::block_on(session_state_stdin.lock());
+            let mut state = session_state_stdin.lock().await;
             let seq = state.next_out_seq;
             state.next_out_seq += 1;
             state.record_send(seq, payload.clone());
@@ -394,7 +393,7 @@ async fn run_session(
                 data: payload,
             };
 
-            if futures::executor::block_on(tcp_send_tx_stdin.send(packet)).is_err() {
+            if tcp_send_tx_stdin.send(packet).await.is_err() {
                 break;
             }
         }
