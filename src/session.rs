@@ -130,6 +130,7 @@ pub async fn recv_encrypted(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use tokio::net::TcpListener;
 
     #[test]
@@ -200,5 +201,36 @@ mod tests {
 
         // Wait for server task to finish
         accept_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_read_timeout_on_inactivity() {
+        // Bind a local listener
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Should bind to local port");
+        let local_addr = listener.local_addr().unwrap();
+
+        // Spawn a task that accepts connection but goes idle (simulates suspended process)
+        let _server_handle = tokio::spawn(async move {
+            let (_server_stream, _) = listener.accept().await.unwrap();
+            // Just sleep and do not send anything
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        });
+
+        // Client connects
+        let mut client_stream = TcpStream::connect(local_addr)
+            .await
+            .expect("Should connect");
+
+        // Try reading with a short 50ms timeout
+        let read_result =
+            tokio::time::timeout(Duration::from_millis(50), read_frame(&mut client_stream)).await;
+
+        // Verify that it timed out
+        assert!(
+            read_result.is_err(),
+            "Reading should have timed out due to inactivity"
+        );
     }
 }

@@ -403,10 +403,18 @@ async fn run_session(
 
         let mut transport_in_seq = 1;
         loop {
-            let encrypted = match read_frame_reader(&mut reader).await {
-                Ok(bytes) => bytes,
-                Err(_) => break,
-            };
+            // Read length-framed packet from socket with a 15-second idle timeout
+            let encrypted =
+                match tokio::time::timeout(Duration::from_secs(15), read_frame_reader(&mut reader))
+                    .await
+                {
+                    Ok(Ok(bytes)) => bytes,
+                    Ok(Err(_)) => break, // Socket error or EOF
+                    Err(_) => {
+                        eprintln!("\r\n[etr] Connection idle timeout. Reconnecting...");
+                        break;
+                    }
+                };
 
             let decrypted = match cipher.decrypt(transport_in_seq, &encrypted) {
                 Ok(bytes) => bytes,
@@ -454,12 +462,24 @@ async fn run_session(
         }
     });
 
+    // Task to periodically send heartbeats every 5 seconds to prevent idle timeout
+    let tcp_send_tx_heartbeat = tcp_send_tx.clone();
+    let heartbeat_task = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            if tcp_send_tx_heartbeat.send(Packet::Heartbeat).await.is_err() {
+                break;
+            }
+        }
+    });
+
     // Wait for critical stream tasks to complete
     tokio::select! {
         _ = writer_task => {},
         _ = stdin_task => {},
         _ = reader_task => {},
         _ = resize_task => {},
+        _ = heartbeat_task => {},
     }
 
     Ok(())

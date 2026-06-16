@@ -41,13 +41,17 @@ enum Commands {
     Register,
 }
 
+type ActiveChannel = Option<(mpsc::Sender<Packet>, u64)>;
+
 struct ActiveSession {
     client_id: String,
     session_state: Arc<Mutex<SessionState>>,
     pty_write_tx: mpsc::Sender<Vec<u8>>,
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
-    // Active channel to send packets to the TCP writer task
-    tcp_tx: Arc<Mutex<Option<mpsc::Sender<Packet>>>>,
+    // Active channel to send packets to the TCP writer task (sender and connection ID)
+    tcp_tx: Arc<Mutex<ActiveChannel>>,
+    // Next connection ID to assign
+    next_conn_id: Arc<Mutex<u64>>,
 }
 
 type SessionMap = Arc<Mutex<HashMap<String, Arc<ActiveSession>>>>;
@@ -205,6 +209,7 @@ async fn handle_registration(mut stream: UnixStream, sessions: SessionMap) -> io
     let master_shared = Arc::new(Mutex::new(master));
     let session_state = Arc::new(Mutex::new(SessionState::new(client_id.clone(), passkey)));
     let tcp_tx = Arc::new(Mutex::new(None));
+    let next_conn_id = Arc::new(Mutex::new(1));
 
     let active_session = Arc::new(ActiveSession {
         client_id: client_id.clone(),
@@ -212,6 +217,7 @@ async fn handle_registration(mut stream: UnixStream, sessions: SessionMap) -> io
         pty_write_tx,
         master: Arc::clone(&master_shared),
         tcp_tx: Arc::clone(&tcp_tx),
+        next_conn_id: Arc::clone(&next_conn_id),
     });
 
     // Spawn a task to read from PTY master and forward it to client
@@ -242,7 +248,7 @@ async fn handle_registration(mut stream: UnixStream, sessions: SessionMap) -> io
 
             // If we have an active TCP connection, send it
             let tcp_tx_guard = futures::executor::block_on(tcp_tx_reader.lock());
-            if let Some(tx) = &*tcp_tx_guard {
+            if let Some((tx, _)) = &*tcp_tx_guard {
                 let _ = tx.blocking_send(packet);
             }
             drop(tcp_tx_guard);
@@ -359,12 +365,19 @@ async fn handle_client_tcp(mut stream: TcpStream, sessions: SessionMap) -> io::R
         send_encrypted(&mut stream, &cipher, seq, &packet).await?;
     }
 
-    // 8. Set up channel for client TCP writing
+    // 8. Set up channel for client TCP writing and assign unique connection ID
+    let conn_id = {
+        let mut guard = session.next_conn_id.lock().await;
+        let id = *guard;
+        *guard += 1;
+        id
+    };
+
     let (tcp_send_tx, mut tcp_send_rx) = mpsc::channel::<Packet>(1000);
 
-    // Register the new TCP writer channel in the active session
+    // Register the new TCP writer channel in the active session along with the connection ID
     let mut active_tx = session.tcp_tx.lock().await;
-    *active_tx = Some(tcp_send_tx);
+    *active_tx = Some((tcp_send_tx, conn_id));
     drop(active_tx);
 
     // Split TCP stream
@@ -385,7 +398,7 @@ async fn handle_client_tcp(mut stream: TcpStream, sessions: SessionMap) -> io::R
         }
     });
 
-    // Task to read data from client TCP socket
+    // Task to read data from client TCP socket with a 15-second idle timeout
     let session_state_writer = Arc::clone(&session.session_state);
     let pty_write_tx = session.pty_write_tx.clone();
     let master_clone = Arc::clone(&session.master);
@@ -397,10 +410,19 @@ async fn handle_client_tcp(mut stream: TcpStream, sessions: SessionMap) -> io::R
 
         let mut transport_in_seq = 1;
         loop {
-            // Read length-framed packet from socket
-            let encrypted = match read_frame_reader(&mut reader).await {
-                Ok(bytes) => bytes,
-                Err(_) => break, // Socket disconnected
+            // Read length-framed packet from socket with a 15-second timeout
+            let encrypted = match tokio::time::timeout(
+                std::time::Duration::from_secs(15),
+                read_frame_reader(&mut reader),
+            )
+            .await
+            {
+                Ok(Ok(bytes)) => bytes,
+                Ok(Err(_)) => break, // Socket disconnected
+                Err(_) => {
+                    eprintln!("Client connection timed out due to inactivity.");
+                    break;
+                }
             };
 
             let decrypted = match cipher.decrypt(transport_in_seq, &encrypted) {
@@ -453,18 +475,49 @@ async fn handle_client_tcp(mut stream: TcpStream, sessions: SessionMap) -> io::R
         }
     });
 
-    // Wait for reader or writer task to finish (indicates connection drop)
+    // Task to periodically send heartbeats every 5 seconds to prevent idle timeout
+    let tcp_send_tx_heartbeat = session.tcp_tx.clone();
+    let heartbeat_task = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let tx_guard = tcp_send_tx_heartbeat.lock().await;
+            if let Some((tx, id)) = &*tx_guard {
+                if *id == conn_id {
+                    if tx.send(Packet::Heartbeat).await.is_err() {
+                        break;
+                    }
+                } else {
+                    break; // Replaced by newer connection, terminate this heartbeat task
+                }
+            } else {
+                break;
+            }
+        }
+    });
+
+    // Wait for reader, writer or heartbeat task to finish (indicates connection drop)
     tokio::select! {
         _ = writer_task => {},
         _ = reader_task => {},
+        _ = heartbeat_task => {},
     }
 
-    println!(
-        "Client connection lost for client_id={}, cleaning up active channel.",
-        session.client_id
-    );
     let mut active_tx = session.tcp_tx.lock().await;
-    *active_tx = None;
+    if let Some((_, active_id)) = &*active_tx {
+        if *active_id == conn_id {
+            *active_tx = None;
+            println!(
+                "Client connection lost for client_id={}, cleaning up active channel.",
+                session.client_id
+            );
+        } else {
+            println!(
+                "Client connection for client_id={} was replaced by a newer connection (conn_id={}), skipping cleanup.",
+                session.client_id, active_id
+            );
+        }
+    }
+    drop(active_tx);
 
     Ok(())
 }
