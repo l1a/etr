@@ -167,7 +167,7 @@ fn bootstrap_ssh(
     let mut stdin = child
         .stdin
         .take()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "Failed to open SSH stdin pipe"))?;
+        .ok_or_else(|| io::Error::other("Failed to open SSH stdin pipe"))?;
 
     let handshake = format!("{}/{}/{}\n", client_id, passkey, term);
     stdin.write_all(handshake.as_bytes())?;
@@ -178,10 +178,10 @@ fn bootstrap_ssh(
     let output = child.wait_with_output()?;
     if !output.status.success() {
         let err_msg = String::from_utf8_lossy(&output.stdout);
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("SSH bootstrap failed: {}", err_msg.trim()),
-        ));
+        return Err(io::Error::other(format!(
+            "SSH bootstrap failed: {}",
+            err_msg.trim()
+        )));
     }
 
     Ok(())
@@ -338,7 +338,9 @@ async fn run_session(
 
     // Send initial terminal size to server
     if let Ok((cols, rows)) = crossterm::terminal::size() {
-        let _ = tcp_send_tx.send(Packet::TerminalResize { rows, cols }).await;
+        let _ = tcp_send_tx
+            .send(Packet::TerminalResize { rows, cols })
+            .await;
     }
 
     let (mut reader, mut writer) = stream.into_split();
@@ -348,7 +350,10 @@ async fn run_session(
     let writer_task = tokio::spawn(async move {
         let mut transport_out_seq = 1;
         while let Some(packet) = tcp_send_rx.recv().await {
-            if let Err(_) = send_encrypted_writer(&mut writer, &cipher_clone, transport_out_seq, &packet).await {
+            if send_encrypted_writer(&mut writer, &cipher_clone, transport_out_seq, &packet)
+                .await
+                .is_err()
+            {
                 break;
             }
             transport_out_seq += 1;
@@ -363,11 +368,7 @@ async fn run_session(
         let mut stdin = std::io::stdin();
         let mut buf = [0u8; 1024];
 
-        loop {
-            let n = match stdin.read(&mut buf) {
-                Ok(n) => n,
-                Err(_) => break,
-            };
+        while let Ok(n) = stdin.read(&mut buf) {
             if n == 0 {
                 break;
             }
@@ -424,18 +425,15 @@ async fn run_session(
                 Err(_) => break,
             };
 
-            match packet {
-                Packet::TerminalData { seq_num, data } => {
-                    if seq_num == expected_seq {
-                        let _ = stdout.write_all(&data);
-                        let _ = stdout.flush();
-                        expected_seq += 1;
+            if let Packet::TerminalData { seq_num, data } = packet
+                && seq_num == expected_seq
+            {
+                let _ = stdout.write_all(&data);
+                let _ = stdout.flush();
+                expected_seq += 1;
 
-                        let mut guard = session_state_reader.lock().await;
-                        guard.next_in_seq = expected_seq;
-                    }
-                }
-                _ => {}
+                let mut guard = session_state_reader.lock().await;
+                guard.next_in_seq = expected_seq;
             }
         }
     });
@@ -443,7 +441,7 @@ async fn run_session(
     // Task to poll terminal resize events
     let tcp_send_tx_resize = tcp_send_tx.clone();
     let resize_task = tokio::spawn(async move {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         if let Ok(mut sigwinch) = signal(SignalKind::window_change()) {
             while sigwinch.recv().await.is_some() {
                 if let Ok((cols, rows)) = crossterm::terminal::size() {

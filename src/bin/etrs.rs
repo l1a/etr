@@ -101,10 +101,10 @@ async fn run_register(socket_path: String) -> io::Result<()> {
         println!("Session registered successfully.");
         Ok(())
     } else {
-        Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("Registration failed: {}", response),
-        ))
+        Err(io::Error::other(format!(
+            "Registration failed: {}",
+            response
+        )))
     }
 }
 
@@ -177,24 +177,17 @@ async fn handle_registration(mut stream: UnixStream, sessions: SessionMap) -> io
             pixel_width: 0,
             pixel_height: 0,
         })
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(io::Error::other)?;
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
     let mut cmd = CommandBuilder::new(shell);
     cmd.env("TERM", term);
 
-    let mut _child = pair
-        .slave
-        .spawn_command(cmd)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let mut _child = pair.slave.spawn_command(cmd).map_err(io::Error::other)?;
 
     let master = pair.master;
-    let mut pty_reader = master
-        .try_clone_reader()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    let mut pty_writer = master
-        .take_writer()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let mut pty_reader = master.try_clone_reader().map_err(io::Error::other)?;
+    let mut pty_writer = master.take_writer().map_err(io::Error::other)?;
 
     // Channel for writing to PTY
     let (pty_write_tx, mut pty_write_rx) = mpsc::channel::<Vec<u8>>(1000);
@@ -382,7 +375,9 @@ async fn handle_client_tcp(mut stream: TcpStream, sessions: SessionMap) -> io::R
     let writer_task = tokio::spawn(async move {
         let mut transport_out_seq = 1;
         while let Some(packet) = tcp_send_rx.recv().await {
-            if let Err(e) = send_encrypted_writer(&mut writer, &cipher_clone, transport_out_seq, &packet).await {
+            if let Err(e) =
+                send_encrypted_writer(&mut writer, &cipher_clone, transport_out_seq, &packet).await
+            {
                 eprintln!("TCP writer task error: {:?}", e);
                 break;
             }
@@ -464,7 +459,10 @@ async fn handle_client_tcp(mut stream: TcpStream, sessions: SessionMap) -> io::R
         _ = reader_task => {},
     }
 
-    println!("Client connection lost for client_id={}, cleaning up active channel.", session.client_id);
+    println!(
+        "Client connection lost for client_id={}, cleaning up active channel.",
+        session.client_id
+    );
     let mut active_tx = session.tcp_tx.lock().await;
     *active_tx = None;
 

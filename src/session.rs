@@ -126,3 +126,79 @@ pub async fn recv_encrypted(
 
     Ok(packet)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    #[test]
+    fn test_session_state_recording_and_eviction() {
+        let mut state = SessionState::new("test-client".to_string(), "passkey123".to_string());
+        state.max_history_size = 3;
+
+        // Record some sends
+        state.record_send(1, b"hello".to_vec());
+        state.record_send(2, b"world".to_vec());
+        state.record_send(3, b"rust".to_vec());
+        assert_eq!(state.send_history.len(), 3);
+
+        // Record a 4th send, should evict seq 1
+        state.record_send(4, b"test".to_vec());
+        assert_eq!(state.send_history.len(), 3);
+        assert_eq!(
+            state.send_history.front().unwrap().0,
+            2,
+            "Seq 1 should have been evicted"
+        );
+
+        // Get replays after peer acknowledged up to seq 2
+        let replays = state.get_replay_packets(2);
+        assert_eq!(replays.len(), 2);
+        assert_eq!(replays[0].0, 3);
+        assert_eq!(replays[1].0, 4);
+
+        // Acknowledge up to seq 3, should evict seq 2 and 3
+        state.acknowledge_up_to(3);
+        assert_eq!(state.send_history.len(), 1);
+        assert_eq!(state.send_history.front().unwrap().0, 4);
+    }
+
+    #[tokio::test]
+    async fn test_tcp_framing_read_write() {
+        // Bind a local listener on a random port
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Should bind to local port");
+        let local_addr = listener.local_addr().unwrap();
+
+        // Spawn accept task
+        let accept_handle = tokio::spawn(async move {
+            let (mut server_stream, _) = listener.accept().await.unwrap();
+            let data = read_frame(&mut server_stream).await.unwrap();
+            assert_eq!(data, b"framed-payload-data");
+            write_frame(&mut server_stream, b"response-data")
+                .await
+                .unwrap();
+        });
+
+        // Client connects
+        let mut client_stream = TcpStream::connect(local_addr)
+            .await
+            .expect("Should connect to local listener");
+
+        // Write frame
+        write_frame(&mut client_stream, b"framed-payload-data")
+            .await
+            .expect("Write frame should succeed");
+
+        // Read response frame
+        let response = read_frame(&mut client_stream)
+            .await
+            .expect("Read frame should succeed");
+        assert_eq!(response, b"response-data");
+
+        // Wait for server task to finish
+        accept_handle.await.unwrap();
+    }
+}
