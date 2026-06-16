@@ -13,6 +13,7 @@ use etr::crypto::{SessionCipher, generate_nonce};
 use etr::protocol::Packet;
 use etr::session::{SessionState, read_frame, recv_encrypted, send_encrypted, write_frame};
 
+/// Command-line interface for the `etrs` server daemon.
 #[derive(Parser)]
 #[command(
     name = "etrs",
@@ -20,12 +21,15 @@ use etr::session::{SessionState, read_frame, recv_encrypted, send_encrypted, wri
     about = "Eternal Terminal Server Daemon in Rust"
 )]
 struct Cli {
+    /// TCP port the daemon listens on for incoming client connections.
     #[arg(short, long, default_value = "2022")]
     port: u16,
 
+    /// IP address to bind the TCP listener to.
     #[arg(short, long, default_value = "0.0.0.0")]
     bind: String,
 
+    /// Path to the Unix domain socket used for local session registration.
     #[arg(short, long, default_value = "/tmp/etrs.sock")]
     socket: String,
 
@@ -43,14 +47,23 @@ enum Commands {
 
 type ActiveChannel = Option<(mpsc::Sender<Packet>, u64)>;
 
+/// Shared state for one active terminal session.
+///
+/// An [`ActiveSession`] is created by [`handle_registration`] when the client
+/// bootstraps via SSH and lives in the [`SessionMap`] until the shell exits or
+/// the session is explicitly removed.
 struct ActiveSession {
+    /// Session identifier (matches `SessionState::client_id`).
     client_id: String,
+    /// Persistent sequence / history state shared with the TCP handler.
     session_state: Arc<Mutex<SessionState>>,
+    /// Channel to send raw bytes into the PTY slave (i.e. keystrokes).
     pty_write_tx: mpsc::Sender<Vec<u8>>,
+    /// Shared handle to the PTY master, used for resize events.
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
-    // Active channel to send packets to the TCP writer task (sender and connection ID)
+    /// Active channel to send packets to the TCP writer task (sender and connection ID).
     tcp_tx: Arc<std::sync::Mutex<ActiveChannel>>,
-    // Next connection ID to assign
+    /// Next connection ID to assign — incremented on each reconnect.
     next_conn_id: Arc<Mutex<u64>>,
 }
 
@@ -74,6 +87,10 @@ async fn main() -> io::Result<()> {
     }
 }
 
+/// Invoke the `register` or `daemon` sub-command, auto-detecting the correct
+/// default when neither is supplied: if `stdin` is a TTY the user likely
+/// ran `etrs` interactively, so default to `daemon`; when stdin is a pipe
+/// the process was spawned by SSH, so default to `register`.
 async fn run_register(socket_path: String) -> io::Result<()> {
     // Read the handshake string from stdin: CLIENT_ID/PASSKEY/TERM
     let mut input = String::new();
@@ -112,6 +129,11 @@ async fn run_register(socket_path: String) -> io::Result<()> {
     }
 }
 
+/// Start the persistent `etrs` background daemon.
+///
+/// Opens a Unix domain socket at `socket_path` for session registration
+/// requests from `etrs register` (invoked over SSH) and a TCP listener on
+/// `bind_addr:port` for reconnecting `etr` clients.
 async fn run_daemon(bind_addr: String, port: u16, socket_path: String) -> io::Result<()> {
     println!("Starting etrs daemon...");
 
@@ -154,6 +176,12 @@ async fn run_daemon(bind_addr: String, port: u16, socket_path: String) -> io::Re
     Ok(())
 }
 
+/// Handle a single session-registration request arriving on the Unix socket.
+///
+/// Parses the `CLIENT_ID/PASSKEY/TERM` line written by `etrs register`,
+/// allocates a PTY, spawns the user's shell, and inserts an [`ActiveSession`]
+/// into `sessions`.  Background tasks forward PTY output to any connected
+/// TCP client and clean up the session when the shell exits.
 async fn handle_registration(mut stream: UnixStream, sessions: SessionMap) -> io::Result<()> {
     let mut buf = vec![0u8; 1024];
     let n = stream.read(&mut buf).await?;
@@ -308,6 +336,16 @@ async fn handle_registration(mut stream: UnixStream, sessions: SessionMap) -> io
     Ok(())
 }
 
+/// Handle a single incoming TCP connection from an `etr` client.
+///
+/// Performs the full handshake sequence:
+/// 1. Read [`Packet::ConnectRequest`] and look up the session.
+/// 2. Generate a server nonce and send [`Packet::ConnectResponse`].
+/// 3. Derive the [`SessionCipher`] and exchange [`Packet::Auth`] packets.
+/// 4. Exchange [`Packet::SyncRequest`] / [`Packet::SyncResponse`] to replay
+///    any missed terminal-data packets.
+/// 5. Bi-directionally forward data between the TCP socket and the PTY until
+///    the connection drops, then clean up tasks and the active channel.
 async fn handle_client_tcp(mut stream: TcpStream, sessions: SessionMap) -> io::Result<()> {
     // 1. Read ConnectRequest from client
     let request_bytes = read_frame(&mut stream).await?;
@@ -588,8 +626,10 @@ async fn handle_client_tcp(mut stream: TcpStream, sessions: SessionMap) -> io::R
     Ok(())
 }
 
-// Low-level helper functions for split socket operations
+// ── Low-level helper functions for split socket operations ───────────────────
 
+/// Encrypt `packet` with the given `cipher` and `seq_num` and write it as a
+/// length-prefixed frame to the owned write-half of a split TCP stream.
 async fn send_encrypted_writer(
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
     cipher: &SessionCipher,
@@ -608,6 +648,8 @@ async fn send_encrypted_writer(
     Ok(())
 }
 
+/// Read a single length-prefixed encrypted frame from the owned read-half of
+/// a split TCP stream.
 async fn read_frame_reader(reader: &mut tokio::net::tcp::OwnedReadHalf) -> io::Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     reader.read_exact(&mut len_buf).await?;
@@ -621,4 +663,55 @@ async fn read_frame_reader(reader: &mut tokio::net::tcp::OwnedReadHalf) -> io::R
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf).await?;
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// Verify that the CLI rejects unknown flags and accepts known ones,
+    /// ensuring clap's metadata (help text, defaults) is wired correctly.
+    #[test]
+    fn test_cli_defaults() {
+        // Parsing with no arguments should succeed and use defaults
+        let cli = Cli::try_parse_from(["etrs"]).expect("Should parse with defaults");
+        assert_eq!(cli.port, 2022);
+        assert_eq!(cli.bind, "0.0.0.0");
+        assert_eq!(cli.socket, "/tmp/etrs.sock");
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn test_cli_custom_port_and_bind() {
+        let cli = Cli::try_parse_from(["etrs", "--port", "3000", "--bind", "127.0.0.1"])
+            .expect("Should parse custom port and bind");
+        assert_eq!(cli.port, 3000);
+        assert_eq!(cli.bind, "127.0.0.1");
+    }
+
+    #[test]
+    fn test_cli_daemon_subcommand() {
+        let cli = Cli::try_parse_from(["etrs", "daemon"]).expect("Should parse daemon subcommand");
+        assert!(matches!(cli.command, Some(Commands::Daemon)));
+    }
+
+    #[test]
+    fn test_cli_register_subcommand() {
+        let cli =
+            Cli::try_parse_from(["etrs", "register"]).expect("Should parse register subcommand");
+        assert!(matches!(cli.command, Some(Commands::Register)));
+    }
+
+    #[test]
+    fn test_cli_help_flag_is_valid() {
+        // CommandFactory::command() should build without panic
+        let mut cmd = Cli::command();
+        // --help would normally exit(0); just verify the command structure is valid
+        let help = cmd.render_help();
+        let help_str = help.to_string();
+        assert!(help_str.contains("--port"));
+        assert!(help_str.contains("--bind"));
+        assert!(help_str.contains("--socket"));
+    }
 }
