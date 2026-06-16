@@ -95,7 +95,7 @@ async fn run_register(socket_path: String) -> io::Result<()> {
     stream.read_to_end(&mut buf).await?;
     let response = String::from_utf8_lossy(&buf);
     if response.trim() == "OK" {
-        println!("Session registered successfully.");
+        eprintln!("Session registered successfully.");
         Ok(())
     } else {
         Err(io::Error::other(format!("Registration failed: {}", response)))
@@ -103,7 +103,7 @@ async fn run_register(socket_path: String) -> io::Result<()> {
 }
 
 async fn run_daemon(bind_addr: String, port: u16, socket_path: String) -> io::Result<()> {
-    println!("Starting etrs daemon...");
+    eprintln!("Starting etrs daemon...");
     let sessions: SessionMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let _ = std::fs::remove_file(&socket_path);
 
@@ -126,7 +126,7 @@ async fn run_daemon(bind_addr: String, port: u16, socket_path: String) -> io::Re
         .parse()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     let socket = Arc::new(UdpSocket::bind(&addr).await?);
-    println!("Listening on UDP {}", addr);
+    eprintln!("Listening on UDP {}", addr);
 
     loop {
         let pkt = match recv_packet(&socket).await? {
@@ -176,7 +176,7 @@ async fn handle_registration(mut stream: UnixStream, sessions: SessionMap) -> io
     let passkey = parts[1].to_string();
     let term = parts[2].to_string();
 
-    println!("Registering session id={} term={}", parts[0], term);
+    eprintln!("Registering session id={} term={}", parts[0], term);
 
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -219,7 +219,7 @@ async fn handle_registration(mut stream: UnixStream, sessions: SessionMap) -> io
     let active_cleanup = Arc::clone(&active);
     tokio::task::spawn_blocking(move || {
         let _ = child.wait();
-        println!("Shell exited for session {:?}, cleaning up.", session_id);
+        eprintln!("Shell exited for session {:?}, cleaning up.", session_id);
         sessions_cleanup.lock().unwrap().remove(&session_id);
         // Signal any connected client to disconnect.
         let tx = active_cleanup.outbound_tx.lock().unwrap().clone();
@@ -260,7 +260,7 @@ async fn handle_registration(mut stream: UnixStream, sessions: SessionMap) -> io
                 });
             }
         }
-        println!("PTY reader exited for session {:?}.", session_id);
+        eprintln!("PTY reader exited for session {:?}.", session_id);
         sessions_pty.lock().unwrap().remove(&session_id);
     });
 
