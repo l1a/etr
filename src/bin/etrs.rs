@@ -464,7 +464,7 @@ async fn handle_client_tcp(mut stream: TcpStream, sessions: SessionMap) -> io::R
         _ = reader_task => {},
     }
 
-    println!("Client connection lost, cleaning up active channel.");
+    println!("Client connection lost for client_id={}, cleaning up active channel.", session.client_id);
     let mut active_tx = session.tcp_tx.lock().await;
     *active_tx = None;
 
