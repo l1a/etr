@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use clap::{CommandFactory, Parser, ValueEnum};
+use clap::{ArgAction, CommandFactory, Parser, ValueEnum};
 use clap_complete::Shell;
 use clap_complete_nushell::Nushell;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -12,14 +12,39 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, mpsc};
 
-use etr::crypto::generate_session_id;
+use etr::crypto::{CipherSuiteId, generate_session_id};
+
+/// Log to stderr if `$verbose >= $level`.
+macro_rules! vlog {
+    ($verbose:expr, $level:expr, $($arg:tt)*) => {
+        if $verbose >= $level {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
+fn payload_type(p: Option<&Payload>) -> &'static str {
+    match p {
+        Some(Payload::ClientHello(_))   => "ClientHello",
+        Some(Payload::ServerHello(_))   => "ServerHello",
+        Some(Payload::StreamOpen(_))    => "StreamOpen",
+        Some(Payload::StreamClose(_))   => "StreamClose",
+        Some(Payload::StreamData(_))    => "StreamData",
+        Some(Payload::StreamAck(_))     => "StreamAck",
+        Some(Payload::TerminalResize(_))=> "TerminalResize",
+        Some(Payload::Heartbeat(_))     => "Heartbeat",
+        Some(Payload::Disconnect(_))    => "Disconnect",
+        None                            => "Empty",
+    }
+}
 use etr::handshake::ClientHandshake;
 use etr::protocol::{
-    Envelope, FLAG_HANDSHAKE, Payload, StreamData, StreamOpen, StreamType, TerminalResize,
-    Heartbeat, Disconnect, PacketHeader, PROTOCOL_VERSION,
+    Envelope, Payload, StreamData, TerminalResize,
+    Heartbeat, PacketHeader,
 };
 use etr::session::SessionState;
 use etr::transport::{decode_data_packet, decode_plaintext_packet, recv_packet, send_packet};
+use prost::Message as _;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -39,9 +64,9 @@ struct Cli {
     #[arg(short = 's', long, default_value = "22")]
     ssh_port: u16,
 
-    /// Enable verbose logging of connection events and status messages
-    #[arg(short, long)]
-    verbose: bool,
+    /// Verbosity: -v connection events, -vv cipher details, -vvv packet trace
+    #[arg(short = 'v', action = ArgAction::Count)]
+    verbose: u8,
 
     /// Generate shell completions for the specified shell
     #[arg(long, value_enum, value_name = "SHELL")]
@@ -89,9 +114,7 @@ async fn main() -> io::Result<()> {
     let passkey = generate_passkey();
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
 
-    if cli.verbose {
-        println!("Connecting to {} via SSH to bootstrap session...", target);
-    }
+    vlog!(cli.verbose, 1, "[etr] Connecting to {} via SSH to bootstrap session...", target);
 
     bootstrap_ssh(&target, cli.ssh_port, &session_id, &passkey, &term)?;
 
@@ -179,7 +202,7 @@ async fn run_connection_loop(
     passkey: String,
     session_id: [u8; 16],
     session: Arc<Mutex<SessionState>>,
-    verbose: bool,
+    verbose: u8,
 ) -> io::Result<()> {
     let host = if let Some(idx) = target.find('@') { &target[idx + 1..] } else { &target };
     let server_addr: SocketAddr = format!("{}:{}", host, port)
@@ -201,7 +224,7 @@ async fn run_connection_loop(
     let mut first = true;
     loop {
         if !first {
-            if verbose { eprintln!("\r\n[etr] Reconnecting to {}...", server_addr); }
+            vlog!(verbose, 1, "\r\n[etr] Reconnecting to {}...", server_addr);
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
         first = false;
@@ -216,32 +239,38 @@ async fn run_connection_loop(
             s.last_received_map()
         };
 
+        vlog!(verbose, 2, "[etr] Sending ClientHello  session={} suites={:?}",
+            hex_encode(&session_id), CipherSuiteId::client_preference());
+
         let (hs, hello_header, hello_envelope) =
             ClientHandshake::reconnect(session_id, passkey.clone(), last_received);
 
         if let Err(e) = send_packet(&socket, server_addr, &hello_header, &hello_envelope, None).await {
-            if verbose { eprintln!("[etr] Failed to send ClientHello: {:?}", e); }
+            vlog!(verbose, 1, "[etr] Failed to send ClientHello: {:?}", e);
             continue;
         }
 
         // Wait for ServerHello (with timeout).
         let pkt = match tokio::time::timeout(Duration::from_secs(10), recv_packet(&socket)).await {
             Ok(Ok(Some(p))) => p,
-            _ => { if verbose { eprintln!("[etr] ServerHello timeout"); } continue; }
+            _ => { vlog!(verbose, 1, "[etr] ServerHello timeout"); continue; }
         };
 
         if !pkt.header.is_handshake() || pkt.header.session_id != session_id {
             continue;
         }
 
-        let (cipher, server_acks) = match hs.process_server_hello(&pkt.payload_bytes) {
+        let (cipher, suite, server_acks) = match hs.process_server_hello(&pkt.payload_bytes) {
             Ok(r) => r,
-            Err(e) => { if verbose { eprintln!("[etr] Handshake failed: {}", e); } continue; }
+            Err(e) => { vlog!(verbose, 1, "[etr] Handshake failed: {}", e); continue; }
         };
+
+        vlog!(verbose, 2, "[etr] Handshake complete  suite={}  session={}",
+            suite, hex_encode(&session_id));
 
         let cipher = Arc::new(cipher);
 
-        if verbose { println!("\r\n[etr] Connected. Session active."); }
+        vlog!(verbose, 1, "\r\n[etr] Connected. Session active.");
 
         {
             let mut s = session.lock().await;
@@ -264,15 +293,15 @@ async fn run_connection_loop(
 
         match result {
             Ok(_) => {
-                if verbose { println!("[etr] Connection closed cleanly.\r"); }
+                vlog!(verbose, 1, "[etr] Connection closed cleanly.\r");
                 std::process::exit(0);
             }
             Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
-                if verbose { println!("[etr] Connection closed cleanly.\r"); }
+                vlog!(verbose, 1, "[etr] Connection closed cleanly.\r");
                 std::process::exit(0);
             }
             Err(e) => {
-                if verbose { eprintln!("[etr] Session dropped: {:?}\r", e); }
+                vlog!(verbose, 1, "[etr] Session dropped: {:?}\r", e);
             }
         }
     }
@@ -285,7 +314,7 @@ async fn run_session(
     cipher: Arc<etr::crypto::AeadCipher>,
     session: Arc<Mutex<SessionState>>,
     stdin_rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
-    verbose: bool,
+    verbose: u8,
 ) -> io::Result<()> {
     let (send_tx, mut send_rx) = mpsc::channel::<Envelope>(1000);
 
@@ -324,6 +353,10 @@ async fn run_session(
         while let Some(envelope) = send_rx.recv().await {
             let seq = { let mut s = session_w.lock().await; s.next_packet_seq() };
             let header = PacketHeader::new(0, session_id, seq);
+            vlog!(verbose, 3, "[etr] → {} seq={} {}b",
+                payload_type(envelope.payload.as_ref()),
+                seq,
+                envelope.encoded_len());
             let _ = send_packet(&socket_w, server_addr, &header, &envelope, Some(&cipher_w)).await;
         }
     });
@@ -379,6 +412,11 @@ async fn run_session(
             } else {
                 decode_data_packet(&pkt.payload_bytes, pkt.header.packet_seq, &cipher_r)?
             };
+
+            vlog!(verbose, 3, "[etr] ← {} seq={} {}b",
+                payload_type(envelope.payload.as_ref()),
+                pkt.header.packet_seq,
+                pkt.payload_bytes.len());
 
             match envelope.payload {
                 Some(Payload::StreamData(sd)) if sd.stream_id == 0 => {
@@ -455,6 +493,26 @@ async fn run_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn test_verbose_count() {
+        let cli = Cli::try_parse_from(["etr", "-vvv", "host"]).unwrap();
+        assert_eq!(cli.verbose, 3);
+    }
+
+    #[test]
+    fn test_verbose_default() {
+        let cli = Cli::try_parse_from(["etr", "host"]).unwrap();
+        assert_eq!(cli.verbose, 0);
+    }
+
+    #[test]
+    fn test_help_valid() {
+        let mut cmd = Cli::command();
+        let help = cmd.render_help().to_string();
+        assert!(help.contains("Verbosity") || help.contains("-v"));
+    }
 
     #[test]
     fn test_parse_target() {

@@ -42,7 +42,6 @@ pub struct ClientHandshake {
     passkey: String,
     client_nonce: [u8; 32],
     kem_keypair: KemKeyPair,
-    chosen_suite: CipherSuiteId,
 }
 
 impl ClientHandshake {
@@ -73,8 +72,8 @@ impl ClientHandshake {
         last_received_seq: HashMap<u32, u64>,
     ) -> (Self, PacketHeader, Envelope) {
         let client_nonce = generate_nonce();
-        let suite = CipherSuiteId::X25519Aes256GcmSha256; // will be overridden by negotiation
-        let kem_keypair = KemKeyPair::generate(suite);
+        // Generate an X25519 ephemeral key for the ClientHello; the server picks the suite.
+        let kem_keypair = KemKeyPair::generate(CipherSuiteId::X25519Aes256GcmSha256);
 
         let hello = ClientHello {
             protocol_version: PROTOCOL_VERSION as u32,
@@ -88,17 +87,18 @@ impl ClientHandshake {
         let header = PacketHeader::new(FLAG_HANDSHAKE, session_id, 0);
         let envelope = Envelope { payload: Some(Payload::ClientHello(hello)) };
 
-        let state = Self { session_id, passkey, client_nonce, kem_keypair, chosen_suite: suite };
+        let state = Self { session_id, passkey, client_nonce, kem_keypair };
         (state, header, envelope)
     }
 
     /// Process a `ServerHello` payload (after decrypting with the hello key).
     ///
-    /// On success returns the negotiated AEAD cipher and the server's ack map.
+    /// On success returns the negotiated AEAD cipher, the chosen cipher suite,
+    /// and the server's per-stream ack map.
     pub fn process_server_hello(
         self,
         payload_bytes: &[u8],
-    ) -> Result<(AeadCipher, HashMap<u32, u64>), HandshakeError> {
+    ) -> Result<(AeadCipher, CipherSuiteId, HashMap<u32, u64>), HandshakeError> {
         // Decrypt with the hello key (derived from passkey + client_nonce only).
         let hello_cipher = derive_hello_cipher(self.passkey.as_bytes(), &self.client_nonce);
         let plaintext = hello_cipher
@@ -134,7 +134,7 @@ impl ClientHandshake {
             &server_nonce,
         );
 
-        Ok((cipher, server_hello.last_received_seq))
+        Ok((cipher, suite, server_hello.last_received_seq))
     }
 }
 
@@ -285,7 +285,7 @@ mod tests {
         .expect("server handshake should succeed");
 
         // Client processes ServerHello.
-        let (client_cipher, _server_acks) = client_hs
+        let (client_cipher, _suite, _server_acks) = client_hs
             .process_server_hello(&outcome.response_payload_bytes)
             .expect("client should accept ServerHello");
 

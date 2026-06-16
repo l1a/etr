@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::collections::HashMap;
 use std::io::IsTerminal;
@@ -9,6 +9,37 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UdpSocket, UnixListener, UnixStream};
 use tokio::sync::{Mutex, mpsc};
+
+static VERBOSITY: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+
+fn verbosity() -> u8 {
+    *VERBOSITY.get().unwrap_or(&0)
+}
+
+/// Log to stderr if the global verbosity level is >= `$level`.
+macro_rules! vlog {
+    ($level:expr, $($arg:tt)*) => {
+        if verbosity() >= $level {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
+fn payload_type(p: Option<&etr::protocol::Payload>) -> &'static str {
+    use etr::protocol::Payload;
+    match p {
+        Some(Payload::ClientHello(_))    => "ClientHello",
+        Some(Payload::ServerHello(_))    => "ServerHello",
+        Some(Payload::StreamOpen(_))     => "StreamOpen",
+        Some(Payload::StreamClose(_))    => "StreamClose",
+        Some(Payload::StreamData(_))     => "StreamData",
+        Some(Payload::StreamAck(_))      => "StreamAck",
+        Some(Payload::TerminalResize(_)) => "TerminalResize",
+        Some(Payload::Heartbeat(_))      => "Heartbeat",
+        Some(Payload::Disconnect(_))     => "Disconnect",
+        None                             => "Empty",
+    }
+}
 
 fn default_socket_path() -> String {
     dirs::runtime_dir()
@@ -21,7 +52,7 @@ fn default_socket_path() -> String {
 
 use etr::handshake::process_client_hello;
 use etr::protocol::{
-    Disconnect, Envelope, Heartbeat, PacketHeader, Payload, StreamData, TerminalResize,
+    Disconnect, Envelope, Heartbeat, PacketHeader, Payload, StreamData,
 };
 use etr::session::SessionState;
 use etr::transport::{ReceivedPacket, decode_data_packet, recv_packet, send_packet};
@@ -44,6 +75,10 @@ struct Cli {
     /// Path to the Unix domain socket used for local session registration.
     #[arg(short, long, default_value_t = default_socket_path())]
     socket: String,
+
+    /// Verbosity: -v session events, -vv cipher details, -vvv packet trace
+    #[arg(short = 'v', action = ArgAction::Count)]
+    verbose: u8,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -75,6 +110,7 @@ type SessionMap = Arc<std::sync::Mutex<HashMap<[u8; 16], Arc<ActiveSession>>>>;
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let cli = Cli::parse();
+    let _ = VERBOSITY.set(cli.verbose);
     let cmd = cli.command.unwrap_or_else(|| {
         if !io::stdin().is_terminal() { Commands::Register } else { Commands::Daemon }
     });
@@ -85,6 +121,7 @@ async fn main() -> io::Result<()> {
 }
 
 async fn run_register(socket_path: String) -> io::Result<()> {
+    // run_register is invoked via SSH; keep its output minimal.
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
     let input = input.trim();
@@ -104,7 +141,7 @@ async fn run_register(socket_path: String) -> io::Result<()> {
     stream.read_to_end(&mut buf).await?;
     let response = String::from_utf8_lossy(&buf);
     if response.trim() == "OK" {
-        eprintln!("Session registered successfully.");
+        vlog!(1, "Session registered successfully.");
         Ok(())
     } else {
         Err(io::Error::other(format!("Registration failed: {}", response)))
@@ -127,7 +164,7 @@ async fn run_daemon(bind_addr: String, port: u16, socket_path: String) -> io::Re
             let sess = Arc::clone(&sessions_reg);
             tokio::spawn(async move {
                 if let Err(e) = handle_registration(stream, sess).await {
-                    eprintln!("Registration error: {:?}", e);
+                    eprintln!("[etrs] Registration error: {:?}", e);
                 }
             });
         }
@@ -154,7 +191,7 @@ async fn run_daemon(bind_addr: String, port: u16, socket_path: String) -> io::Re
                 if let Err(e) =
                     handle_client_hello(pkt.peer, pkt.header, pkt.payload_bytes, sess, sock).await
                 {
-                    eprintln!("Handshake error from {}: {:?}", pkt.peer, e);
+                    vlog!(1, "[etrs] Handshake error from {}: {:?}", pkt.peer, e);
                 }
             });
         } else {
@@ -188,7 +225,7 @@ async fn handle_registration(mut stream: UnixStream, sessions: SessionMap) -> io
     let passkey = parts[1].to_string();
     let term = parts[2].to_string();
 
-    eprintln!("Registering session id={} term={}", parts[0], term);
+    vlog!(1, "[etrs] Registering session id={} term={}", parts[0], term);
 
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -231,7 +268,7 @@ async fn handle_registration(mut stream: UnixStream, sessions: SessionMap) -> io
     let active_cleanup = Arc::clone(&active);
     tokio::task::spawn_blocking(move || {
         let _ = child.wait();
-        eprintln!("Shell exited for session {:?}, cleaning up.", session_id);
+        vlog!(1, "[etrs] Shell exited for session {}, cleaning up.", hex_encode(&session_id));
         sessions_cleanup.lock().unwrap().remove(&session_id);
         // Signal any connected client to disconnect.
         let tx = active_cleanup.outbound_tx.lock().unwrap().clone();
@@ -272,7 +309,7 @@ async fn handle_registration(mut stream: UnixStream, sessions: SessionMap) -> io
                 });
             }
         }
-        eprintln!("PTY reader exited for session {:?}.", session_id);
+        vlog!(2, "[etrs] PTY reader exited for session {}.", hex_encode(&session_id));
         sessions_pty.lock().unwrap().remove(&session_id);
     });
 
@@ -301,12 +338,17 @@ async fn handle_client_hello(
     };
     let server_last_received = active.session_state.lock().await.last_received_map();
 
+    vlog!(1, "[etrs] ClientHello from {}  session={}", peer, hex_encode(&session_id));
+
     let outcome = process_client_hello(
         &payload_bytes,
         server_last_received,
         |_| Some(passkey.clone()),
     )
     .map_err(|e| io::Error::other(e.to_string()))?;
+
+    vlog!(2, "[etrs] Handshake complete  suite={}  session={}  peer={}",
+        outcome.chosen_suite, hex_encode(&outcome.session_id), peer);
 
     // Apply client acks and collect replay packets.
     let replays = {
@@ -364,11 +406,14 @@ async fn handle_client_hello(
 
     // Writer task: encrypt and send each outbound envelope to the client.
     let mut writer = tokio::spawn(async move {
+        use prost::Message as _;
         while let Some(envelope) = outbound_rx.recv().await {
             let seq = {
                 let mut s = session_w.lock().await;
                 s.next_packet_seq()
             };
+            vlog!(3, "[etrs] → {} seq={} {}b  peer={}",
+                payload_type(envelope.payload.as_ref()), seq, envelope.encoded_len(), peer);
             let header = PacketHeader::new(0, session_id, seq);
             let _ = send_packet(&socket_w, peer, &header, &envelope, Some(&cipher_w)).await;
         }
@@ -389,9 +434,13 @@ async fn handle_client_hello(
             .await
             {
                 Ok(Some(p)) => p,
-                Ok(None) => break, // channel replaced by a reconnect; exit cleanly
+                Ok(None) => {
+                    vlog!(1, "[etrs] Connection replaced for {}  session={}",
+                        peer, hex_encode(&session_id));
+                    break; // channel replaced by a reconnect; exit cleanly
+                }
                 Err(_) => {
-                    eprintln!("Client {} timed out.", peer);
+                    vlog!(1, "[etrs] Client {} timed out  session={}", peer, hex_encode(&session_id));
                     break;
                 }
             };
@@ -410,6 +459,12 @@ async fn handle_client_hello(
                 Ok(e) => e,
                 Err(_) => continue,
             };
+
+            vlog!(3, "[etrs] ← {} seq={} {}b  peer={}",
+                payload_type(envelope.payload.as_ref()),
+                pkt.header.packet_seq,
+                pkt.payload_bytes.len(),
+                peer);
 
             match envelope.payload {
                 Some(Payload::StreamData(sd)) if sd.stream_id == 0 => {
@@ -475,6 +530,10 @@ async fn handle_client_hello(
     Ok(())
 }
 
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
     if s.len() % 2 != 0 {
         return None;
@@ -496,6 +555,13 @@ mod tests {
         assert_eq!(cli.port, 2022);
         assert_eq!(cli.bind, "0.0.0.0");
         assert_eq!(cli.socket, default_socket_path());
+        assert_eq!(cli.verbose, 0);
+    }
+
+    #[test]
+    fn test_cli_verbose_count() {
+        let cli = Cli::try_parse_from(["etrs", "-vvv"]).unwrap();
+        assert_eq!(cli.verbose, 3);
     }
 
     #[test]

@@ -38,6 +38,7 @@ impl std::fmt::Display for CryptoError {
 impl std::error::Error for CryptoError {}
 
 /// Wire ID used in handshake negotiation.
+/// Also implements `Display` for human-readable diagnostic output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum CipherSuiteId {
@@ -78,6 +79,17 @@ impl CipherSuiteId {
         suites
     }
 
+    pub fn name(self) -> &'static str {
+        match self {
+            #[cfg(feature = "pqc")]
+            Self::MlKem1024Aes256GcmSha3 => "ML-KEM-1024+AES-256-GCM+SHA3-256",
+            #[cfg(feature = "pqc")]
+            Self::MlKem768Aes256GcmSha256 => "ML-KEM-768+AES-256-GCM+SHA-256",
+            Self::X25519Aes256GcmSha256 => "X25519+AES-256-GCM+SHA-256",
+            Self::X25519ChaCha20Poly1305Sha256 => "X25519+ChaCha20-Poly1305+SHA-256",
+        }
+    }
+
     fn uses_sha3_kdf(self) -> bool {
         let _ = self;
         #[cfg(feature = "pqc")]
@@ -87,6 +99,12 @@ impl CipherSuiteId {
 
     fn uses_chacha20(self) -> bool {
         self == CipherSuiteId::X25519ChaCha20Poly1305Sha256
+    }
+}
+
+impl std::fmt::Display for CipherSuiteId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
     }
 }
 
