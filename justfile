@@ -6,8 +6,8 @@ ETRS_BIN  := justfile_directory() + "/target/debug/etrs"
 ETR_REL   := justfile_directory() + "/target/release/etr"
 ETRS_REL  := justfile_directory() + "/target/release/etrs"
 INSTALL   := home_directory() + "/.cargo/bin"
-LOG_FILE  := "/tmp/etrs.log"
-SOCK_FILE := "/tmp/etrs.sock"
+LOG_FILE  := `echo "${XDG_STATE_HOME:-$HOME/.local/state}/etr/etrs.log"`
+SOCK_FILE := `echo "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/etr/etrs.sock"`
 TMUX_SESS := "etr_test"
 
 # List available recipes
@@ -120,6 +120,7 @@ test-local: check-tools install
 
     # ── 1. Start daemon ───────────────────────────────────────────────────────
     echo "==> Starting etrs daemon..."
+    mkdir -p "$(dirname "{{LOG_FILE}}")"
     rm -f "{{SOCK_FILE}}"
     "{{ETRS_BIN}}" daemon > "{{LOG_FILE}}" 2>&1 &
     ETRS_PID=$!
@@ -189,7 +190,8 @@ test-local: check-tools install
 
 # Show live server log
 log:
-    @tail -f {{LOG_FILE}}
+    @mkdir -p "$(dirname "{{LOG_FILE}}")"
+    @tail -f "{{LOG_FILE}}"
 
 # Kill daemon and tmux session (manual cleanup)
 clean:

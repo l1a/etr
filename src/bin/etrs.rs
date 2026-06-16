@@ -10,6 +10,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UdpSocket, UnixListener, UnixStream};
 use tokio::sync::{Mutex, mpsc};
 
+fn default_socket_path() -> String {
+    dirs::runtime_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join("etr")
+        .join("etrs.sock")
+        .to_string_lossy()
+        .into_owned()
+}
+
 use etr::handshake::process_client_hello;
 use etr::protocol::{
     Disconnect, Envelope, Heartbeat, PacketHeader, Payload, StreamData, TerminalResize,
@@ -33,7 +42,7 @@ struct Cli {
     bind: String,
 
     /// Path to the Unix domain socket used for local session registration.
-    #[arg(short, long, default_value = "/tmp/etrs.sock")]
+    #[arg(short, long, default_value_t = default_socket_path())]
     socket: String,
 
     #[command(subcommand)]
@@ -105,6 +114,9 @@ async fn run_register(socket_path: String) -> io::Result<()> {
 async fn run_daemon(bind_addr: String, port: u16, socket_path: String) -> io::Result<()> {
     eprintln!("Starting etrs daemon...");
     let sessions: SessionMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    if let Some(parent) = std::path::Path::new(&socket_path).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let _ = std::fs::remove_file(&socket_path);
 
     // Unix socket for SSH-bootstrapped registration.
@@ -483,7 +495,7 @@ mod tests {
         let cli = Cli::try_parse_from(["etrs"]).unwrap();
         assert_eq!(cli.port, 2022);
         assert_eq!(cli.bind, "0.0.0.0");
-        assert_eq!(cli.socket, "/tmp/etrs.sock");
+        assert_eq!(cli.socket, default_socket_path());
     }
 
     #[test]

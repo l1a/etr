@@ -29,3 +29,4 @@ rand = "0.8"
 rand_core = "0.6"
 crossterm = "0.27"
 nix = { version = "0.29", features = ["fs", "term", "process", "signal"] }
+dirs = "5"
