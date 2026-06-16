@@ -45,6 +45,7 @@ struct ActiveSession {
     client_id: String,
     session_state: Arc<Mutex<SessionState>>,
     pty_write_tx: mpsc::Sender<Vec<u8>>,
+    master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     // Active channel to send packets to the TCP writer task
     tcp_tx: Arc<Mutex<Option<mpsc::Sender<Packet>>>>,
 }
@@ -119,7 +120,7 @@ async fn run_daemon(bind_addr: String, port: u16, socket_path: String) -> io::Re
     let unix_listener = UnixListener::bind(&socket_path)?;
     let sessions_clone = Arc::clone(&sessions);
     tokio::spawn(async move {
-        while let Ok((mut stream, _)) = unix_listener.accept().await {
+        while let Ok((stream, _)) = unix_listener.accept().await {
             let sessions_inner = Arc::clone(&sessions_clone);
             tokio::spawn(async move {
                 if let Err(e) = handle_registration(stream, sessions_inner).await {
@@ -208,6 +209,7 @@ async fn handle_registration(mut stream: UnixStream, sessions: SessionMap) -> io
         }
     });
 
+    let master_shared = Arc::new(Mutex::new(master));
     let session_state = Arc::new(Mutex::new(SessionState::new(client_id.clone(), passkey)));
     let tcp_tx = Arc::new(Mutex::new(None));
 
@@ -215,6 +217,7 @@ async fn handle_registration(mut stream: UnixStream, sessions: SessionMap) -> io
         client_id: client_id.clone(),
         session_state: Arc::clone(&session_state),
         pty_write_tx,
+        master: Arc::clone(&master_shared),
         tcp_tx: Arc::clone(&tcp_tx),
     });
 
@@ -392,6 +395,7 @@ async fn handle_client_tcp(mut stream: TcpStream, sessions: SessionMap) -> io::R
     // Task to read data from client TCP socket
     let session_state_writer = Arc::clone(&session.session_state);
     let pty_write_tx = session.pty_write_tx.clone();
+    let master_clone = Arc::clone(&session.master);
     let reader_task = tokio::spawn(async move {
         let mut expected_seq = {
             let guard = session_state_writer.lock().await;
@@ -433,9 +437,14 @@ async fn handle_client_tcp(mut stream: TcpStream, sessions: SessionMap) -> io::R
                     }
                 }
                 Packet::TerminalResize { rows, cols } => {
-                    // Handle terminal resize (optional, implementation could update pty size)
-                    // We will add PTY resize support here later if needed
                     println!("Resize event: rows={} cols={}", rows, cols);
+                    let master_guard = master_clone.lock().await;
+                    let _ = master_guard.resize(PtySize {
+                        rows,
+                        cols,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    });
                 }
                 Packet::Heartbeat => {
                     // Handled implicitly by connection remaining open

@@ -1,7 +1,6 @@
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use clap_complete_nushell::Nushell;
-use crossterm::event::{self, Event};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use std::io::{self, Write};
 use std::process::Command;
@@ -356,12 +355,13 @@ async fn run_session(
     // Task to read data from local stdin and queue it to write
     let session_state_stdin = Arc::clone(session_state);
     let tcp_send_tx_stdin = tcp_send_tx.clone();
-    let stdin_task = tokio::spawn(async move {
-        let mut stdin = tokio::io::stdin();
+    let stdin_task = tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut stdin = std::io::stdin();
         let mut buf = [0u8; 1024];
 
         loop {
-            let n = match stdin.read(&mut buf).await {
+            let n = match stdin.read(&mut buf) {
                 Ok(n) => n,
                 Err(_) => break,
             };
@@ -370,7 +370,7 @@ async fn run_session(
             }
             let payload = buf[0..n].to_vec();
 
-            let mut state = session_state_stdin.lock().await;
+            let mut state = futures::executor::block_on(session_state_stdin.lock());
             let seq = state.next_out_seq;
             state.next_out_seq += 1;
             state.record_send(seq, payload.clone());
@@ -381,7 +381,7 @@ async fn run_session(
                 data: payload,
             };
 
-            if tcp_send_tx_stdin.send(packet).await.is_err() {
+            if futures::executor::block_on(tcp_send_tx_stdin.send(packet)).is_err() {
                 break;
             }
         }
@@ -438,11 +438,10 @@ async fn run_session(
     // Task to poll terminal resize events
     let tcp_send_tx_resize = tcp_send_tx.clone();
     let resize_task = tokio::spawn(async move {
-        loop {
-            if let Ok(Ok(true)) =
-                tokio::task::spawn_blocking(|| event::poll(Duration::from_millis(500))).await
-            {
-                if let Ok(Event::Resize(cols, rows)) = event::read() {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut sigwinch) = signal(SignalKind::window_change()) {
+            while sigwinch.recv().await.is_some() {
+                if let Ok((cols, rows)) = crossterm::terminal::size() {
                     let packet = Packet::TerminalResize { rows, cols };
                     if tcp_send_tx_resize.send(packet).await.is_err() {
                         break;
