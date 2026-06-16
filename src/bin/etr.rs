@@ -14,18 +14,26 @@ use tokio::sync::{Mutex, mpsc};
 
 use etr::crypto::{CipherSuiteId, generate_session_id};
 
-/// When running interactively, verbose logs go here instead of stderr so they
-/// don't corrupt the raw-mode terminal display.
+/// Log file for verbose output — set once at startup when running interactively.
 static LOG_FILE: std::sync::OnceLock<std::sync::Mutex<std::fs::File>> = std::sync::OnceLock::new();
 
-/// Log at `$level` — writes to the log file in interactive mode, stderr otherwise.
+/// Set to true when raw mode is active; suppresses stderr logging to avoid
+/// corrupting the terminal display.
+static IN_RAW_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Log at `$level`:
+/// - before raw mode: stderr (always visible) + log file (if open)
+/// - during raw mode: log file only (stderr would corrupt the display)
+/// - no log file open and not in raw mode: stderr
 macro_rules! vlog {
     ($verbose:expr, $level:expr, $($arg:tt)*) => {
         if $verbose >= $level {
+            let raw = IN_RAW_MODE.load(std::sync::atomic::Ordering::Relaxed);
+            if !raw {
+                eprintln!($($arg)*);
+            }
             if let Some(f) = LOG_FILE.get() {
                 let _ = writeln!(f.lock().unwrap(), $($arg)*);
-            } else {
-                eprintln!($($arg)*);
             }
         }
     };
@@ -390,6 +398,7 @@ async fn run_connection_loop(
         }
 
         enable_raw_mode().unwrap();
+        IN_RAW_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
         let result = run_session(
             socket,
             server_addr,
@@ -400,6 +409,7 @@ async fn run_connection_loop(
             verbose,
         )
         .await;
+        IN_RAW_MODE.store(false, std::sync::atomic::Ordering::Relaxed);
         let _ = disable_raw_mode();
 
         match result {

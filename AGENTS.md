@@ -4,8 +4,19 @@ Welcome! This file contains project-specific guidelines, constraints, and instru
 
 ---
 
+## 0. Start of session — required reading
+
+**Before doing any work**, read `NOTES.md` in this directory. It is the authoritative
+record of current project state: architecture decisions, known gaps, working features,
+and design intent. Do not rely on git history or code inspection alone — NOTES.md
+captures context that is not in the code.
+
+---
+
 ## 1. Project Overview
-`etr` is a Rust implementation of the C++ tool **Eternal Terminal (et)**. It is a remote shell that automatically reconnects without interrupting the session.
+`etr` is a Rust implementation of the C++ tool **Eternal Terminal (et)**. It is a remote
+shell that automatically reconnects without interrupting the session. See NOTES.md for
+full architecture and current status.
 
 ---
 
@@ -26,3 +37,7 @@ Welcome! This file contains project-specific guidelines, constraints, and instru
   * Keep commit subject lines under 50 characters, in the imperative mood.
   * Always append the AI attribution line as a trailer: `Assisted-By: <Model Name>` (e.g., `Assisted-By: Gemini 3.5 Flash`).
 * **PRs & Merges:** Never push to `main` directly or run background push/commit operations without explicit user confirmation.
+* **NOTES.md — update on every commit or push:** Before committing or pushing, update
+  `NOTES.md` to reflect any changes to architecture, known gaps, working features, or
+  design decisions made during the session. NOTES.md must stay current — a reader
+  picking up the project from NOTES.md alone should have an accurate picture.

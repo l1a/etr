@@ -194,7 +194,8 @@ etrs daemon -vvv          # with full packet trace
 # On the client
 etr user@host             # standard connect
 etr localhost             # localhost testing (SSH to localhost must be configured)
-etr -vvv host             # verbose — logs to ~/.local/state/etr/etr.log
+etr -vvv host             # verbose — shown on stderr before session, then logged to
+                          #   ~/.local/state/etr/etr.log during raw-mode session
 
 # Prerequisites for localhost testing
 ssh-copy-id localhost     # or append ~/.ssh/id_*.pub to ~/.ssh/authorized_keys
@@ -206,24 +207,58 @@ just test-local
 
 ---
 
+## Product vision
+
+### Mode 1 — Persistent reconnecting shell (like mosh)
+
+The primary use case. `etr user@host` should work with **no pre-configuration on the
+server** — analogous to how mosh works. The client SSHes to the server, uses that SSH
+connection to start `etrs` on the fly (not a pre-running daemon), and then hands off
+to UDP for the persistent session.
+
+**Current state**: requires `etrs daemon` to be running on the server beforehand.
+**Required change**: `etr` should SSH in and run `etrs daemon --background` (or
+equivalent) if no daemon is already listening, rather than assuming one exists. The
+daemon should daemonize, write a PID file, and exit the SSH foreground process, then
+`etrs register` completes as now. On subsequent connections to the same host, `etr`
+detects the daemon is already running (via the registration port) and skips starting
+a new one.
+
+### Mode 2 — Persistent port forwarding (like `ssh -L`/`-R`)
+
+A one-shot invocation that opens a forwarded socket and keeps it alive across network
+interruptions, without a PTY session. Example:
+
+```bash
+etr -L 5432:db-host:5432 user@jumphost   # local port → remote
+etr -R 8080:localhost:8080 user@server   # remote port → local
+```
+
+**Current state**: the `PortForward` stream type is defined in the protocol and the
+stream multiplexing layer supports multiple streams, but the CLI has no `-L`/`-R` flags
+and the server has no port-forwarding logic.
+
+---
+
 ## Known gaps / next steps
 
-- **`--server-path`**: `etr --server-path /full/path/to/etrs host` is available if
-  `etrs` is not in the SSH session PATH, but with `~/.cargo/bin` in PATH it is
-  not normally needed.
-- **Port forwarding**: the stream multiplexing layer supports `PortForward` stream
-  type but `etr` has no `-L`/`-R` CLI flags yet.
+- **Mode 1 — auto-start daemon**: `etr` should start `etrs` on the server via SSH if
+  no daemon is running, rather than requiring it to be pre-started. This is the most
+  important missing piece for the mosh-like UX.
+- **Mode 2 — port forwarding**: add `-L`/`-R` CLI flags to `etr` and implement the
+  forwarding logic in `etrs`. The stream layer already supports it structurally.
+- **`--server-path`**: available if `etrs` is not in the SSH session PATH, but not
+  normally needed when `~/.cargo/bin` is in PATH.
 - **Multiple simultaneous sessions**: the daemon supports them (keyed by `session_id`)
   but there is no way to list or attach to existing sessions from the CLI.
 - **Client log path**: not yet configurable via CLI flag.
 - **Windows / macOS**: the PTY layer uses `portable-pty` (cross-platform) but has
-  only been tested on Linux. The TCP registration approach removed the last
-  Linux-specific path (`$XDG_RUNTIME_DIR`).
-- **PQC**: ML-KEM-768/1024 is implemented and tested but not compiled in by default
-  because `ml-kem` is a newer dependency. Enable with `--features pqc`.
-- **Re-attach from a new client machine**: not yet implemented. Session state lives
-  in the daemon process; a new machine would need the original `session_id` and
-  `passkey`, which are not persisted anywhere.
+  only been tested on Linux.
+- **PQC**: ML-KEM-768/1024 is implemented and tested but not compiled in by default.
+  Enable with `--features pqc`.
+- **Re-attach from a new client machine**: session state lives in the daemon process;
+  a new machine would need the original `session_id` and `passkey`, which are not
+  persisted anywhere.
 
 ---
 
