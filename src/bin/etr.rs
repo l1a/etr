@@ -1,4 +1,4 @@
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, ValueEnum};
 use clap_complete::Shell;
 use clap_complete_nushell::Nushell;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
@@ -17,11 +17,11 @@ use etr::session::{SessionState, read_frame, recv_encrypted, send_encrypted, wri
 #[derive(Parser, Debug)]
 #[command(
     name = "etr",
-    version = "0.1.1",
+    version = "0.1.2",
     about = "Eternal Terminal Client in Rust"
 )]
 struct Cli {
-    /// Remote host target (e.g. user@host or host)
+    /// Remote host target (e.g. user@host[:port] or host[:port])
     target: Option<String>,
 
     /// Remote TCP port of etr server
@@ -36,18 +36,9 @@ struct Cli {
     #[arg(short, long)]
     verbose: bool,
 
-    #[command(subcommand)]
-    command: Option<Commands>,
-}
-
-#[derive(Subcommand, Debug, Clone)]
-enum Commands {
     /// Generate shell completions for the specified shell
-    Completions {
-        /// The shell to generate completions for
-        #[arg(value_enum)]
-        shell: ShellChoice,
-    },
+    #[arg(long, value_enum, value_name = "SHELL")]
+    completions: Option<ShellChoice>,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy)]
@@ -64,39 +55,32 @@ enum ShellChoice {
 async fn main() -> io::Result<()> {
     let cli = Cli::parse();
 
-    if let Some(command) = cli.command {
-        match command {
-            Commands::Completions { shell } => {
-                let mut cmd = Cli::command();
-                match shell {
-                    ShellChoice::Bash => {
-                        clap_complete::generate(Shell::Bash, &mut cmd, "etr", &mut io::stdout())
-                    }
-                    ShellChoice::Elvish => {
-                        clap_complete::generate(Shell::Elvish, &mut cmd, "etr", &mut io::stdout())
-                    }
-                    ShellChoice::Fish => {
-                        clap_complete::generate(Shell::Fish, &mut cmd, "etr", &mut io::stdout())
-                    }
-                    ShellChoice::PowerShell => clap_complete::generate(
-                        Shell::PowerShell,
-                        &mut cmd,
-                        "etr",
-                        &mut io::stdout(),
-                    ),
-                    ShellChoice::Zsh => {
-                        clap_complete::generate(Shell::Zsh, &mut cmd, "etr", &mut io::stdout())
-                    }
-                    ShellChoice::Nushell => {
-                        clap_complete::generate(Nushell, &mut cmd, "etr", &mut io::stdout())
-                    }
-                }
-                return Ok(());
+    if let Some(shell) = cli.completions {
+        let mut cmd = Cli::command();
+        match shell {
+            ShellChoice::Bash => {
+                clap_complete::generate(Shell::Bash, &mut cmd, "etr", &mut io::stdout())
+            }
+            ShellChoice::Elvish => {
+                clap_complete::generate(Shell::Elvish, &mut cmd, "etr", &mut io::stdout())
+            }
+            ShellChoice::Fish => {
+                clap_complete::generate(Shell::Fish, &mut cmd, "etr", &mut io::stdout())
+            }
+            ShellChoice::PowerShell => {
+                clap_complete::generate(Shell::PowerShell, &mut cmd, "etr", &mut io::stdout())
+            }
+            ShellChoice::Zsh => {
+                clap_complete::generate(Shell::Zsh, &mut cmd, "etr", &mut io::stdout())
+            }
+            ShellChoice::Nushell => {
+                clap_complete::generate(Nushell, &mut cmd, "etr", &mut io::stdout())
             }
         }
+        return Ok(());
     }
 
-    let target = match cli.target {
+    let target_input = match cli.target {
         Some(t) => t,
         None => {
             let mut cmd = Cli::command();
@@ -104,6 +88,8 @@ async fn main() -> io::Result<()> {
             return Ok(());
         }
     };
+
+    let (target, port) = parse_target(&target_input, cli.port);
 
     // 1. Generate credentials
     let client_id = generate_id();
@@ -121,11 +107,36 @@ async fn main() -> io::Result<()> {
     let session_state = Arc::new(Mutex::new(SessionState::new(client_id.clone(), passkey)));
 
     // 4. Run persistent connection loop
-    if let Err(e) = run_connection_loop(target, cli.port, session_state, cli.verbose).await {
+    if let Err(e) = run_connection_loop(target, port, session_state, cli.verbose).await {
         eprintln!("Session connection loop terminated: {:?}", e);
     }
 
     Ok(())
+}
+
+fn parse_target(target_str: &str, default_port: u16) -> (String, u16) {
+    if let Some(r_bracket_idx) = target_str.rfind(']') {
+        if let Some(colon_idx) = target_str[r_bracket_idx..].find(':') {
+            let absolute_colon_idx = r_bracket_idx + colon_idx;
+            let port_str = &target_str[absolute_colon_idx + 1..];
+            if let Ok(parsed_port) = port_str.parse::<u16>() {
+                return (target_str[..absolute_colon_idx].to_string(), parsed_port);
+            }
+        }
+        return (target_str.to_string(), default_port);
+    }
+
+    if let Some(colon_idx) = target_str.find(':') {
+        let colons_count = target_str.chars().filter(|&c| c == ':').count();
+        if colons_count == 1 {
+            let port_str = &target_str[colon_idx + 1..];
+            if let Ok(parsed_port) = port_str.parse::<u16>() {
+                return (target_str[..colon_idx].to_string(), parsed_port);
+            }
+        }
+    }
+
+    (target_str.to_string(), default_port)
 }
 
 fn generate_id() -> String {
@@ -609,4 +620,32 @@ async fn read_frame_reader(reader: &mut tokio::net::tcp::OwnedReadHalf) -> io::R
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf).await?;
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_target() {
+        assert_eq!(parse_target("host", 2022), ("host".to_string(), 2022));
+        assert_eq!(parse_target("host:1234", 2022), ("host".to_string(), 1234));
+        assert_eq!(
+            parse_target("user@host:3000", 2022),
+            ("user@host".to_string(), 3000)
+        );
+        assert_eq!(parse_target("::1", 2022), ("::1".to_string(), 2022));
+        assert_eq!(
+            parse_target("[::1]:1234", 2022),
+            ("[::1]".to_string(), 1234)
+        );
+        assert_eq!(
+            parse_target("user@[::1]:1234", 2022),
+            ("user@[::1]".to_string(), 1234)
+        );
+        assert_eq!(
+            parse_target("user@[::1]", 2022),
+            ("user@[::1]".to_string(), 2022)
+        );
+    }
 }

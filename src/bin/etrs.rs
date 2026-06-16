@@ -16,7 +16,7 @@ use etr::session::{SessionState, read_frame, recv_encrypted, send_encrypted, wri
 #[derive(Parser)]
 #[command(
     name = "etrs",
-    version = "0.1.1",
+    version = "0.1.2",
     about = "Eternal Terminal Server Daemon in Rust"
 )]
 struct Cli {
