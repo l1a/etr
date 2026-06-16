@@ -11,6 +11,7 @@
 //! - [`session`]: Per-session and per-stream state that survives reconnections.
 //! - [`transport`]: Async UDP send/receive helpers.
 //! - [`handshake`]: 1-RTT client and server handshake state machines.
+pub mod config;
 pub mod crypto;
 pub mod handshake;
 pub mod protocol;

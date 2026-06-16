@@ -91,6 +91,39 @@ impl CipherSuiteId {
         }
     }
 
+    /// Short kebab-case name used in CLI flags and config files.
+    pub fn short_name(self) -> &'static str {
+        match self {
+            #[cfg(feature = "pqc")]
+            Self::MlKem1024Aes256GcmSha3 => "ml-kem-1024",
+            #[cfg(feature = "pqc")]
+            Self::MlKem768Aes256GcmSha256 => "ml-kem-768",
+            Self::X25519Aes256GcmSha256 => "x25519-aes",
+            Self::X25519ChaCha20Poly1305Sha256 => "x25519-chacha",
+        }
+    }
+
+    /// Parse from the short name used in CLI flags and config files.
+    pub fn from_name(s: &str) -> Option<Self> {
+        match s {
+            #[cfg(feature = "pqc")]
+            "ml-kem-1024" => Some(Self::MlKem1024Aes256GcmSha3),
+            #[cfg(feature = "pqc")]
+            "ml-kem-768" => Some(Self::MlKem768Aes256GcmSha256),
+            "x25519-aes" => Some(Self::X25519Aes256GcmSha256),
+            "x25519-chacha" => Some(Self::X25519ChaCha20Poly1305Sha256),
+            _ => None,
+        }
+    }
+
+    /// All valid short names for the suites compiled into this binary.
+    pub fn all_short_names() -> &'static [&'static str] {
+        #[cfg(feature = "pqc")]
+        return &["ml-kem-1024", "ml-kem-768", "x25519-aes", "x25519-chacha"];
+        #[cfg(not(feature = "pqc"))]
+        return &["x25519-aes", "x25519-chacha"];
+    }
+
     fn uses_sha3_kdf(self) -> bool {
         let _ = self;
         #[cfg(feature = "pqc")]

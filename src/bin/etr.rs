@@ -12,6 +12,7 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, mpsc};
 
+use etr::config::Config;
 use etr::crypto::{CipherSuiteId, generate_session_id};
 
 /// Log file for verbose output — set once at startup when running interactively.
@@ -80,17 +81,23 @@ struct Cli {
     /// Remote host (e.g. user@host or host)
     target: Option<String>,
 
-    /// SSH port for initial authentication
-    #[arg(short = 's', long, default_value = "22")]
-    ssh_port: u16,
+    /// SSH port for initial authentication (default: 22, or config file ssh_port)
+    #[arg(short = 's', long)]
+    ssh_port: Option<u16>,
 
     /// Verbosity: -v connection events, -vv cipher details, -vvv packet trace
     #[arg(short = 'v', action = ArgAction::Count)]
     verbose: u8,
 
     /// Path to the etrs binary on the remote host (default: relies on PATH)
-    #[arg(long, default_value = "etrs")]
-    server_path: String,
+    #[arg(long)]
+    server_path: Option<String>,
+
+    /// Cipher suite to use, in preference order (repeatable).
+    /// Available: ml-kem-1024, ml-kem-768, x25519-aes, x25519-chacha
+    /// Overrides config file. Default: all supported suites, strongest first.
+    #[arg(long = "cipher", value_name = "NAME")]
+    ciphers: Vec<String>,
 
     /// Generate shell completions for the specified shell
     #[arg(long, value_enum, value_name = "SHELL")]
@@ -167,6 +174,26 @@ async fn main() -> io::Result<()> {
 
     let target = target_input;
 
+    // Load config file, then apply CLI overrides.
+    let cfg = Config::load();
+    let ssh_port = cli
+        .ssh_port
+        .unwrap_or_else(|| cfg.client.ssh_port.unwrap_or(22));
+    let server_path = cli
+        .server_path
+        .or(cfg.client.server_path)
+        .unwrap_or_else(|| "etrs".to_string());
+
+    // Resolve cipher preference list: CLI flags > config file > compiled-in defaults.
+    let cipher_names = if !cli.ciphers.is_empty() {
+        cli.ciphers
+    } else if !cfg.client.ciphers.is_empty() {
+        cfg.client.ciphers
+    } else {
+        vec![] // empty = use CipherSuiteId::client_preference() defaults
+    };
+    let cipher_suites = resolve_ciphers(&cipher_names)?;
+
     let session_id = generate_session_id();
     let passkey = generate_passkey();
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
@@ -180,11 +207,11 @@ async fn main() -> io::Result<()> {
 
     let server_port = bootstrap_ssh(
         &target,
-        cli.ssh_port,
+        ssh_port,
         &session_id,
         &passkey,
         &term,
-        &cli.server_path,
+        &server_path,
     )?;
 
     vlog!(cli.verbose, 2, "[etr] etrs bound to port {}", server_port);
@@ -197,6 +224,7 @@ async fn main() -> io::Result<()> {
         passkey,
         session_id,
         session,
+        cipher_suites,
         cli.verbose,
     )
     .await
@@ -218,6 +246,29 @@ fn generate_passkey() -> String {
         .take(32)
         .map(char::from)
         .collect()
+}
+
+fn resolve_ciphers(names: &[String]) -> io::Result<Vec<u32>> {
+    if names.is_empty() {
+        return Ok(CipherSuiteId::client_preference());
+    }
+    let mut suites = Vec::with_capacity(names.len());
+    for name in names {
+        match CipherSuiteId::from_name(name) {
+            Some(s) => suites.push(s.as_u32()),
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "unknown cipher '{}'. Valid names: {}",
+                        name,
+                        CipherSuiteId::all_short_names().join(", ")
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(suites)
 }
 
 /// SSH to the target, start `etrs`, send session credentials via stdin,
@@ -279,6 +330,7 @@ async fn run_connection_loop(
     passkey: String,
     session_id: [u8; 16],
     session: Arc<Mutex<SessionState>>,
+    cipher_suites: Vec<u32>,
     verbose: u8,
 ) -> io::Result<()> {
     let host = if let Some(idx) = target.find('@') {
@@ -343,11 +395,15 @@ async fn run_connection_loop(
             2,
             "[etr] Sending ClientHello  session={} suites={:?}",
             hex_encode(&session_id),
-            CipherSuiteId::client_preference()
+            cipher_suites
         );
 
-        let (hs, hello_header, hello_envelope) =
-            ClientHandshake::reconnect(session_id, passkey.clone(), last_received);
+        let (hs, hello_header, hello_envelope) = ClientHandshake::reconnect(
+            session_id,
+            passkey.clone(),
+            last_received,
+            cipher_suites.clone(),
+        );
 
         if let Err(e) =
             send_packet(&socket, server_addr, &hello_header, &hello_envelope, None).await

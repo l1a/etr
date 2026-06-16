@@ -49,12 +49,15 @@ impl ClientHandshake {
     ///
     /// `last_received_seq` should be populated from `SessionState::last_received_map()`;
     /// pass an empty map for a brand-new session.
+    /// `cipher_suites` is an ordered list of `CipherSuiteId` wire IDs; pass
+    /// `CipherSuiteId::client_preference()` for the compiled-in defaults.
     pub fn new(
         passkey: String,
         last_received_seq: HashMap<u32, u64>,
+        cipher_suites: Vec<u32>,
     ) -> (Self, PacketHeader, Envelope) {
         let session_id = generate_session_id();
-        Self::with_session_id(session_id, passkey, last_received_seq)
+        Self::with_session_id(session_id, passkey, last_received_seq, cipher_suites)
     }
 
     /// Reconnect variant: reuse the existing `session_id`.
@@ -62,27 +65,30 @@ impl ClientHandshake {
         session_id: [u8; 16],
         passkey: String,
         last_received_seq: HashMap<u32, u64>,
+        cipher_suites: Vec<u32>,
     ) -> (Self, PacketHeader, Envelope) {
-        Self::with_session_id(session_id, passkey, last_received_seq)
+        Self::with_session_id(session_id, passkey, last_received_seq, cipher_suites)
     }
 
     fn with_session_id(
         session_id: [u8; 16],
         passkey: String,
         last_received_seq: HashMap<u32, u64>,
+        cipher_suites: Vec<u32>,
     ) -> (Self, PacketHeader, Envelope) {
         let client_nonce = generate_nonce();
-        // Generate a keypair for the most-preferred suite (the first in the preference list).
+        // Generate a keypair for the most-preferred suite (first in the list).
         // The server must choose that suite because the KEM public key is suite-specific.
-        let preferred_suites = CipherSuiteId::client_preference();
-        let preferred_suite = CipherSuiteId::from_u32(preferred_suites[0])
+        let preferred_suite = cipher_suites
+            .first()
+            .and_then(|&id| CipherSuiteId::from_u32(id))
             .unwrap_or(CipherSuiteId::X25519Aes256GcmSha256);
         let kem_keypair = KemKeyPair::generate(preferred_suite);
 
         let hello = ClientHello {
             protocol_version: PROTOCOL_VERSION as u32,
             session_id: session_id.to_vec(),
-            cipher_suites: CipherSuiteId::client_preference(),
+            cipher_suites,
             client_nonce: client_nonce.to_vec(),
             kem_public_key: kem_keypair.public_key_bytes(),
             last_received_seq,
@@ -285,8 +291,11 @@ mod tests {
         let passkey = "test-passkey".to_string();
 
         // Client builds ClientHello.
-        let (client_hs, _header, client_envelope) =
-            ClientHandshake::new(passkey.clone(), HashMap::new());
+        let (client_hs, _header, client_envelope) = ClientHandshake::new(
+            passkey.clone(),
+            HashMap::new(),
+            CipherSuiteId::client_preference(),
+        );
 
         // Extract ClientHello payload bytes (as if received over UDP).
         let client_payload = client_envelope.encode_to_vec();
@@ -315,8 +324,11 @@ mod tests {
 
     #[test]
     fn test_wrong_passkey_rejected() {
-        let (_client_hs, _header, client_envelope) =
-            ClientHandshake::new("correct".to_string(), HashMap::new());
+        let (_client_hs, _header, client_envelope) = ClientHandshake::new(
+            "correct".to_string(),
+            HashMap::new(),
+            CipherSuiteId::client_preference(),
+        );
         let client_payload = client_envelope.encode_to_vec();
 
         let result = process_client_hello(&client_payload, HashMap::new(), |_| {
@@ -326,8 +338,11 @@ mod tests {
         // but the client will fail to decrypt the ServerHello.
         let outcome = result.expect("server produces a response");
 
-        let (client_hs2, _, client_envelope2) =
-            ClientHandshake::new("correct".to_string(), HashMap::new());
+        let (client_hs2, _, client_envelope2) = ClientHandshake::new(
+            "correct".to_string(),
+            HashMap::new(),
+            CipherSuiteId::client_preference(),
+        );
         let _ = client_envelope2; // suppress warning
 
         // Simulate the client trying to decrypt with its own (different) nonce context.
@@ -345,7 +360,11 @@ mod tests {
 
     #[test]
     fn test_unknown_session_rejected() {
-        let (_hs, _hdr, env) = ClientHandshake::new("pk".to_string(), HashMap::new());
+        let (_hs, _hdr, env) = ClientHandshake::new(
+            "pk".to_string(),
+            HashMap::new(),
+            CipherSuiteId::client_preference(),
+        );
         let payload = env.encode_to_vec();
         let result = process_client_hello(&payload, HashMap::new(), |_| None);
         assert!(matches!(result, Err(HandshakeError::UnknownSession)));
@@ -403,7 +422,11 @@ mod tests {
         let passkey = "passkey".to_string();
         // Simulate client having received up to seq 5 on stream 0.
         let client_last: HashMap<u32, u64> = [(0, 5)].into();
-        let (_hs, _hdr, env) = ClientHandshake::new(passkey.clone(), client_last.clone());
+        let (_hs, _hdr, env) = ClientHandshake::new(
+            passkey.clone(),
+            client_last.clone(),
+            CipherSuiteId::client_preference(),
+        );
 
         let outcome = process_client_hello(&env.encode_to_vec(), HashMap::new(), |_| {
             Some(passkey.clone())
@@ -417,7 +440,11 @@ mod tests {
     fn test_server_last_received_seq_roundtrips() {
         let passkey = "passkey".to_string();
         let server_last: HashMap<u32, u64> = [(0, 10)].into();
-        let (_hs, _hdr, env) = ClientHandshake::new(passkey.clone(), HashMap::new());
+        let (_hs, _hdr, env) = ClientHandshake::new(
+            passkey.clone(),
+            HashMap::new(),
+            CipherSuiteId::client_preference(),
+        );
 
         let outcome = process_client_hello(&env.encode_to_vec(), server_last.clone(), |_| {
             Some(passkey.clone())
