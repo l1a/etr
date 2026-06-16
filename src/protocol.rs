@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Wire-format packet types for the `etr` protocol.
 //!
 //! All packets are serialised with [`bincode`] and encrypted with AES-256-GCM

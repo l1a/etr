@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 use clap::{CommandFactory, Parser, ValueEnum};
 use clap_complete::Shell;
 use clap_complete_nushell::Nushell;

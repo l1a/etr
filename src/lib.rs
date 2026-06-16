@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! `etr` — Eternal Terminal in Rust.
 //!
 //! This crate provides the shared library used by both the `etr` client and

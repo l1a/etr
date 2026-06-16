@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! Persistent session state and TCP framing helpers.
 //!
 //! [`SessionState`] tracks the send-history ring-buffer that allows the

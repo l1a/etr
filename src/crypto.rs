@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
 //! AES-256-GCM session encryption and HKDF-SHA-256 key derivation.
 //!
 //! A [`SessionCipher`] is created once per TCP connection by calling
