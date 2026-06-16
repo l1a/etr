@@ -4,19 +4,18 @@ use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::io::{self, Read, Write};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UdpSocket, UnixListener, UnixStream};
 use tokio::sync::{Mutex, mpsc};
 
-use etr::crypto::AeadCipher;
 use etr::handshake::process_client_hello;
 use etr::protocol::{
-    Envelope, Payload, StreamData, Disconnect, TerminalResize, Heartbeat, PacketHeader,
+    Disconnect, Envelope, Heartbeat, PacketHeader, Payload, StreamData, TerminalResize,
 };
 use etr::session::SessionState;
-use etr::transport::{decode_data_packet, recv_packet, send_packet};
+use etr::transport::{ReceivedPacket, decode_data_packet, recv_packet, send_packet};
 
 #[derive(Parser)]
 #[command(
@@ -49,15 +48,17 @@ enum Commands {
     Register,
 }
 
-/// State shared between the registration path and the UDP handler for one session.
+/// State shared between the registration path and the UDP demux loop for one session.
 struct ActiveSession {
-    session_id: [u8; 16],
     passkey: String,
     session_state: Arc<Mutex<SessionState>>,
     pty_write_tx: mpsc::Sender<Vec<u8>>,
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
-    /// Current active UDP sender channel + remote addr, replaced on reconnect.
-    udp_tx: Arc<std::sync::Mutex<Option<(mpsc::Sender<Envelope>, SocketAddr)>>>,
+    /// Inbound packet channel: the demux loop sends here; the connection handler reads here.
+    /// Replaced on each reconnect, which drops the old Sender and closes the old Receiver.
+    inbound_tx: std::sync::Mutex<Option<mpsc::Sender<ReceivedPacket>>>,
+    /// Outbound envelope channel: PTY reader sends here; the connection handler encrypts + sends.
+    outbound_tx: std::sync::Mutex<Option<mpsc::Sender<Envelope>>>,
 }
 
 type SessionMap = Arc<std::sync::Mutex<HashMap<[u8; 16], Arc<ActiveSession>>>>;
@@ -80,10 +81,15 @@ async fn run_register(socket_path: String) -> io::Result<()> {
     let input = input.trim();
     let parts: Vec<&str> = input.split('/').collect();
     if parts.len() < 3 {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Expected SESSION_ID_HEX/PASSKEY/TERM"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Expected SESSION_ID_HEX/PASSKEY/TERM",
+        ));
     }
     let mut stream = UnixStream::connect(&socket_path).await?;
-    stream.write_all(format!("{}/{}/{}\n", parts[0], parts[1], parts[2]).as_bytes()).await?;
+    stream
+        .write_all(format!("{}/{}/{}\n", parts[0], parts[1], parts[2]).as_bytes())
+        .await?;
     stream.flush().await?;
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).await?;
@@ -115,7 +121,7 @@ async fn run_daemon(bind_addr: String, port: u16, socket_path: String) -> io::Re
         }
     });
 
-    // UDP listener for etr clients.
+    // Single UDP socket — this loop is the exclusive reader.
     let addr: SocketAddr = format!("{}:{}", bind_addr, port)
         .parse()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
@@ -125,45 +131,37 @@ async fn run_daemon(bind_addr: String, port: u16, socket_path: String) -> io::Re
     loop {
         let pkt = match recv_packet(&socket).await? {
             Some(p) => p,
-            None => continue,
+            None => continue, // unknown protocol version; skip
         };
 
         if pkt.header.is_handshake() {
+            // New connection or reconnect: spawn a handler for the handshake.
             let sess = Arc::clone(&sessions);
             let sock = Arc::clone(&socket);
             tokio::spawn(async move {
-                if let Err(e) = handle_client_hello(pkt.peer, pkt.header, pkt.payload_bytes, sess, sock).await {
+                if let Err(e) =
+                    handle_client_hello(pkt.peer, pkt.header, pkt.payload_bytes, sess, sock).await
+                {
                     eprintln!("Handshake error from {}: {:?}", pkt.peer, e);
                 }
             });
         } else {
-            // Route data packet to the correct session.
+            // Data packet: route to the session's inbound channel.
             let session_id = pkt.header.session_id;
-            let entry = sessions.lock().unwrap().get(&session_id).cloned();
-            if let Some(session) = entry {
-                let cipher = {
-                    let s = session.session_state.lock().await;
-                    // cipher is stored per-connection in udp_tx context; handled below
-                    drop(s);
-                    None::<Arc<AeadCipher>>
-                };
-                // Forward to the session's active connection handler via its channel.
-                let tx_opt = session.udp_tx.lock().unwrap().as_ref().map(|(tx, _)| tx.clone());
-                if let Some(tx) = tx_opt {
-                    // Wrap raw packet info as an opaque envelope for routing;
-                    // the connection handler decrypts it with its own cipher handle.
-                    // Since we can't pass raw bytes through the Envelope channel, we
-                    // re-parse here using the session's stored cipher.
-                    drop(cipher); // satisfy the borrow checker
-                    let _ = tx; // connection handler owns decryption
-                }
+            let tx = sessions
+                .lock()
+                .unwrap()
+                .get(&session_id)
+                .and_then(|s| s.inbound_tx.lock().unwrap().clone());
+            if let Some(tx) = tx {
+                // Non-blocking: drop the packet if the handler is behind.
+                let _ = tx.try_send(pkt);
             }
         }
     }
 }
 
 async fn handle_registration(mut stream: UnixStream, sessions: SessionMap) -> io::Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut buf = vec![0u8; 1024];
     let n = stream.read(&mut buf).await?;
     let msg = String::from_utf8_lossy(&buf[..n]);
@@ -172,7 +170,8 @@ async fn handle_registration(mut stream: UnixStream, sessions: SessionMap) -> io
         stream.write_all(b"ERROR: Invalid format").await?;
         return Ok(());
     }
-    let session_id = hex_decode(parts[0]).and_then(|b| b.try_into().ok())
+    let session_id: [u8; 16] = hex_decode(parts[0])
+        .and_then(|b| b.try_into().ok())
         .ok_or_else(|| io::Error::other("Invalid session_id hex"))?;
     let passkey = parts[1].to_string();
     let term = parts[2].to_string();
@@ -180,7 +179,8 @@ async fn handle_registration(mut stream: UnixStream, sessions: SessionMap) -> io
     println!("Registering session id={} term={}", parts[0], term);
 
     let pty_system = native_pty_system();
-    let pair = pty_system.openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+    let pair = pty_system
+        .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
         .map_err(io::Error::other)?;
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
@@ -195,46 +195,51 @@ async fn handle_registration(mut stream: UnixStream, sessions: SessionMap) -> io
     let (pty_write_tx, mut pty_write_rx) = mpsc::channel::<Vec<u8>>(1000);
     tokio::task::spawn_blocking(move || {
         while let Some(data) = pty_write_rx.blocking_recv() {
-            if pty_writer.write_all(&data).is_err() { break; }
+            if pty_writer.write_all(&data).is_err() {
+                break;
+            }
             let _ = pty_writer.flush();
         }
     });
 
     let master_shared = Arc::new(Mutex::new(master));
     let session_state = Arc::new(Mutex::new(SessionState::new(session_id, passkey.clone())));
-    let udp_tx: Arc<std::sync::Mutex<Option<(mpsc::Sender<Envelope>, SocketAddr)>>> =
-        Arc::new(std::sync::Mutex::new(None));
 
     let active = Arc::new(ActiveSession {
-        session_id,
         passkey,
         session_state: Arc::clone(&session_state),
         pty_write_tx,
         master: Arc::clone(&master_shared),
-        udp_tx: Arc::clone(&udp_tx),
+        inbound_tx: std::sync::Mutex::new(None),
+        outbound_tx: std::sync::Mutex::new(None),
     });
 
     // Clean up on shell exit.
     let sessions_cleanup = Arc::clone(&sessions);
-    let udp_tx_cleanup = Arc::clone(&udp_tx);
+    let active_cleanup = Arc::clone(&active);
     tokio::task::spawn_blocking(move || {
         let _ = child.wait();
         println!("Shell exited for session {:?}, cleaning up.", session_id);
         sessions_cleanup.lock().unwrap().remove(&session_id);
-        let guard = udp_tx_cleanup.lock().unwrap();
-        if let Some((tx, _)) = &*guard {
-            let _ = tx.blocking_send(Envelope { payload: Some(Payload::Disconnect(Disconnect {})) });
+        // Signal any connected client to disconnect.
+        let tx = active_cleanup.outbound_tx.lock().unwrap().clone();
+        if let Some(tx) = tx {
+            let _ = tx.blocking_send(Envelope {
+                payload: Some(Payload::Disconnect(Disconnect {})),
+            });
         }
     });
 
-    // Forward PTY output to any connected UDP client.
+    // Forward PTY output to any connected client via the outbound channel.
     let session_state_pty = Arc::clone(&session_state);
-    let udp_tx_pty = Arc::clone(&udp_tx);
+    let active_pty = Arc::clone(&active);
     let sessions_pty = Arc::clone(&sessions);
     tokio::task::spawn_blocking(move || {
         let mut buf = [0u8; 4096];
         while let Ok(n) = pty_reader.read(&mut buf) {
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             let payload = buf[..n].to_vec();
             let seq = {
                 let mut s = futures::executor::block_on(session_state_pty.lock());
@@ -244,8 +249,8 @@ async fn handle_registration(mut stream: UnixStream, sessions: SessionMap) -> io
                 st.record_send(seq, payload.clone());
                 seq
             };
-            let tx_opt = udp_tx_pty.lock().unwrap().as_ref().map(|(tx, _)| tx.clone());
-            if let Some(tx) = tx_opt {
+            let tx = active_pty.outbound_tx.lock().unwrap().clone();
+            if let Some(tx) = tx {
                 let _ = tx.blocking_send(Envelope {
                     payload: Some(Payload::StreamData(StreamData {
                         stream_id: 0,
@@ -266,88 +271,99 @@ async fn handle_registration(mut stream: UnixStream, sessions: SessionMap) -> io
 
 async fn handle_client_hello(
     peer: SocketAddr,
-    _header: PacketHeader,
+    header: PacketHeader,
     payload_bytes: Vec<u8>,
     sessions: SessionMap,
     socket: Arc<UdpSocket>,
 ) -> io::Result<()> {
-    let session = {
-        let guard = sessions.lock().unwrap();
-        // Peek at session_id from the payload before the full handshake.
-        // We need to extract it to look up the passkey.
-        // process_client_hello does this internally via the lookup closure.
-        drop(guard);
-    };
-    let _ = session;
+    let session_id = header.session_id;
 
-    let sessions_lookup = Arc::clone(&sessions);
+    // Look up passkey and active session — drop the std Mutex guard before any .await.
+    let (passkey, active) = {
+        let guard = sessions.lock().unwrap();
+        let s = guard
+            .get(&session_id)
+            .ok_or_else(|| io::Error::other("unknown session"))?;
+        (s.passkey.clone(), Arc::clone(s))
+        // guard dropped here
+    };
+    let server_last_received = active.session_state.lock().await.last_received_map();
+
     let outcome = process_client_hello(
         &payload_bytes,
-        HashMap::new(), // server_last_received filled below from session state
-        move |session_id_bytes| {
-            let sid: [u8; 16] = session_id_bytes.try_into().ok()?;
-            let guard = sessions_lookup.lock().unwrap();
-            guard.get(&sid).map(|s| s.passkey.clone())
-        },
+        server_last_received,
+        |_| Some(passkey.clone()),
     )
     .map_err(|e| io::Error::other(e.to_string()))?;
 
-    // Look up the active session.
-    let active = {
-        let guard = sessions.lock().unwrap();
-        guard.get(&outcome.session_id).cloned()
-    };
-    let Some(active) = active else {
-        return Err(io::Error::other("session disappeared after handshake"));
-    };
-
-    // Apply client acks and compute server's replay set.
+    // Apply client acks and collect replay packets.
     let replays = {
         let mut s = active.session_state.lock().await;
         s.apply_server_acks(&outcome.client_last_received);
         s.collect_replays(&outcome.client_last_received)
     };
 
-    // Send ServerHello. The payload is already hello-key-encrypted, so we write raw bytes.
-    let mut buf = Vec::with_capacity(etr::protocol::HEADER_SIZE + outcome.response_payload_bytes.len());
+    // Send ServerHello (pre-encrypted with the hello key).
+    let mut buf =
+        Vec::with_capacity(etr::protocol::HEADER_SIZE + outcome.response_payload_bytes.len());
     buf.extend_from_slice(&outcome.response_header.encode());
     buf.extend_from_slice(&outcome.response_payload_bytes);
     socket.send_to(&buf, peer).await?;
 
     let cipher = Arc::new(outcome.cipher);
 
-    // Set up a channel for this connection's outbound packets.
-    let (tx, mut rx) = mpsc::channel::<Envelope>(1000);
-    {
-        let mut guard = active.udp_tx.lock().unwrap();
-        *guard = Some((tx.clone(), peer));
-    }
+    // Create per-connection inbound channel and register it so the demux loop
+    // can route data packets here.  Replacing the Sender closes the previous
+    // Receiver, which cleanly terminates any prior connection's reader task.
+    let (inbound_tx, mut inbound_rx) = mpsc::channel::<ReceivedPacket>(256);
+    *active.inbound_tx.lock().unwrap() = Some(inbound_tx);
 
-    // Queue replay packets.
+    // Create per-connection outbound channel and wire the PTY reader into it.
+    let (outbound_tx, mut outbound_rx) = mpsc::channel::<Envelope>(1000);
+    *active.outbound_tx.lock().unwrap() = Some(outbound_tx);
+
+    // Queue replay packets ahead of live data.
     for (stream_id, packets) in replays {
         for (seq, data) in packets {
-            let _ = tx.send(Envelope {
-                payload: Some(Payload::StreamData(StreamData { stream_id, seq_num: seq, data })),
-            }).await;
+            if active
+                .outbound_tx
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|tx| {
+                    tx.try_send(Envelope {
+                        payload: Some(Payload::StreamData(StreamData {
+                            stream_id,
+                            seq_num: seq,
+                            data,
+                        })),
+                    })
+                    .is_ok()
+                })
+                .unwrap_or(false)
+            {}
         }
     }
 
+    let session_id = outcome.session_id;
     let socket_w = Arc::clone(&socket);
     let cipher_w = Arc::clone(&cipher);
     let session_w = Arc::clone(&active.session_state);
-    let session_id = outcome.session_id;
 
-    // Writer task: encrypt and send outbound envelopes.
+    // Writer task: encrypt and send each outbound envelope to the client.
     let mut writer = tokio::spawn(async move {
-        while let Some(envelope) = rx.recv().await {
-            let seq = { let mut s = session_w.lock().await; s.next_packet_seq() };
+        while let Some(envelope) = outbound_rx.recv().await {
+            let seq = {
+                let mut s = session_w.lock().await;
+                s.next_packet_seq()
+            };
             let header = PacketHeader::new(0, session_id, seq);
             let _ = send_packet(&socket_w, peer, &header, &envelope, Some(&cipher_w)).await;
         }
     });
 
-    // Reader task: receive and decrypt inbound data from this client.
-    let socket_r = Arc::clone(&socket);
+    // Reader task: drain the inbound channel (filled by the demux loop) and
+    // dispatch to PTY / resize / control handlers.
     let cipher_r = Arc::clone(&cipher);
     let session_r = Arc::clone(&active.session_state);
     let pty_tx = active.pty_write_tx.clone();
@@ -356,20 +372,29 @@ async fn handle_client_hello(
         loop {
             let pkt = match tokio::time::timeout(
                 std::time::Duration::from_secs(15),
-                recv_packet(&socket_r),
-            ).await {
-                Ok(Ok(Some(p))) if p.peer == peer && p.header.session_id == session_id => p,
-                Ok(Ok(_)) => continue,
-                Ok(Err(e)) => return Err(e),
+                inbound_rx.recv(),
+            )
+            .await
+            {
+                Ok(Some(p)) => p,
+                Ok(None) => break, // channel replaced by a reconnect; exit cleanly
                 Err(_) => {
                     eprintln!("Client {} timed out.", peer);
                     break;
                 }
             };
 
-            if pkt.header.is_handshake() { break; } // reconnect; new handler takes over
+            // A handshake packet arriving here means the client is reconnecting;
+            // the new handle_client_hello call will replace our inbound channel.
+            if pkt.header.is_handshake() {
+                break;
+            }
 
-            let envelope = match decode_data_packet(&pkt.payload_bytes, pkt.header.packet_seq, &cipher_r) {
+            let envelope = match decode_data_packet(
+                &pkt.payload_bytes,
+                pkt.header.packet_seq,
+                &cipher_r,
+            ) {
                 Ok(e) => e,
                 Err(_) => continue,
             };
@@ -383,7 +408,9 @@ async fn handle_client_hello(
                     if sd.seq_num == expected {
                         let _ = pty_tx.send(sd.data).await;
                         let mut s = session_r.lock().await;
-                        if let Some(st) = s.stream_mut(0) { st.next_in_seq += 1; }
+                        if let Some(st) = s.stream_mut(0) {
+                            st.next_in_seq += 1;
+                        }
                     }
                 }
                 Some(Payload::TerminalResize(tr)) => {
@@ -404,15 +431,16 @@ async fn handle_client_hello(
     });
 
     // Heartbeat task.
-    let tx_hb = {
-        let guard = active.udp_tx.lock().unwrap();
-        guard.as_ref().map(|(tx, _)| tx.clone())
-    };
+    let outbound_hb = active.outbound_tx.lock().unwrap().clone();
     let mut hb_task = tokio::spawn(async move {
-        if let Some(tx) = tx_hb {
+        if let Some(tx) = outbound_hb {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                if tx.send(Envelope { payload: Some(Payload::Heartbeat(Heartbeat {})) }).await.is_err() {
+                if tx
+                    .send(Envelope { payload: Some(Payload::Heartbeat(Heartbeat {})) })
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -420,26 +448,27 @@ async fn handle_client_hello(
     });
 
     tokio::select! {
-        _ = &mut writer => {}
-        _ = &mut reader => {}
+        _ = &mut writer  => {}
+        _ = &mut reader  => {}
         _ = &mut hb_task => {}
     }
     writer.abort();
     reader.abort();
     hb_task.abort();
 
-    // Clear active channel so the PTY reader stops trying to send.
-    let mut guard = active.udp_tx.lock().unwrap();
-    if guard.as_ref().map(|(_, a)| *a == peer).unwrap_or(false) {
-        *guard = None;
-    }
+    // Clear the channels so the PTY reader stops queuing into the dead connection.
+    *active.inbound_tx.lock().unwrap() = None;
+    *active.outbound_tx.lock().unwrap() = None;
 
     Ok(())
 }
 
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 { return None; }
-    (0..s.len()).step_by(2)
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
         .collect()
 }
