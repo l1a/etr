@@ -346,4 +346,29 @@ mod tests {
         let ct = enc.encrypt(1, b"secret").unwrap();
         assert!(dec.decrypt(1, &ct).is_err());
     }
+
+    #[test]
+    fn test_short_name_round_trip() {
+        for &name in CipherSuiteId::all_short_names() {
+            let suite = CipherSuiteId::from_name(name).expect("all_short_names are parseable");
+            assert_eq!(suite.short_name(), name);
+        }
+    }
+
+    #[test]
+    fn test_from_name_unknown_returns_none() {
+        assert!(CipherSuiteId::from_name("not-a-suite").is_none());
+        assert!(CipherSuiteId::from_name("").is_none());
+    }
+
+    #[test]
+    fn test_all_short_names_non_empty() {
+        assert!(!CipherSuiteId::all_short_names().is_empty());
+    }
+
+    #[test]
+    fn test_from_name_known_suites() {
+        assert!(CipherSuiteId::from_name("x25519-aes").is_some());
+        assert!(CipherSuiteId::from_name("x25519-chacha").is_some());
+    }
 }

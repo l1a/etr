@@ -147,11 +147,43 @@ tells you where to look. Watch it live with `tail -f ~/.local/state/etr/etr.log`
 
 ---
 
+## Configuration
+
+A TOML config file is loaded from `$XDG_CONFIG_HOME/etr/config.toml`
+(default: `~/.config/etr/config.toml`). All fields are optional and fall back to
+compiled-in defaults. CLI flags take precedence over config file values.
+
+```toml
+[client]
+# Cipher suites in preference order (short names below).
+# Default: all supported suites, strongest first.
+ciphers = ["ml-kem-1024", "x25519-aes"]
+
+# Default SSH port (default: 22)
+ssh_port = 22
+
+# Path to etrs on remote hosts (default: "etrs", relies on PATH)
+server_path = "/usr/local/bin/etrs"
+```
+
+### Cipher suite selection
+
+Select cipher suites with `--cipher` (repeatable, preference order):
+```bash
+etr --cipher ml-kem-1024 --cipher x25519-aes host
+```
+
+Precedence: `--cipher` flags > `config.toml ciphers` > compiled-in defaults.
+
+---
+
 ## Ports and paths
 
 | Resource | Default | Override |
 |----------|---------|----------|
 | UDP data port | OS-assigned (random high port) | `etrs -p PORT` |
+| SSH port | 22 | `-s PORT` or config `ssh_port` |
+| etrs binary path | `etrs` (PATH) | `--server-path` or config `server_path` |
 | Server log | `~/.local/state/etr/etrs.log` | (not yet configurable) |
 | Client log | `~/.local/state/etr/etr.log` | (not yet configurable) |
 | Server bind address | `[::]` (dual-stack) | `etrs -b ADDR` |
@@ -257,7 +289,7 @@ and the server has no port-forwarding logic.
 
 ---
 
-## Test coverage (94 tests)
+## Test coverage (112 tests)
 
 | Module | What's tested |
 |--------|--------------|
@@ -271,4 +303,5 @@ and the server has no port-forwarding logic.
 | `session/stream` | Acknowledge edge cases, replay from 0, initial seq values |
 | `session/mod` | Close/ack unknown stream, `last_received_map` semantics, collect_replays, `open_stream` idempotence |
 | `bin/etrs` | CLI defaults, verbose count, custom port, subcommand parsing |
-| `bin/etr` | CLI defaults, port parsing, target parsing (IPv6 brackets, user@host, host:port) |
+| `config` | TOML parse (full section, partial, empty), default values |
+| `bin/etr` | CLI defaults, port parsing, target parsing, `--cipher` flag, `resolve_ciphers` |

@@ -725,10 +725,69 @@ mod tests {
 
     #[test]
     fn test_target_passthrough() {
-        // target is now passed as-is to SSH; no port stripping needed.
         let cli = Cli::try_parse_from(["etr", "user@host"]).unwrap();
         assert_eq!(cli.target.as_deref(), Some("user@host"));
         let cli = Cli::try_parse_from(["etr", "localhost"]).unwrap();
         assert_eq!(cli.target.as_deref(), Some("localhost"));
+    }
+
+    #[test]
+    fn test_ssh_port_default_is_none() {
+        let cli = Cli::try_parse_from(["etr", "host"]).unwrap();
+        assert_eq!(cli.ssh_port, None);
+    }
+
+    #[test]
+    fn test_ssh_port_override() {
+        let cli = Cli::try_parse_from(["etr", "-s", "2222", "host"]).unwrap();
+        assert_eq!(cli.ssh_port, Some(2222));
+    }
+
+    #[test]
+    fn test_cipher_flag_single() {
+        let cli = Cli::try_parse_from(["etr", "--cipher", "x25519-aes", "host"]).unwrap();
+        assert_eq!(cli.ciphers, vec!["x25519-aes"]);
+    }
+
+    #[test]
+    fn test_cipher_flag_multiple() {
+        let cli = Cli::try_parse_from([
+            "etr",
+            "--cipher",
+            "ml-kem-1024",
+            "--cipher",
+            "x25519-chacha",
+            "host",
+        ])
+        .unwrap();
+        assert_eq!(cli.ciphers, vec!["ml-kem-1024", "x25519-chacha"]);
+    }
+
+    #[test]
+    fn test_cipher_flag_default_is_empty() {
+        let cli = Cli::try_parse_from(["etr", "host"]).unwrap();
+        assert!(cli.ciphers.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_ciphers_empty_returns_defaults() {
+        let suites = resolve_ciphers(&[]).unwrap();
+        assert!(!suites.is_empty());
+        assert_eq!(suites, CipherSuiteId::client_preference());
+    }
+
+    #[test]
+    fn test_resolve_ciphers_valid_names() {
+        let suites =
+            resolve_ciphers(&["x25519-aes".to_string(), "x25519-chacha".to_string()]).unwrap();
+        assert_eq!(suites, vec![3u32, 4u32]);
+    }
+
+    #[test]
+    fn test_resolve_ciphers_unknown_name_errors() {
+        let result = resolve_ciphers(&["not-a-cipher".to_string()]);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("not-a-cipher"));
     }
 }

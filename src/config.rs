@@ -85,3 +85,65 @@ pub fn config_path() -> std::path::PathBuf {
         .join("etr")
         .join("config.toml")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_config_path_ends_with_etr_config() {
+        let path = config_path();
+        assert!(path.ends_with("etr/config.toml"));
+    }
+
+    #[test]
+    fn test_default_config_is_empty() {
+        let cfg = Config::default();
+        assert!(cfg.client.ciphers.is_empty());
+        assert!(cfg.client.ssh_port.is_none());
+        assert!(cfg.client.server_path.is_none());
+    }
+
+    #[test]
+    fn test_parse_empty_toml_uses_defaults() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.client.ciphers.is_empty());
+        assert!(cfg.client.ssh_port.is_none());
+        assert!(cfg.client.server_path.is_none());
+    }
+
+    #[test]
+    fn test_parse_full_client_section() {
+        let toml = r#"
+[client]
+ciphers = ["ml-kem-1024", "x25519-aes"]
+ssh_port = 2222
+server_path = "/usr/local/bin/etrs"
+"#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.client.ciphers, vec!["ml-kem-1024", "x25519-aes"]);
+        assert_eq!(cfg.client.ssh_port, Some(2222));
+        assert_eq!(
+            cfg.client.server_path.as_deref(),
+            Some("/usr/local/bin/etrs")
+        );
+    }
+
+    #[test]
+    fn test_parse_partial_client_section() {
+        let toml = "[client]\nssh_port = 22\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.client.ssh_port, Some(22));
+        assert!(cfg.client.ciphers.is_empty());
+        assert!(cfg.client.server_path.is_none());
+    }
+
+    #[test]
+    fn test_load_nonexistent_file_returns_default() {
+        // Config::load() gracefully handles a missing file.
+        // We can't easily redirect config_path(), but we verify the fallback
+        // behaviour by testing the toml parse path directly.
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.client.ciphers.is_empty());
+    }
+}
