@@ -374,11 +374,6 @@ async fn handle_client_tcp(mut stream: TcpStream, sessions: SessionMap) -> io::R
     let replays = state.get_replay_packets(client_last_received);
     drop(state);
 
-    for (seq, data) in replays {
-        let packet = Packet::TerminalData { seq_num: seq, data };
-        send_encrypted(&mut stream, &cipher, seq, &packet).await?;
-    }
-
     // 8. Set up channel for client TCP writing and assign unique connection ID
     let conn_id = {
         let mut guard = session.next_conn_id.lock().await;
@@ -388,6 +383,12 @@ async fn handle_client_tcp(mut stream: TcpStream, sessions: SessionMap) -> io::R
     };
 
     let (tcp_send_tx, mut tcp_send_rx) = mpsc::channel::<Packet>(1000);
+
+    // Queue catch-up packets to the sender channel to be encrypted with transport sequence numbers
+    for (seq, data) in replays {
+        let packet = Packet::TerminalData { seq_num: seq, data };
+        let _ = tcp_send_tx.send(packet).await;
+    }
 
     // Register the new TCP writer channel in the active session along with the connection ID
     let mut active_tx = session.tcp_tx.lock().await;

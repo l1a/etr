@@ -337,14 +337,13 @@ async fn run_session(
     session_state: &Arc<Mutex<SessionState>>,
     replays: Vec<(u64, Vec<u8>)>,
 ) -> io::Result<()> {
-    // Send catch-up packets
-    let mut stream = stream;
+    let (tcp_send_tx, mut tcp_send_rx) = mpsc::channel::<Packet>(1000);
+
+    // Queue catch-up packets to the sender channel to be encrypted with transport sequence numbers
     for (seq, data) in replays {
         let packet = Packet::TerminalData { seq_num: seq, data };
-        send_encrypted(&mut stream, &cipher, seq, &packet).await?;
+        let _ = tcp_send_tx.send(packet).await;
     }
-
-    let (tcp_send_tx, mut tcp_send_rx) = mpsc::channel::<Packet>(1000);
 
     // Send initial terminal size to server
     if let Ok((cols, rows)) = crossterm::terminal::size() {
