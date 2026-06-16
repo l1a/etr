@@ -91,3 +91,140 @@ pub fn decode_plaintext_packet(payload_bytes: &[u8]) -> std::io::Result<Envelope
     Envelope::decode(payload_bytes)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::{AeadCipher, CipherSuiteId, KemKeyPair, derive_session_cipher,
+                        encapsulate, generate_nonce};
+    use crate::protocol::{Envelope, Heartbeat, Payload, PacketHeader};
+
+    fn make_cipher() -> AeadCipher {
+        let suite = CipherSuiteId::X25519Aes256GcmSha256;
+        let kp = KemKeyPair::generate(suite);
+        let (ct, server_secret) = encapsulate(suite, &kp.public_key_bytes()).unwrap();
+        let client_secret = kp.decapsulate(&ct).unwrap();
+        let cn = generate_nonce();
+        let sn = generate_nonce();
+        // Both sides derive the same cipher; we just need one for these tests.
+        derive_session_cipher(suite, b"passkey", &server_secret, &cn, &sn);
+        derive_session_cipher(suite, b"passkey", &client_secret, &cn, &sn)
+    }
+
+    fn heartbeat_envelope() -> Envelope {
+        Envelope { payload: Some(Payload::Heartbeat(Heartbeat {})) }
+    }
+
+    // ── decode_data_packet ────────────────────────────────────────────────────
+
+    #[test]
+    fn decode_data_packet_round_trip() {
+        let cipher = make_cipher();
+        let envelope = heartbeat_envelope();
+        let plaintext = prost::Message::encode_to_vec(&envelope);
+        let ciphertext = cipher.encrypt(42, &plaintext).unwrap();
+        let decoded = decode_data_packet(&ciphertext, 42, &cipher).unwrap();
+        assert!(matches!(decoded.payload, Some(Payload::Heartbeat(_))));
+    }
+
+    #[test]
+    fn decode_data_packet_wrong_key_fails() {
+        let enc_cipher = make_cipher();
+        let dec_cipher = make_cipher(); // independent key
+        let plaintext = prost::Message::encode_to_vec(&heartbeat_envelope());
+        let ciphertext = enc_cipher.encrypt(1, &plaintext).unwrap();
+        assert!(decode_data_packet(&ciphertext, 1, &dec_cipher).is_err());
+    }
+
+    #[test]
+    fn decode_data_packet_mutated_ciphertext_fails() {
+        let cipher = make_cipher();
+        let plaintext = prost::Message::encode_to_vec(&heartbeat_envelope());
+        let mut ciphertext = cipher.encrypt(1, &plaintext).unwrap();
+        ciphertext[0] ^= 0xFF;
+        assert!(decode_data_packet(&ciphertext, 1, &cipher).is_err());
+    }
+
+    #[test]
+    fn decode_data_packet_wrong_seq_fails() {
+        let cipher = make_cipher();
+        let plaintext = prost::Message::encode_to_vec(&heartbeat_envelope());
+        let ciphertext = cipher.encrypt(1, &plaintext).unwrap();
+        assert!(decode_data_packet(&ciphertext, 2, &cipher).is_err());
+    }
+
+    // ── decode_plaintext_packet ───────────────────────────────────────────────
+
+    #[test]
+    fn decode_plaintext_packet_valid() {
+        use prost::Message;
+        let env = heartbeat_envelope();
+        let bytes = env.encode_to_vec();
+        let decoded = decode_plaintext_packet(&bytes).unwrap();
+        assert!(matches!(decoded.payload, Some(Payload::Heartbeat(_))));
+    }
+
+    #[test]
+    fn decode_plaintext_packet_invalid_protobuf_fails() {
+        assert!(decode_plaintext_packet(b"\xFF\xFF\xFF\xFF garbage").is_err());
+    }
+
+    #[test]
+    fn decode_plaintext_packet_empty_bytes_gives_empty_envelope() {
+        // Empty bytes decode to an Envelope with no payload (all fields optional in proto3).
+        let decoded = decode_plaintext_packet(&[]).unwrap();
+        assert!(decoded.payload.is_none());
+    }
+
+    // ── send_packet / recv_packet loopback ────────────────────────────────────
+
+    #[tokio::test]
+    async fn send_recv_plaintext_loopback() {
+        use prost::Message;
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let session_id = [1u8; 16];
+        let header = PacketHeader::new(0, session_id, 7);
+        let envelope = heartbeat_envelope();
+
+        send_packet(&client, server_addr, &header, &envelope, None).await.unwrap();
+
+        let pkt = recv_packet(&server).await.unwrap().unwrap();
+        assert_eq!(pkt.header.session_id, session_id);
+        assert_eq!(pkt.header.packet_seq, 7);
+        let decoded = decode_plaintext_packet(&pkt.payload_bytes).unwrap();
+        assert_eq!(decoded.encode_to_vec(), envelope.encode_to_vec());
+    }
+
+    #[tokio::test]
+    async fn send_recv_encrypted_loopback() {
+        use prost::Message;
+        let server_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_sock.local_addr().unwrap();
+
+        let cipher = make_cipher();
+        let session_id = [2u8; 16];
+        let header = PacketHeader::new(0, session_id, 3);
+        let envelope = heartbeat_envelope();
+
+        send_packet(&client_sock, server_addr, &header, &envelope, Some(&cipher)).await.unwrap();
+
+        let pkt = recv_packet(&server_sock).await.unwrap().unwrap();
+        let decoded = decode_data_packet(&pkt.payload_bytes, 3, &cipher).unwrap();
+        assert_eq!(decoded.encode_to_vec(), envelope.encode_to_vec());
+    }
+
+    #[tokio::test]
+    async fn recv_packet_truncated_header_returns_none() {
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        // Send fewer bytes than HEADER_SIZE.
+        client.send_to(&[0u8; 10], server_addr).await.unwrap();
+        let result = recv_packet(&server).await.unwrap();
+        assert!(result.is_none());
+    }
+}

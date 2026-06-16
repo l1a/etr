@@ -239,11 +239,17 @@ where
 
 #[derive(Debug)]
 pub enum HandshakeError {
+    /// The session ID in `ClientHello` was not found in the session store.
     UnknownSession,
+    /// AEAD decryption of the hello-encrypted payload failed (wrong passkey or tampered packet).
     AuthFailed,
+    /// The client's offered cipher suites contain no suite the server supports.
     UnsupportedSuite,
+    /// The packet could not be decoded as a valid protobuf `Envelope`.
     MalformedPacket,
+    /// The decoded `Envelope` contains the wrong message type for this phase.
     UnexpectedPacket,
+    /// An internal crypto operation failed (should not happen with valid inputs).
     InternalError,
 }
 
@@ -336,5 +342,81 @@ mod tests {
         let payload = env.encode_to_vec();
         let result = process_client_hello(&payload, HashMap::new(), |_| None);
         assert!(matches!(result, Err(HandshakeError::UnknownSession)));
+    }
+
+    #[test]
+    fn test_malformed_packet_rejected() {
+        let result = process_client_hello(b"\xFF\xFF\xFF garbage", HashMap::new(), |_| Some("pk".into()));
+        assert!(matches!(result, Err(HandshakeError::MalformedPacket)));
+    }
+
+    #[test]
+    fn test_empty_bytes_rejected() {
+        // An empty protobuf decodes to an Envelope with no payload → UnexpectedPacket.
+        let result = process_client_hello(&[], HashMap::new(), |_| Some("pk".into()));
+        assert!(matches!(result, Err(HandshakeError::UnexpectedPacket)));
+    }
+
+    #[test]
+    fn test_unexpected_packet_type_rejected() {
+        use crate::protocol::{Heartbeat, Payload};
+        // Send a Heartbeat where a ClientHello is expected.
+        let env = Envelope { payload: Some(Payload::Heartbeat(Heartbeat {})) };
+        let payload = env.encode_to_vec();
+        let result = process_client_hello(&payload, HashMap::new(), |_| Some("pk".into()));
+        assert!(matches!(result, Err(HandshakeError::UnexpectedPacket)));
+    }
+
+    #[test]
+    fn test_unsupported_suite_rejected() {
+        use crate::protocol::{ClientHello, Payload};
+        use prost::Message;
+        let hello = ClientHello {
+            protocol_version: crate::protocol::PROTOCOL_VERSION as u32,
+            session_id: vec![0u8; 16],
+            cipher_suites: vec![0xDEAD_BEEF],  // unknown suite
+            client_nonce: vec![0u8; 32],
+            kem_public_key: vec![0u8; 32],
+            last_received_seq: HashMap::new(),
+        };
+        let env = Envelope { payload: Some(Payload::ClientHello(hello)) };
+        let result = process_client_hello(&env.encode_to_vec(), HashMap::new(), |_| Some("pk".into()));
+        assert!(matches!(result, Err(HandshakeError::UnsupportedSuite)));
+    }
+
+    #[test]
+    fn test_reconnect_last_received_seq_roundtrips() {
+        let passkey = "passkey".to_string();
+        // Simulate client having received up to seq 5 on stream 0.
+        let client_last: HashMap<u32, u64> = [(0, 5)].into();
+        let (_hs, _hdr, env) = ClientHandshake::new(passkey.clone(), client_last.clone());
+
+        let outcome = process_client_hello(
+            &env.encode_to_vec(),
+            HashMap::new(),
+            |_| Some(passkey.clone()),
+        ).unwrap();
+
+        assert_eq!(outcome.client_last_received, client_last);
+    }
+
+    #[test]
+    fn test_server_last_received_seq_roundtrips() {
+        let passkey = "passkey".to_string();
+        let server_last: HashMap<u32, u64> = [(0, 10)].into();
+        let (_hs, _hdr, env) = ClientHandshake::new(passkey.clone(), HashMap::new());
+
+        let outcome = process_client_hello(
+            &env.encode_to_vec(),
+            server_last.clone(),
+            |_| Some(passkey.clone()),
+        ).unwrap();
+
+        // The server's last_received map must appear in ServerHello so the client
+        // can trim its send history — verify it survives the encode/decode cycle.
+        let (_, _suite, server_acks) = _hs
+            .process_server_hello(&outcome.response_payload_bytes)
+            .unwrap();
+        assert_eq!(server_acks, server_last);
     }
 }

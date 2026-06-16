@@ -28,6 +28,7 @@ pub struct SessionState {
 }
 
 impl SessionState {
+    /// Create a new session with stream 0 (terminal PTY) pre-opened.
     pub fn new(session_id: [u8; 16], passkey: String) -> Self {
         let mut state = Self {
             session_id,
@@ -48,14 +49,19 @@ impl SessionState {
             .or_insert_with(|| StreamState::new(stream_id, stream_type))
     }
 
+    /// Return an immutable reference to the stream with the given ID, or `None`.
     pub fn stream(&self, stream_id: u32) -> Option<&StreamState> {
         self.streams.get(&stream_id)
     }
 
+    /// Return a mutable reference to the stream with the given ID, or `None`.
     pub fn stream_mut(&mut self, stream_id: u32) -> Option<&mut StreamState> {
         self.streams.get_mut(&stream_id)
     }
 
+    /// Transition stream `stream_id` to [`StreamLifecycle::Closed`].
+    ///
+    /// No-op if the stream does not exist.
     pub fn close_stream(&mut self, stream_id: u32) {
         if let Some(s) = self.streams.get_mut(&stream_id) {
             s.lifecycle = StreamLifecycle::Closed;
@@ -161,5 +167,75 @@ mod tests {
         assert_eq!(s.next_packet_seq(), 1);
         assert_eq!(s.next_packet_seq(), 2);
         assert_eq!(s.next_packet_seq(), 3);
+    }
+
+    #[test]
+    fn test_close_stream_nonexistent_noop() {
+        let mut s = make_state();
+        s.close_stream(99); // must not panic
+        assert!(s.stream(99).is_none());
+    }
+
+    #[test]
+    fn test_apply_server_acks_unknown_stream_ignored() {
+        let mut s = make_state();
+        // Stream 5 does not exist; applying an ack for it must be a no-op.
+        let acks = [(5u32, 100u64)].into();
+        s.apply_server_acks(&acks); // must not panic
+        assert!(s.stream(5).is_none());
+    }
+
+    #[test]
+    fn test_last_received_map_nothing_received() {
+        // next_in_seq starts at 1; checked_sub(1) == Some(0), so stream 0 appears
+        // with value 0, which tells the peer to replay all history (seq > 0).
+        let s = make_state();
+        let map = s.last_received_map();
+        assert_eq!(map[&0], 0);
+    }
+
+    #[test]
+    fn test_last_received_map_after_receive() {
+        let mut s = make_state();
+        s.stream_mut(0).unwrap().next_in_seq = 4; // received up to seq 3
+        let map = s.last_received_map();
+        assert_eq!(map[&0], 3);
+    }
+
+    #[test]
+    fn test_collect_replays_empty_peer_map_returns_all() {
+        let mut s = make_state();
+        let st = s.stream_mut(0).unwrap();
+        st.record_send(1, b"x".to_vec());
+        st.record_send(2, b"y".to_vec());
+
+        // Peer has received nothing (empty map → last == 0 for every stream).
+        let replays = s.collect_replays(&HashMap::new());
+        let r = &replays[&0];
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].0, 1);
+        assert_eq!(r[1].0, 2);
+    }
+
+    #[test]
+    fn test_collect_replays_empty_history_omitted() {
+        let s = make_state(); // stream 0 exists but has no history
+        let replays = s.collect_replays(&HashMap::new());
+        assert!(replays.is_empty());
+    }
+
+    #[test]
+    fn test_stream_unknown_returns_none() {
+        let s = make_state();
+        assert!(s.stream(42).is_none());
+    }
+
+    #[test]
+    fn test_open_stream_idempotent() {
+        let mut s = make_state();
+        s.open_stream(2, StreamType::PortForward);
+        s.open_stream(2, StreamType::PortForward); // second call is a no-op
+        assert_eq!(s.streams.contains_key(&2), true);
+        assert_eq!(s.streams.iter().filter(|(id, _)| **id == 2).count(), 1);
     }
 }
