@@ -346,14 +346,12 @@ async fn run_session(
     // Task to write data to server socket
     let cipher_clone = Arc::clone(&cipher);
     let writer_task = tokio::spawn(async move {
+        let mut transport_out_seq = 1;
         while let Some(packet) = tcp_send_rx.recv().await {
-            let seq = match &packet {
-                Packet::TerminalData { seq_num, .. } => *seq_num,
-                _ => 0,
-            };
-            if let Err(_) = send_encrypted_writer(&mut writer, &cipher_clone, seq, &packet).await {
+            if let Err(_) = send_encrypted_writer(&mut writer, &cipher_clone, transport_out_seq, &packet).await {
                 break;
             }
+            transport_out_seq += 1;
         }
     });
 
@@ -402,22 +400,24 @@ async fn run_session(
 
         let mut stdout = io::stdout();
 
+        let mut transport_in_seq = 1;
         loop {
             let encrypted = match read_frame_reader(&mut reader).await {
                 Ok(bytes) => bytes,
                 Err(_) => break,
             };
 
-            let decrypted = match cipher.decrypt(expected_seq, &encrypted) {
+            let decrypted = match cipher.decrypt(transport_in_seq, &encrypted) {
                 Ok(bytes) => bytes,
                 Err(e) => {
                     eprintln!(
-                        "Decryption failed on client at seq={}: {:?}",
-                        expected_seq, e
+                        "Decryption failed on client at transport_seq={}: {:?}",
+                        transport_in_seq, e
                     );
                     break;
                 }
             };
+            transport_in_seq += 1;
 
             let packet: Packet = match bincode::deserialize(&decrypted) {
                 Ok(p) => p,

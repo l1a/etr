@@ -380,15 +380,13 @@ async fn handle_client_tcp(mut stream: TcpStream, sessions: SessionMap) -> io::R
     // Task to write data to client TCP socket
     let cipher_clone = Arc::clone(&cipher);
     let writer_task = tokio::spawn(async move {
+        let mut transport_out_seq = 1;
         while let Some(packet) = tcp_send_rx.recv().await {
-            let seq = match &packet {
-                Packet::TerminalData { seq_num, .. } => *seq_num,
-                _ => 0,
-            };
-            if let Err(e) = send_encrypted_writer(&mut writer, &cipher_clone, seq, &packet).await {
+            if let Err(e) = send_encrypted_writer(&mut writer, &cipher_clone, transport_out_seq, &packet).await {
                 eprintln!("TCP writer task error: {:?}", e);
                 break;
             }
+            transport_out_seq += 1;
         }
     });
 
@@ -402,6 +400,7 @@ async fn handle_client_tcp(mut stream: TcpStream, sessions: SessionMap) -> io::R
             guard.next_in_seq
         };
 
+        let mut transport_in_seq = 1;
         loop {
             // Read length-framed packet from socket
             let encrypted = match read_frame_reader(&mut reader).await {
@@ -409,16 +408,17 @@ async fn handle_client_tcp(mut stream: TcpStream, sessions: SessionMap) -> io::R
                 Err(_) => break, // Socket disconnected
             };
 
-            let decrypted = match cipher.decrypt(expected_seq, &encrypted) {
+            let decrypted = match cipher.decrypt(transport_in_seq, &encrypted) {
                 Ok(bytes) => bytes,
                 Err(e) => {
                     eprintln!(
-                        "TCP reader decryption failed at seq={}: {:?}",
-                        expected_seq, e
+                        "TCP reader decryption failed at transport_seq={}: {:?}",
+                        transport_in_seq, e
                     );
                     break;
                 }
             };
+            transport_in_seq += 1;
 
             let packet: Packet = match bincode::deserialize(&decrypted) {
                 Ok(p) => p,
