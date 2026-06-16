@@ -2,7 +2,7 @@ name: Continuous Integration
 
 on:
   push:
-    branches: [ main, chore/reserve-crates-io-name ]
+    branches: [ main, 'feature/**', 'fix/**', 'chore/**' ]
   pull_request:
     branches: [ main ]
 
