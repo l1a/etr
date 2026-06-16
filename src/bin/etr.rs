@@ -200,6 +200,25 @@ async fn run_connection_loop(
     };
     let addr = format!("{}:{}", host, port);
 
+    // Create a long-lived channel for stdin reading to avoid spawning multiple competing threads
+    let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>(1000);
+    let stdin_rx_shared = Arc::new(Mutex::new(stdin_rx));
+
+    // Spawn a single long-lived thread to read from std::io::stdin
+    let _global_stdin_task = tokio::task::spawn_blocking(move || {
+        use std::io::Read;
+        let mut stdin = std::io::stdin();
+        let mut buf = [0u8; 1024];
+        while let Ok(n) = stdin.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            if stdin_tx.blocking_send(buf[0..n].to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+
     let mut is_first_connect = true;
 
     loop {
@@ -229,7 +248,14 @@ async fn run_connection_loop(
         enable_raw_mode().unwrap();
 
         // Run session loops
-        let run_result = run_session(stream, cipher, &session_state, replays).await;
+        let run_result = run_session(
+            stream,
+            cipher,
+            &session_state,
+            replays,
+            Arc::clone(&stdin_rx_shared),
+        )
+        .await;
 
         // Restore terminal state
         let _ = disable_raw_mode();
@@ -336,6 +362,7 @@ async fn run_session(
     cipher: Arc<SessionCipher>,
     session_state: &Arc<Mutex<SessionState>>,
     replays: Vec<(u64, Vec<u8>)>,
+    stdin_rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
 ) -> io::Result<()> {
     let (tcp_send_tx, mut tcp_send_rx) = mpsc::channel::<Packet>(1000);
 
@@ -369,18 +396,18 @@ async fn run_session(
         }
     });
 
-    // Task to read data from local stdin and queue it to write using non-blocking async tokio::io::stdin
+    // Task to forward data from long-lived stdin channel to server
     let session_state_stdin = Arc::clone(session_state);
     let tcp_send_tx_stdin = tcp_send_tx.clone();
     let mut stdin_task = tokio::spawn(async move {
-        let mut stdin = tokio::io::stdin();
-        let mut buf = [0u8; 1024];
-
-        while let Ok(n) = stdin.read(&mut buf).await {
-            if n == 0 {
-                break;
-            }
-            let payload = buf[0..n].to_vec();
+        loop {
+            let payload = {
+                let mut rx_guard = stdin_rx.lock().await;
+                match rx_guard.recv().await {
+                    Some(p) => p,
+                    None => break,
+                }
+            };
 
             let mut state = session_state_stdin.lock().await;
             let seq = state.next_out_seq;
