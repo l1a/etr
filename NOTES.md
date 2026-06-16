@@ -209,7 +209,7 @@ cargo install --path . --no-default-features
 
 # Code quality gate (run before pushing)
 just check            # cargo fmt --check + cargo clippy -D warnings
-just test             # cargo test (91 tests as of this writing)
+just test             # cargo test (112 tests as of this writing)
 ```
 
 ---
@@ -297,7 +297,7 @@ and the server has no port-forwarding logic.
 | `crypto/kdf` | Determinism, output length, salt/IKM/info binding, SHA-256 vs SHA3-256 divergence |
 | `crypto/x25519` | Key exchange round-trip, distinct keypairs differ, invalid-length error |
 | `crypto/kyber` | ML-KEM-768/1024 round-trips, wrong ciphertext → implicit rejection |
-| `crypto/mod` | Full suite encrypt/decrypt, wrong passkey, hello cipher |
+| `crypto/mod` | Full suite encrypt/decrypt, wrong passkey, hello cipher, `short_name`/`from_name`/`all_short_names` |
 | `handshake` | Error variants, empty bytes, wrong message type, unknown suite, `last_received_seq` round-trip |
 | `transport` | Decode wrong key/mutation/seq, invalid protobuf, two UDP loopback end-to-end tests, truncated header |
 | `session/stream` | Acknowledge edge cases, replay from 0, initial seq values |
