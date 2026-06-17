@@ -296,10 +296,6 @@ last-sender reply routing.  Runs without a PTY session if no terminal is attache
 
 ## Known gaps / next steps
 
-- **`just test-local` reconnect test**: previously broken when `pgrep -x etr` failed
-  in non-interactive contexts.  Now uses `tmux display-message #{pane_pid}` to locate
-  the child process and falls back to `pgrep -f` matching the install path; gracefully
-  skips the reconnect sub-test if the PID cannot be found rather than failing.
 - **Benchmarking**: no performance benchmarks exist.  Key areas to measure: QUIC
   connection latency, PTY round-trip latency, throughput under reconnect, and
   port-forward throughput.  Consider `criterion` for micro-benchmarks.

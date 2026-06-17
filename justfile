@@ -110,9 +110,14 @@ check-tools:
 # freezes (no heartbeats sent/received).  After 17 s etrs times out; when
 # SIGCONT wakes etr, tokio immediately sees the elapsed 15-s heartbeat
 # deadline and reconnects.  No need to locate the etrs process at all.
+#
+# etr is launched as the tmux session command (not via send-keys) to avoid
+# the .zshrc startup race and so that #{pane_pid} == etr's PID directly.
 test-local: check-tools install
     #!/usr/bin/env bash
     set -euo pipefail
+
+    CLIENT_LOG="${XDG_STATE_HOME:-$HOME/.local/state}/etr/etr.log"
 
     cleanup() {
         echo ""
@@ -122,39 +127,55 @@ test-local: check-tools install
     }
     trap cleanup EXIT
 
-    mkdir -p "$(dirname "{{LOG_FILE}}")"
+    mkdir -p "$(dirname "$CLIENT_LOG")"
+    # Truncate the client log so session-ready detection isn't confused by
+    # a "[etr] Connected." line left over from a previous run.
+    > "$CLIENT_LOG"
 
-    # ── 1. Launch client in tmux ─────────────────────────────────────────────
+    # ── 1. Launch etr directly as the tmux session command ───────────────────
+    # Running etr as the session command (not via send-keys) avoids the .zshrc
+    # startup race and makes #{pane_pid} == etr's PID.
     echo "==> Launching etr client in tmux session '{{TMUX_SESS}}'..."
-    tmux new-session -d -s "{{TMUX_SESS}}" -x 200 -y 50
-    tmux send-keys -t "{{TMUX_SESS}}" "\"{{INSTALL}}/etr\" -v localhost" Enter
+    tmux new-session -d -s "{{TMUX_SESS}}" -x 200 -y 50 -- \
+        "{{INSTALL}}/etr" -v localhost
 
-    # Wait for the remote shell prompt to appear (indicates handshake is done).
-    # We look for a non-empty line whose last visible character is a common
-    # prompt terminator: $  %  #  >  ❯  ➜
-    echo "    waiting for remote shell prompt..."
+    # ── 2. Wait for "[etr] Connected." in the client log ─────────────────────
+    echo "    waiting for etr to connect..."
     READY=0
     for i in $(seq 1 30); do
         sleep 1
-        if tmux capture-pane -t "{{TMUX_SESS}}" -p 2>/dev/null \
-                | grep -qE '[❯➜$%#>][[:space:]]'; then
-            READY=1
-            break
-        fi
+        grep -q '\[etr\] Connected\.' "$CLIENT_LOG" 2>/dev/null && { READY=1; break; }
     done
     if [[ $READY -eq 0 ]]; then
-        echo "ERROR: remote shell prompt did not appear within 30 s" >&2
-        tmux capture-pane -t "{{TMUX_SESS}}" -p >&2
+        echo "ERROR: '[etr] Connected.' not seen in $CLIENT_LOG within 30 s" >&2
+        cat "$CLIENT_LOG" >&2
         exit 1
     fi
-    echo "    session ready."
 
-    # ── 2. Happy-path test ───────────────────────────────────────────────────
+    # Send a sentinel to the remote shell and wait for it to echo back,
+    # confirming the PTY stream is live end-to-end.
+    SENTINEL="ETR_TEST_READY_$$"
+    tmux send-keys -t "{{TMUX_SESS}}" "echo ${SENTINEL}" Enter
+    echo "    waiting for remote shell sentinel..."
+    READY=0
+    for i in $(seq 1 20); do
+        sleep 1
+        tmux capture-pane -t "{{TMUX_SESS}}" -p -S - 2>/dev/null \
+            | grep -q "${SENTINEL}" && { READY=1; break; }
+    done
+    if [[ $READY -eq 0 ]]; then
+        echo "ERROR: remote shell sentinel not seen within 20 s" >&2
+        tmux capture-pane -t "{{TMUX_SESS}}" -p -S - >&2
+        exit 1
+    fi
+    echo "    session up."
+
+    # ── 3. Happy-path test ───────────────────────────────────────────────────
     echo "==> Sending test commands..."
     tmux send-keys -t "{{TMUX_SESS}}" "echo HELLO_FROM_ETR && hostname && date" Enter
     sleep 2
 
-    OUTPUT=$(tmux capture-pane -t "{{TMUX_SESS}}" -p)
+    OUTPUT=$(tmux capture-pane -t "{{TMUX_SESS}}" -p -S -)
     if echo "$OUTPUT" | grep -q "HELLO_FROM_ETR"; then
         echo "    PASS: test command output received through etr session."
     else
@@ -164,26 +185,13 @@ test-local: check-tools install
         exit 1
     fi
 
-    # ── 3. Reconnect test ────────────────────────────────────────────────────
-    # SIGSTOP the etr client: its tokio runtime freezes, so no heartbeats are
-    # exchanged.  After 17 s (> the 15 s idle timeout), SIGCONT wakes it;
-    # tokio sees the elapsed deadline and reconnects to etrs.
-    #
-    # pgrep -x only matches the binary name, which can fail when invoked from
-    # a non-interactive shell.  Find etr as the direct child of the tmux pane's
-    # shell process instead.
-    PANE_PID=$(tmux display-message -t "{{TMUX_SESS}}" -p '#{pane_pid}' 2>/dev/null || echo "")
-    ETR_PID=""
-    for i in $(seq 1 5); do
-        ETR_PID=$(ps --ppid "${PANE_PID:-0}" -o pid= 2>/dev/null | head -1 | tr -d ' ')
-        [[ -n "$ETR_PID" ]] && break
-        # fallback: search by install path
-        ETR_PID=$(pgrep -f "{{INSTALL}}/etr" | head -1 || true)
-        [[ -n "$ETR_PID" ]] && break
-        sleep 1
-    done
-    if [[ -z "$ETR_PID" ]]; then
-        echo "SKIP: could not locate etr PID; skipping reconnect test" >&2
+    # ── 4. Reconnect test ────────────────────────────────────────────────────
+    # etr is the direct tmux session command, so #{pane_pid} == etr's PID.
+    # No need to search with pgrep.
+    ETR_PID=$(tmux display-message -t "{{TMUX_SESS}}" -p '#{pane_pid}' 2>/dev/null || true)
+    ETR_COMM=$(ps -o comm= -p "${ETR_PID:-0}" 2>/dev/null | tr -d ' ' || true)
+    if [[ "$ETR_COMM" != "etr" ]]; then
+        echo "SKIP: #{pane_pid}=${ETR_PID:-} is '${ETR_COMM}', not 'etr'; skipping reconnect test" >&2
     else
         echo "==> Reconnect test: suspending etr client (pid $ETR_PID) for 17 s..."
         kill -STOP "$ETR_PID"
@@ -196,7 +204,7 @@ test-local: check-tools install
         tmux send-keys -t "{{TMUX_SESS}}" "echo RECONNECT_OK && uptime" Enter
         sleep 2
 
-        OUTPUT2=$(tmux capture-pane -t "{{TMUX_SESS}}" -p)
+        OUTPUT2=$(tmux capture-pane -t "{{TMUX_SESS}}" -p -S -)
         if echo "$OUTPUT2" | grep -q "RECONNECT_OK"; then
             echo "    PASS: session resumed after reconnect."
         else
