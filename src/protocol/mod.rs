@@ -1,100 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Wire format for the etr UDP protocol.
+//! Wire protocol messages for the etr QUIC transport.
 //!
-//! Every UDP datagram starts with a fixed 26-byte unencrypted [`PacketHeader`]
-//! that the server uses for routing before decryption.  The remaining bytes are
-//! a protobuf-encoded [`Envelope`], either plaintext (handshake) or AEAD-
-//! encrypted with the session key (data).
-//!
-//! ## Packet header layout
-//! ```text
-//! ┌────────┬────────┬──────────────────┬──────────────────────┐
-//! │version │ flags  │   session_id     │      packet_seq      │
-//! │ 1 byte │ 1 byte │    16 bytes      │       8 bytes        │
-//! └────────┴────────┴──────────────────┴──────────────────────┘
-//!                                              26 bytes total
-//! ```
-//!
-//! ## Flag bits
-//! - `0x01` — HANDSHAKE: payload is plaintext (ClientHello) or hello-key-
-//!   encrypted (ServerHello); not encrypted with the session key.
-//!
-//! ## Versionability
-//! The `version` byte gates all parsing after the header.  A future protocol
-//! version can change the envelope schema, encryption, or header extension
-//! without breaking parsers that reject unknown versions gracefully.
+//! All messages are protobuf-encoded and transmitted on QUIC bidirectional
+//! streams opened by the client.  Each stream begins with a 1-byte tag
+//! (see [`crate::quic`]) that identifies the stream type, followed by
+//! length-prefixed [`Envelope`] messages on control streams, raw PTY chunks
+//! on the PTY stream, and optional framed data on forward streams.
 //!
 //! ## Stream multiplexing
-//! Multiple logical streams share one session.  Stream 0 is always the
-//! terminal PTY.  Streams 1+ are port-forward connections, each with an
-//! independent sequence-number space for ordered, reliable delivery.
-
-pub const PROTOCOL_VERSION: u8 = 1;
-pub const HEADER_SIZE: usize = 26;
-pub const FLAG_HANDSHAKE: u8 = 0x01;
-
-/// Fixed-layout unencrypted header prepended to every UDP datagram.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PacketHeader {
-    pub version: u8,
-    pub flags: u8,
-    /// Identifies the logical session; used for server-side routing.
-    pub session_id: [u8; 16],
-    /// Monotonically increasing per-session counter.  Used as the AEAD nonce.
-    pub packet_seq: u64,
-}
-
-impl PacketHeader {
-    pub fn new(flags: u8, session_id: [u8; 16], packet_seq: u64) -> Self {
-        Self {
-            version: PROTOCOL_VERSION,
-            flags,
-            session_id,
-            packet_seq,
-        }
-    }
-
-    pub fn is_handshake(&self) -> bool {
-        self.flags & FLAG_HANDSHAKE != 0
-    }
-
-    /// Serialize to exactly [`HEADER_SIZE`] bytes.
-    pub fn encode(&self) -> [u8; HEADER_SIZE] {
-        let mut buf = [0u8; HEADER_SIZE];
-        buf[0] = self.version;
-        buf[1] = self.flags;
-        buf[2..18].copy_from_slice(&self.session_id);
-        buf[18..26].copy_from_slice(&self.packet_seq.to_be_bytes());
-        buf
-    }
-
-    /// Parse from a raw datagram slice.  Returns `None` if the slice is too
-    /// short or the version is not supported.
-    pub fn decode(buf: &[u8]) -> Option<Self> {
-        if buf.len() < HEADER_SIZE {
-            return None;
-        }
-        let version = buf[0];
-        if version != PROTOCOL_VERSION {
-            return None;
-        }
-        let flags = buf[1];
-        let session_id: [u8; 16] = buf[2..18].try_into().ok()?;
-        let packet_seq = u64::from_be_bytes(buf[18..26].try_into().ok()?);
-        Some(Self {
-            version,
-            flags,
-            session_id,
-            packet_seq,
-        })
-    }
-}
-
-// ── Protobuf envelope ────────────────────────────────────────────────────────
-//
-// All messages use prost derive macros — no protoc or build.rs required.
-// Field tags are stable across versions; add new optional fields with higher
-// tag numbers and old peers will ignore them.
+//!
+//! | Tag  | Stream   | Client → Server                  | Server → Client               |
+//! |------|----------|----------------------------------|-------------------------------|
+//! | 0x01 | Control  | `SessionOpen`, then `Envelope`*  | `SessionAccept`, then `Envelope`* |
+//! | 0x02 | PTY      | stdin chunks `[seq][len][data]`  | PTY output chunks `[seq][len][data]` |
+//! | 0x03 | Forward  | `StreamOpen` header + raw bytes  | raw bytes                     |
+//!
+//! `Envelope`* = any combination of `Heartbeat`, `TerminalResize`, `Disconnect`.
 
 /// Stream type carried in [`StreamOpen`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
@@ -104,65 +25,60 @@ pub enum StreamType {
     PortForward = 1,
 }
 
-/// Sent by the client to initiate or resume a session.  Plaintext on the wire.
+/// Transport protocol for a port-forward stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+pub enum ForwardProto {
+    /// TCP forwarding: one QUIC stream per TCP connection.
+    Tcp = 0,
+    /// UDP forwarding: one shared QUIC stream per `-L` spec.
+    Udp = 1,
+}
+
+/// Sent by the client on the control stream to resume or open a session.
 #[derive(Clone, PartialEq, prost::Message)]
-pub struct ClientHello {
-    /// Must match [`PROTOCOL_VERSION`].
-    #[prost(uint32, tag = "1")]
-    pub protocol_version: u32,
+pub struct SessionOpen {
     /// 16-byte session ID generated by the client.
-    #[prost(bytes = "vec", tag = "2")]
+    #[prost(bytes = "vec", tag = "1")]
     pub session_id: Vec<u8>,
-    /// Cipher suites the client supports, in preference order.
-    #[prost(uint32, repeated, tag = "3")]
-    pub cipher_suites: Vec<u32>,
-    /// 32-byte client nonce for key derivation.
-    #[prost(bytes = "vec", tag = "4")]
-    pub client_nonce: Vec<u8>,
-    /// Ephemeral public key (X25519) or encapsulation key (ML-KEM) bytes.
-    #[prost(bytes = "vec", tag = "5")]
-    pub kem_public_key: Vec<u8>,
-    /// Highest terminal stream sequence number received in the previous
-    /// connection, per stream.  Empty on a brand-new session.
-    #[prost(map = "uint32, uint64", tag = "6")]
+    /// Shared secret bootstrapped via SSH stdin.
+    #[prost(string, tag = "2")]
+    pub passkey: String,
+    /// Highest PTY-output seq the client received from the server, per stream.
+    /// The server replays any history above this watermark.
+    #[prost(map = "uint32, uint64", tag = "3")]
     pub last_received_seq: std::collections::HashMap<u32, u64>,
 }
 
-/// Sent by the server in response to [`ClientHello`].  Encrypted with the
-/// hello key so only the holder of the passkey can read it.
+/// Sent by the server in reply to [`SessionOpen`] once the session is verified.
 #[derive(Clone, PartialEq, prost::Message)]
-pub struct ServerHello {
-    /// The cipher suite the server selected.
-    #[prost(uint32, tag = "1")]
-    pub chosen_suite: u32,
-    /// 32-byte server nonce for key derivation.
-    #[prost(bytes = "vec", tag = "2")]
-    pub server_nonce: Vec<u8>,
-    /// KEM ciphertext (server ephemeral PK for X25519; ML-KEM ciphertext for PQC).
-    #[prost(bytes = "vec", tag = "3")]
-    pub kem_ciphertext: Vec<u8>,
-    /// Highest stream sequence number received by the server, per stream.
-    /// Client uses this to trim its replay buffer.
-    #[prost(map = "uint32, uint64", tag = "4")]
+pub struct SessionAccept {
+    /// Highest stdin seq the server received from the client, per stream.
+    /// The client replays any history above this watermark.
+    #[prost(map = "uint32, uint64", tag = "1")]
     pub last_received_seq: std::collections::HashMap<u32, u64>,
 }
 
-/// Open a new logical stream within the session.
+/// Header sent by the client at the start of a forward (0x03) stream,
+/// describing the remote target to connect to.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct StreamOpen {
     #[prost(uint32, tag = "1")]
     pub stream_id: u32,
     #[prost(enumeration = "StreamType", tag = "2")]
     pub stream_type: i32,
-    /// For port-forward streams: the remote host to connect to on the server.
+    /// Remote host the server should connect to.
     #[prost(string, tag = "3")]
     pub remote_host: String,
-    /// For port-forward streams: the remote port.
+    /// Remote port.
     #[prost(uint32, tag = "4")]
     pub remote_port: u32,
+    /// TCP or UDP (default: TCP).
+    #[prost(enumeration = "ForwardProto", tag = "5")]
+    pub forward_proto: i32,
 }
 
-/// Close a stream cleanly or signal an error.
+/// Close a forward stream cleanly or signal an error.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct StreamClose {
     #[prost(uint32, tag = "1")]
@@ -172,28 +88,7 @@ pub struct StreamClose {
     pub error_code: u32,
 }
 
-/// Ordered data chunk belonging to one stream.
-#[derive(Clone, PartialEq, prost::Message)]
-pub struct StreamData {
-    #[prost(uint32, tag = "1")]
-    pub stream_id: u32,
-    /// Per-stream monotonically increasing sequence number.
-    #[prost(uint64, tag = "2")]
-    pub seq_num: u64,
-    #[prost(bytes = "vec", tag = "3")]
-    pub data: Vec<u8>,
-}
-
-/// Acknowledge all stream data up to and including `ack_seq`.
-#[derive(Clone, PartialEq, prost::Message)]
-pub struct StreamAck {
-    #[prost(uint32, tag = "1")]
-    pub stream_id: u32,
-    #[prost(uint64, tag = "2")]
-    pub ack_seq: u64,
-}
-
-/// Terminal window resize event (stream 0 only).
+/// Terminal window resize event sent on the control stream.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct TerminalResize {
     #[prost(uint32, tag = "1")]
@@ -202,41 +97,59 @@ pub struct TerminalResize {
     pub cols: u32,
 }
 
-/// Keepalive to prevent idle timeout on both sides.
+/// Keepalive message exchanged on the control stream to detect idle timeouts.
+///
+/// `last_received_seq` piggybacks the sender's receive watermark so the peer
+/// can continuously trim its send history without waiting for a reconnect.
 #[derive(Clone, PartialEq, prost::Message)]
-pub struct Heartbeat {}
+pub struct Heartbeat {
+    /// Highest seq received per stream (stream_id → seq).  Empty map = pure keepalive.
+    #[prost(map = "uint32, uint64", tag = "1")]
+    pub last_received_seq: std::collections::HashMap<u32, u64>,
+}
 
-/// Clean-disconnect signal; the receiver should not attempt to reconnect.
+/// Clean-disconnect signal on the control stream.
+/// The receiver should not attempt to reconnect.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct Disconnect {}
 
-/// Top-level protobuf envelope: exactly one payload per UDP datagram.
+/// Framing for one UDP datagram on a shared UDP forward (0x03) stream.
+/// The peer address is embedded so the far side can route replies correctly.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct UdpDatagram {
+    #[prost(string, tag = "1")]
+    pub peer_addr: String,
+    #[prost(uint32, tag = "2")]
+    pub peer_port: u32,
+    #[prost(bytes = "vec", tag = "3")]
+    pub data: Vec<u8>,
+}
+
+/// Top-level protobuf envelope for control-stream messages.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct Envelope {
-    #[prost(oneof = "Payload", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9")]
+    #[prost(oneof = "Payload", tags = "3, 4, 7, 8, 9, 10, 11, 12")]
     pub payload: Option<Payload>,
 }
 
 #[derive(Clone, PartialEq, prost::Oneof)]
 pub enum Payload {
-    #[prost(message, tag = "1")]
-    ClientHello(ClientHello),
-    #[prost(message, tag = "2")]
-    ServerHello(ServerHello),
     #[prost(message, tag = "3")]
     StreamOpen(StreamOpen),
     #[prost(message, tag = "4")]
     StreamClose(StreamClose),
-    #[prost(message, tag = "5")]
-    StreamData(StreamData),
-    #[prost(message, tag = "6")]
-    StreamAck(StreamAck),
     #[prost(message, tag = "7")]
     TerminalResize(TerminalResize),
     #[prost(message, tag = "8")]
     Heartbeat(Heartbeat),
     #[prost(message, tag = "9")]
     Disconnect(Disconnect),
+    #[prost(message, tag = "10")]
+    SessionOpen(SessionOpen),
+    #[prost(message, tag = "11")]
+    SessionAccept(SessionAccept),
+    #[prost(message, tag = "12")]
+    UdpDatagram(UdpDatagram),
 }
 
 #[cfg(test)]
@@ -245,54 +158,26 @@ mod tests {
     use prost::Message;
 
     #[test]
-    fn test_header_round_trip() {
-        let hdr = PacketHeader::new(FLAG_HANDSHAKE, [0xABu8; 16], 42);
-        let encoded = hdr.encode();
-        assert_eq!(encoded.len(), HEADER_SIZE);
-        let decoded = PacketHeader::decode(&encoded).unwrap();
-        assert_eq!(decoded, hdr);
-    }
-
-    #[test]
-    fn test_header_rejects_wrong_version() {
-        let mut bytes = PacketHeader::new(0, [0u8; 16], 1).encode();
-        bytes[0] = 99;
-        assert!(PacketHeader::decode(&bytes).is_none());
-    }
-
-    #[test]
-    fn test_header_rejects_short_buf() {
-        assert!(PacketHeader::decode(&[0u8; 10]).is_none());
-    }
-
-    #[test]
-    fn test_envelope_stream_data_round_trip() {
+    fn test_session_open_round_trip() {
         let env = Envelope {
-            payload: Some(Payload::StreamData(StreamData {
-                stream_id: 3,
-                seq_num: 99,
-                data: b"hello world".to_vec(),
+            payload: Some(Payload::SessionOpen(SessionOpen {
+                session_id: vec![1u8; 16],
+                passkey: "secret".to_string(),
+                last_received_seq: [(0u32, 7u64)].into(),
             })),
         };
-        let bytes = env.encode_to_vec();
-        let decoded = Envelope::decode(bytes.as_slice()).unwrap();
+        let decoded = Envelope::decode(env.encode_to_vec().as_slice()).unwrap();
         assert_eq!(decoded, env);
     }
 
     #[test]
-    fn test_envelope_client_hello_round_trip() {
+    fn test_session_accept_round_trip() {
         let env = Envelope {
-            payload: Some(Payload::ClientHello(ClientHello {
-                protocol_version: PROTOCOL_VERSION as u32,
-                session_id: vec![1u8; 16],
-                cipher_suites: vec![3, 4],
-                client_nonce: vec![0xAAu8; 32],
-                kem_public_key: vec![0xBBu8; 32],
-                last_received_seq: [(0, 7)].into(),
+            payload: Some(Payload::SessionAccept(SessionAccept {
+                last_received_seq: [(0u32, 3u64)].into(),
             })),
         };
-        let bytes = env.encode_to_vec();
-        let decoded = Envelope::decode(bytes.as_slice()).unwrap();
+        let decoded = Envelope::decode(env.encode_to_vec().as_slice()).unwrap();
         assert_eq!(decoded, env);
     }
 
@@ -304,6 +189,7 @@ mod tests {
                 stream_type: StreamType::PortForward as i32,
                 remote_host: "localhost".to_string(),
                 remote_port: 5432,
+                forward_proto: ForwardProto::Tcp as i32,
             })),
         };
         let close = Envelope {
@@ -320,5 +206,37 @@ mod tests {
             Envelope::decode(close.encode_to_vec().as_slice()).unwrap(),
             close
         );
+    }
+
+    #[test]
+    fn test_heartbeat_disconnect_round_trip() {
+        for payload in [
+            Payload::Heartbeat(Heartbeat {
+                last_received_seq: [(0u32, 42u64)].into(),
+            }),
+            Payload::Heartbeat(Heartbeat::default()),
+            Payload::Disconnect(Disconnect {}),
+        ] {
+            let env = Envelope {
+                payload: Some(payload),
+            };
+            assert_eq!(
+                Envelope::decode(env.encode_to_vec().as_slice()).unwrap(),
+                env
+            );
+        }
+    }
+
+    #[test]
+    fn test_udp_datagram_round_trip() {
+        let env = Envelope {
+            payload: Some(Payload::UdpDatagram(UdpDatagram {
+                peer_addr: "127.0.0.1".to_string(),
+                peer_port: 12345,
+                data: b"dns query".to_vec(),
+            })),
+        };
+        let decoded = Envelope::decode(env.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(decoded, env);
     }
 }

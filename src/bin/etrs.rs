@@ -2,10 +2,16 @@
 use clap::{ArgAction, Parser};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::{self, Read, Write};
+use std::os::unix::io::{FromRawFd, IntoRawFd};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, mpsc};
+
+use etr::protocol::{
+    Disconnect, Envelope, ForwardProto, Payload, SessionAccept, StreamOpen, UdpDatagram,
+};
+use etr::quic::{self, TAG_CONTROL, TAG_FORWARD, TAG_PTY};
+use etr::session::SessionState;
 
 static VERBOSITY: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
 
@@ -19,27 +25,6 @@ macro_rules! vlog {
     };
 }
 
-fn payload_type(p: Option<&etr::protocol::Payload>) -> &'static str {
-    use etr::protocol::Payload;
-    match p {
-        Some(Payload::ClientHello(_)) => "ClientHello",
-        Some(Payload::ServerHello(_)) => "ServerHello",
-        Some(Payload::StreamOpen(_)) => "StreamOpen",
-        Some(Payload::StreamClose(_)) => "StreamClose",
-        Some(Payload::StreamData(_)) => "StreamData",
-        Some(Payload::StreamAck(_)) => "StreamAck",
-        Some(Payload::TerminalResize(_)) => "TerminalResize",
-        Some(Payload::Heartbeat(_)) => "Heartbeat",
-        Some(Payload::Disconnect(_)) => "Disconnect",
-        None => "Empty",
-    }
-}
-
-use etr::handshake::process_client_hello;
-use etr::protocol::{Disconnect, Envelope, Heartbeat, PacketHeader, Payload, StreamData};
-use etr::session::SessionState;
-use etr::transport::{ReceivedPacket, decode_data_packet, recv_packet, send_packet};
-
 #[derive(Parser)]
 #[command(
     name = "etrs",
@@ -47,7 +32,7 @@ use etr::transport::{ReceivedPacket, decode_data_packet, recv_packet, send_packe
     about = "Eternal Terminal Server — started per-session by etr via SSH"
 )]
 struct Cli {
-    /// UDP port to bind (0 = random)
+    /// QUIC port to bind (0 = random)
     #[arg(short, long, default_value = "0")]
     port: u16,
 
@@ -55,7 +40,7 @@ struct Cli {
     #[arg(short, long, default_value = "[::]")]
     bind: String,
 
-    /// Verbosity: -v session events, -vv cipher details, -vvv packet trace
+    /// Verbosity: -v session events, -vv QUIC details, -vvv stream trace
     #[arg(short = 'v', action = ArgAction::Count)]
     verbose: u8,
 }
@@ -81,34 +66,67 @@ fn main() -> io::Result<()> {
     let passkey = parts[1].to_string();
     let term = parts[2].to_string();
 
-    // Bind UDP socket synchronously so we know the actual port before fork.
-    let bind_str = format!("{}:{}", cli.bind, cli.port);
-    let std_socket = std::net::UdpSocket::bind(&bind_str)?;
-    std_socket.set_nonblocking(true)?;
-    let actual_port = std_socket.local_addr()?.port();
+    // Generate ephemeral self-signed QUIC certificate.
+    let (cert, key) = quic::generate_self_signed_cert();
+    let cert_hex = hex_encode(cert.as_ref());
 
-    // Tell the client which port we bound so it can connect.
-    println!("PORT {actual_port}");
-    io::stdout().flush()?;
+    // quinn::Endpoint requires a tokio runtime, so we can't create it before
+    // forking.  Instead, open a pipe: the child creates the endpoint (getting
+    // an OS-assigned port), writes the port back to the parent, then the parent
+    // prints "PORT <n> CERT <hex>" to SSH stdout and exits.
+    let (owned_r, owned_w) = nix::unistd::pipe().map_err(|e| io::Error::other(e.to_string()))?;
+    // Convert to raw fds so they can be used after the fork without ownership tracking.
+    let pipe_r: i32 = owned_r.into_raw_fd();
+    let pipe_w: i32 = owned_w.into_raw_fd();
 
-    // Fork: parent exits (SSH session closes cleanly); child runs the session.
+    // Fork: parent waits for port from child; child runs the tokio session.
     use nix::unistd::{ForkResult, fork, setsid};
     match unsafe { fork() }.map_err(|e| io::Error::other(e.to_string()))? {
-        ForkResult::Parent { .. } => return Ok(()),
+        ForkResult::Parent { .. } => {
+            // Close write end; read the 2-byte port the child sends.
+            nix::unistd::close(pipe_w).ok();
+            let mut port_bytes = [0u8; 2];
+            let mut reader = unsafe { std::fs::File::from_raw_fd(pipe_r) };
+            reader.read_exact(&mut port_bytes)?;
+            let actual_port = u16::from_be_bytes(port_bytes);
+            println!("PORT {actual_port} CERT {cert_hex}");
+            io::stdout().flush()?;
+            return Ok(());
+        }
         ForkResult::Child => {
+            // Close read end; we'll write the port after binding.
+            nix::unistd::close(pipe_r).ok();
             setsid().ok();
-            detach_stdio()?;
         }
     }
 
-    // Child: build the Tokio runtime and run.
+    // Child: build the Tokio runtime, create the quinn endpoint, send port to
+    // parent, then detach stdio and run the session.
+    let bind_str = format!("{}:{}", cli.bind, cli.port);
+    let bind_addr: std::net::SocketAddr = bind_str
+        .parse()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e}")))?;
+
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(run_session(std_socket, session_id, passkey, term))
+        .block_on(async move {
+            let server_cfg = quic::server_config(cert, key).map_err(io::Error::other)?;
+            let endpoint =
+                quinn::Endpoint::server(server_cfg, bind_addr).map_err(io::Error::other)?;
+            let actual_port = endpoint.local_addr()?.port();
+
+            // Send port to parent (2 bytes big-endian), then close the pipe.
+            let port_bytes = actual_port.to_be_bytes();
+            let mut writer = unsafe { std::fs::File::from_raw_fd(pipe_w) };
+            writer.write_all(&port_bytes)?;
+            drop(writer); // closes pipe_w
+
+            detach_stdio()?;
+            run_session(endpoint, session_id, passkey, term).await
+        })
 }
 
-/// Redirect stdin/stdout to /dev/null and stderr to the session log file.
 fn detach_stdio() -> io::Result<()> {
     use nix::unistd::dup2;
     use std::os::unix::io::IntoRawFd;
@@ -149,23 +167,22 @@ fn session_log_path() -> std::path::PathBuf {
         .join("etrs.log")
 }
 
-/// Run one reconnect-aware session until the client cleanly disconnects
-/// or the 30-minute reconnect window expires.
+/// Run the session reconnect loop until the client cleanly disconnects or
+/// the 30-minute reconnect window expires.
 async fn run_session(
-    std_socket: std::net::UdpSocket,
+    endpoint: quinn::Endpoint,
     session_id: [u8; 16],
     passkey: String,
     term: String,
 ) -> io::Result<()> {
-    let socket = Arc::new(UdpSocket::from_std(std_socket)?);
     vlog!(
         1,
         "[etrs] session {} port={}",
         hex_encode(&session_id),
-        socket.local_addr()?.port()
+        endpoint.local_addr()?.port()
     );
 
-    // --- PTY setup ---
+    // ── PTY setup ────────────────────────────────────────────────────────────
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -181,11 +198,11 @@ async fn run_session(
     cmd.env("TERM", &term);
     let mut child = pair.slave.spawn_command(cmd).map_err(io::Error::other)?;
 
-    // These must be called before pair.master is moved into the Arc<Mutex<>>.
     let mut pty_reader = pair.master.try_clone_reader().map_err(io::Error::other)?;
     let mut pty_writer = pair.master.take_writer().map_err(io::Error::other)?;
     let master = Arc::new(Mutex::new(pair.master));
 
+    // Channel: receive stdin keystrokes from client → write to PTY.
     let (pty_in_tx, mut pty_in_rx) = mpsc::channel::<Vec<u8>>(1000);
     tokio::task::spawn_blocking(move || {
         while let Some(data) = pty_in_rx.blocking_recv() {
@@ -198,13 +215,15 @@ async fn run_session(
 
     let session_state = Arc::new(Mutex::new(SessionState::new(session_id, passkey.clone())));
 
-    // Pointer to the outbound channel for the current connection (None when disconnected).
-    let outbound_tx: Arc<std::sync::Mutex<Option<mpsc::Sender<Envelope>>>> =
-        Arc::new(std::sync::Mutex::new(None));
+    // outbound_pty_tx: current connection's PTY data channel (None = disconnected).
+    let outbound_pty_tx: PtyTx = Arc::new(std::sync::Mutex::new(None));
 
-    // PTY reader: forwards PTY output into the session state and the outbound channel.
+    // outbound_ctrl_tx: current connection's control envelope channel.
+    let outbound_ctrl_tx: CtrlTx = Arc::new(std::sync::Mutex::new(None));
+
+    // PTY reader: forwards PTY output into the session and the active connection.
     {
-        let outbound_tx = Arc::clone(&outbound_tx);
+        let outbound_pty_tx = Arc::clone(&outbound_pty_tx);
         let session_state = Arc::clone(&session_state);
         tokio::task::spawn_blocking(move || {
             let mut buf = [0u8; 4096];
@@ -214,22 +233,15 @@ async fn run_session(
                     Ok(n) => {
                         let data = buf[..n].to_vec();
                         let seq = {
-                            let mut s = futures::executor::block_on(session_state.lock());
+                            let mut s = session_state.blocking_lock();
                             let st = s.stream_mut(0).expect("stream 0 always exists");
                             let seq = st.next_out_seq;
                             st.next_out_seq += 1;
                             st.record_send(seq, data.clone());
                             seq
                         };
-                        let tx = outbound_tx.lock().unwrap().clone();
-                        if let Some(tx) = tx {
-                            let _ = tx.blocking_send(Envelope {
-                                payload: Some(Payload::StreamData(StreamData {
-                                    stream_id: 0,
-                                    seq_num: seq,
-                                    data,
-                                })),
-                            });
+                        if let Some(tx) = outbound_pty_tx.lock().unwrap().clone() {
+                            let _ = tx.blocking_send((seq, data));
                         }
                     }
                 }
@@ -237,9 +249,12 @@ async fn run_session(
         });
     }
 
-    // Shell-exit watcher: sends Disconnect to the client when the shell exits.
+    // Shell-exit signal: set to true when the child shell exits.
+    let (shell_exit_tx, shell_exit_rx) = tokio::sync::watch::channel(false);
+
+    // Shell-exit watcher: sends Disconnect on the control stream when the shell exits.
     {
-        let outbound_tx = Arc::clone(&outbound_tx);
+        let outbound_ctrl_tx = Arc::clone(&outbound_ctrl_tx);
         let session_id_copy = session_id;
         tokio::task::spawn_blocking(move || {
             let _ = child.wait();
@@ -248,241 +263,72 @@ async fn run_session(
                 "[etrs] shell exited for {}",
                 hex_encode(&session_id_copy)
             );
-            if let Some(tx) = outbound_tx.lock().unwrap().clone() {
+            if let Some(tx) = outbound_ctrl_tx.lock().unwrap().clone() {
                 let _ = tx.blocking_send(Envelope {
                     payload: Some(Payload::Disconnect(Disconnect {})),
                 });
             }
+            let _ = shell_exit_tx.send(true);
         });
     }
 
-    // Pointer to the inbound channel for the current connection.
-    let inbound_tx: Arc<std::sync::Mutex<Option<mpsc::Sender<ReceivedPacket>>>> =
-        Arc::new(std::sync::Mutex::new(None));
-
-    // Channel on which the routing task delivers ClientHello packets.
-    let (hello_tx, mut hello_rx) = mpsc::channel::<ReceivedPacket>(4);
-
-    // Routing task: reads the UDP socket and routes handshake vs. data packets.
-    {
-        let inbound_tx = Arc::clone(&inbound_tx);
-        let socket = Arc::clone(&socket);
-        tokio::spawn(async move {
-            loop {
-                let pkt = match recv_packet(&socket).await {
-                    Ok(Some(p)) => p,
-                    Ok(None) => continue,
-                    Err(_) => break,
-                };
-                if pkt.header.session_id != session_id {
-                    continue;
-                }
-                if pkt.header.is_handshake() {
-                    let _ = hello_tx.send(pkt).await;
-                } else {
-                    let tx = inbound_tx.lock().unwrap().clone();
-                    if let Some(tx) = tx {
-                        let _ = tx.try_send(pkt);
-                    }
-                }
-            }
-        });
-    }
-
-    // --- Reconnect loop ---
+    // ── Reconnect loop ───────────────────────────────────────────────────────
     const RECONNECT_WINDOW: Duration = Duration::from_secs(30 * 60);
 
     loop {
-        let hello_pkt = match tokio::time::timeout(RECONNECT_WINDOW, hello_rx.recv()).await {
-            Ok(Some(p)) => p,
-            _ => {
-                vlog!(1, "[etrs] reconnect window expired, shutting down");
+        let mut shell_rx = shell_exit_rx.clone();
+        let incoming = tokio::select! {
+            biased;
+            _ = shell_rx.wait_for(|&v| v) => {
+                vlog!(1, "[etrs] shell exited, shutting down");
                 break;
+            }
+            res = tokio::time::timeout(RECONNECT_WINDOW, endpoint.accept()) => {
+                match res {
+                    Ok(Some(inc)) => inc,
+                    Ok(None) => {
+                        vlog!(1, "[etrs] endpoint closed");
+                        break;
+                    }
+                    Err(_) => {
+                        vlog!(1, "[etrs] reconnect window expired, shutting down");
+                        break;
+                    }
+                }
             }
         };
 
-        let peer = hello_pkt.peer;
-        vlog!(
-            1,
-            "[etrs] ClientHello from {} session={}",
-            peer,
-            hex_encode(&session_id)
-        );
-
-        let server_last = session_state.lock().await.last_received_map();
-        let outcome = match process_client_hello(&hello_pkt.payload_bytes, server_last, |_| {
-            Some(passkey.clone())
-        }) {
-            Ok(o) => o,
+        let conn = match incoming.accept() {
+            Ok(c) => c,
             Err(e) => {
-                vlog!(1, "[etrs] handshake failed from {}: {}", peer, e);
+                vlog!(1, "[etrs] accept error: {e}");
+                continue;
+            }
+        };
+        let conn = match conn.await {
+            Ok(c) => c,
+            Err(e) => {
+                vlog!(1, "[etrs] QUIC handshake error: {e}");
                 continue;
             }
         };
 
-        vlog!(
-            2,
-            "[etrs] handshake complete suite={} peer={}",
-            outcome.chosen_suite,
-            peer
-        );
+        let clean = handle_connection(
+            conn,
+            session_id,
+            &passkey,
+            Arc::clone(&session_state),
+            Arc::clone(&outbound_pty_tx),
+            Arc::clone(&outbound_ctrl_tx),
+            pty_in_tx.clone(),
+            Arc::clone(&master),
+        )
+        .await;
 
-        let replays = {
-            let mut s = session_state.lock().await;
-            s.apply_server_acks(&outcome.client_last_received);
-            s.collect_replays(&outcome.client_last_received)
-        };
+        *outbound_pty_tx.lock().unwrap() = None;
+        *outbound_ctrl_tx.lock().unwrap() = None;
 
-        // Send ServerHello.
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&outcome.response_header.encode());
-        buf.extend_from_slice(&outcome.response_payload_bytes);
-        socket.send_to(&buf, peer).await?;
-
-        let cipher = Arc::new(outcome.cipher);
-
-        // Create per-connection channels.
-        let (ob_tx, mut ob_rx) = mpsc::channel::<Envelope>(1000);
-        *outbound_tx.lock().unwrap() = Some(ob_tx.clone());
-
-        let (ib_tx, mut ib_rx) = mpsc::channel::<ReceivedPacket>(256);
-        *inbound_tx.lock().unwrap() = Some(ib_tx);
-
-        // Queue replays ahead of live data.
-        for (stream_id, packets) in replays {
-            for (seq, data) in packets {
-                let _ = ob_tx.try_send(Envelope {
-                    payload: Some(Payload::StreamData(StreamData {
-                        stream_id,
-                        seq_num: seq,
-                        data,
-                    })),
-                });
-            }
-        }
-
-        // Writer task.
-        let socket_w = Arc::clone(&socket);
-        let cipher_w = Arc::clone(&cipher);
-        let session_w = Arc::clone(&session_state);
-        let mut writer = tokio::spawn(async move {
-            use prost::Message as _;
-            while let Some(env) = ob_rx.recv().await {
-                let seq = {
-                    let mut s = session_w.lock().await;
-                    s.next_packet_seq()
-                };
-                vlog!(
-                    3,
-                    "[etrs] → {} seq={} {}b peer={}",
-                    payload_type(env.payload.as_ref()),
-                    seq,
-                    env.encoded_len(),
-                    peer
-                );
-                let header = PacketHeader::new(0, session_id, seq);
-                let _ = send_packet(&socket_w, peer, &header, &env, Some(&cipher_w)).await;
-            }
-        });
-
-        // Reader task — returns true on clean Disconnect, false on timeout/replacement.
-        let cipher_r = Arc::clone(&cipher);
-        let session_r = Arc::clone(&session_state);
-        let pty_tx = pty_in_tx.clone();
-        let master_r = Arc::clone(&master);
-        let mut reader = tokio::spawn(async move {
-            loop {
-                match tokio::time::timeout(Duration::from_secs(15), ib_rx.recv()).await {
-                    Ok(Some(pkt)) => {
-                        if pkt.header.is_handshake() {
-                            return false;
-                        }
-                        let env = match decode_data_packet(
-                            &pkt.payload_bytes,
-                            pkt.header.packet_seq,
-                            &cipher_r,
-                        ) {
-                            Ok(e) => e,
-                            Err(_) => continue,
-                        };
-                        vlog!(
-                            3,
-                            "[etrs] ← {} seq={} {}b peer={}",
-                            payload_type(env.payload.as_ref()),
-                            pkt.header.packet_seq,
-                            pkt.payload_bytes.len(),
-                            peer
-                        );
-                        match env.payload {
-                            Some(Payload::StreamData(sd)) if sd.stream_id == 0 => {
-                                let expected = {
-                                    let s = session_r.lock().await;
-                                    s.stream(0).map(|st| st.next_in_seq).unwrap_or(1)
-                                };
-                                if sd.seq_num == expected {
-                                    let _ = pty_tx.send(sd.data).await;
-                                    let mut s = session_r.lock().await;
-                                    if let Some(st) = s.stream_mut(0) {
-                                        st.next_in_seq += 1;
-                                    }
-                                }
-                            }
-                            Some(Payload::TerminalResize(tr)) => {
-                                let m = master_r.lock().await;
-                                let _ = m.resize(PtySize {
-                                    rows: tr.rows as u16,
-                                    cols: tr.cols as u16,
-                                    pixel_width: 0,
-                                    pixel_height: 0,
-                                });
-                            }
-                            Some(Payload::Disconnect(_)) => return true,
-                            Some(Payload::Heartbeat(_)) => {}
-                            _ => {}
-                        }
-                    }
-                    Ok(None) => return false,
-                    Err(_) => {
-                        vlog!(
-                            1,
-                            "[etrs] client {} heartbeat timeout, awaiting reconnect",
-                            peer
-                        );
-                        return false;
-                    }
-                }
-            }
-        });
-
-        // Heartbeat task.
-        let ob_hb = ob_tx.clone();
-        let mut hb = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                if ob_hb
-                    .send(Envelope {
-                        payload: Some(Payload::Heartbeat(Heartbeat {})),
-                    })
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
-
-        let clean_disconnect = tokio::select! {
-            r = &mut reader => r.unwrap_or(false),
-            _ = &mut writer => false,
-            _ = &mut hb    => false,
-        };
-        writer.abort();
-        reader.abort();
-        hb.abort();
-        *outbound_tx.lock().unwrap() = None;
-        *inbound_tx.lock().unwrap() = None;
-
-        if clean_disconnect {
+        if clean {
             vlog!(1, "[etrs] client disconnected cleanly, shutting down");
             break;
         }
@@ -490,6 +336,423 @@ async fn run_session(
 
     Ok(())
 }
+
+type PtyTx = Arc<std::sync::Mutex<Option<mpsc::Sender<(u64, Vec<u8>)>>>>;
+type CtrlTx = Arc<std::sync::Mutex<Option<mpsc::Sender<Envelope>>>>;
+
+/// Handle one QUIC connection.  Returns `true` on clean Disconnect.
+#[allow(clippy::too_many_arguments)]
+async fn handle_connection(
+    conn: quinn::Connection,
+    session_id: [u8; 16],
+    passkey: &str,
+    session_state: Arc<Mutex<SessionState>>,
+    outbound_pty_tx: PtyTx,
+    outbound_ctrl_tx: CtrlTx,
+    pty_in_tx: mpsc::Sender<Vec<u8>>,
+    master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
+) -> bool {
+    let peer = conn.remote_address();
+    vlog!(
+        1,
+        "[etrs] connection from {} session={}",
+        peer,
+        hex_encode(&session_id)
+    );
+
+    // ── Control stream: first stream the client opens ─────────────────────
+    let (mut ctrl_send, mut ctrl_recv) = match conn.accept_bi().await {
+        Ok(s) => s,
+        Err(e) => {
+            vlog!(1, "[etrs] accept_bi error: {e}");
+            return false;
+        }
+    };
+
+    let tag = match quic::read_tag(&mut ctrl_recv).await {
+        Ok(t) => t,
+        Err(e) => {
+            vlog!(1, "[etrs] read tag error: {e}");
+            return false;
+        }
+    };
+    if tag != TAG_CONTROL {
+        vlog!(1, "[etrs] expected control tag, got 0x{tag:02x}");
+        return false;
+    }
+
+    let session_open = match quic::read_msg(&mut ctrl_recv).await {
+        Ok(Some(env)) => match env.payload {
+            Some(Payload::SessionOpen(so)) => so,
+            _ => {
+                vlog!(1, "[etrs] expected SessionOpen");
+                return false;
+            }
+        },
+        _ => {
+            vlog!(1, "[etrs] failed to read SessionOpen");
+            return false;
+        }
+    };
+
+    // Verify session identity and passkey.
+    if session_open.session_id != session_id {
+        vlog!(1, "[etrs] session_id mismatch from {peer}");
+        return false;
+    }
+    if session_open.passkey != passkey {
+        vlog!(1, "[etrs] passkey mismatch from {peer}");
+        return false;
+    }
+
+    vlog!(2, "[etrs] session verified peer={peer}");
+    vlog!(2, "[etrs] {}", etr::quic::tls_info());
+
+    // Collect replays and build SessionAccept.
+    let (replays, server_last) = {
+        let mut s = session_state.lock().await;
+        s.apply_server_acks(&session_open.last_received_seq);
+        let replays = s.collect_replays(&session_open.last_received_seq);
+        let server_last = s.last_received_map();
+        (replays, server_last)
+    };
+
+    let session_accept = Envelope {
+        payload: Some(Payload::SessionAccept(SessionAccept {
+            last_received_seq: server_last,
+        })),
+    };
+    if quic::write_msg(&mut ctrl_send, &session_accept)
+        .await
+        .is_err()
+    {
+        return false;
+    }
+
+    // ── Per-connection channels ───────────────────────────────────────────
+    let (pty_ob_tx, mut pty_ob_rx) = mpsc::channel::<(u64, Vec<u8>)>(1000);
+    *outbound_pty_tx.lock().unwrap() = Some(pty_ob_tx.clone());
+
+    let (ctrl_ob_tx, mut ctrl_ob_rx) = mpsc::channel::<Envelope>(64);
+    *outbound_ctrl_tx.lock().unwrap() = Some(ctrl_ob_tx.clone());
+
+    // Queue replay data ahead of live PTY output.
+    if let Some(stream0_replays) = replays.get(&0) {
+        for (seq, data) in stream0_replays {
+            let _ = pty_ob_tx.try_send((*seq, data.clone()));
+        }
+    }
+
+    // ── Wait for the PTY stream (second stream the client opens) ──────────
+    // Meanwhile, accept incoming streams and dispatch them in a separate task.
+    let (pty_stream_tx, pty_stream_rx) =
+        tokio::sync::oneshot::channel::<(quinn::SendStream, quinn::RecvStream)>();
+
+    let conn_dispatch = conn.clone();
+    let session_state_fwd = Arc::clone(&session_state);
+    let mut dispatch_task = tokio::spawn(async move {
+        let mut pty_tx = Some(pty_stream_tx);
+        loop {
+            let (fwd_send, mut fwd_recv) = match conn_dispatch.accept_bi().await {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            let tag = match quic::read_tag(&mut fwd_recv).await {
+                Ok(t) => t,
+                Err(_) => break,
+            };
+            match tag {
+                TAG_PTY => {
+                    if let Some(tx) = pty_tx.take() {
+                        let _ = tx.send((fwd_send, fwd_recv));
+                    }
+                }
+                TAG_FORWARD => {
+                    let so = match quic::read_msg(&mut fwd_recv).await {
+                        Ok(Some(env)) => match env.payload {
+                            Some(Payload::StreamOpen(so)) => so,
+                            _ => continue,
+                        },
+                        _ => break,
+                    };
+                    let proto =
+                        ForwardProto::try_from(so.forward_proto).unwrap_or(ForwardProto::Tcp);
+                    let ss = Arc::clone(&session_state_fwd);
+                    match proto {
+                        ForwardProto::Tcp => {
+                            tokio::spawn(serve_tcp_forward(so, fwd_send, fwd_recv, ss));
+                        }
+                        ForwardProto::Udp => {
+                            tokio::spawn(serve_udp_forward(so, fwd_send, fwd_recv, ss));
+                        }
+                    }
+                }
+                _ => {
+                    vlog!(1, "[etrs] unknown stream tag 0x{tag:02x}, ignoring");
+                }
+            }
+        }
+    });
+
+    let (mut pty_send, mut pty_recv) = match pty_stream_rx.await {
+        Ok(s) => s,
+        Err(_) => {
+            dispatch_task.abort();
+            return false;
+        }
+    };
+
+    // ── PTY output writer: ob_rx → QUIC PTY send stream ──────────────────
+    let mut pty_writer_task = tokio::spawn(async move {
+        while let Some((seq, data)) = pty_ob_rx.recv().await {
+            vlog!(3, "[etrs] pty→client seq={seq} bytes={}", data.len());
+            if quic::write_pty_chunk(&mut pty_send, seq, &data)
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    // ── PTY input reader: QUIC PTY recv stream → pty_in_tx ───────────────
+    let session_r = Arc::clone(&session_state);
+    let pty_in_tx2 = pty_in_tx.clone();
+    let mut pty_reader_task = tokio::spawn(async move {
+        while let Ok(Some((seq, data))) = quic::read_pty_chunk(&mut pty_recv).await {
+            vlog!(3, "[etrs] pty←client seq={seq} bytes={}", data.len());
+            {
+                let mut s = session_r.lock().await;
+                if let Some(st) = s.stream_mut(0) {
+                    st.next_in_seq = seq + 1;
+                }
+            }
+            let _ = pty_in_tx2.send(data).await;
+        }
+    });
+
+    // ── Control writer: ctrl_ob_rx → QUIC ctrl send stream ───────────────
+    let mut ctrl_writer_task = tokio::spawn(async move {
+        while let Some(env) = ctrl_ob_rx.recv().await {
+            let is_disconnect = matches!(env.payload, Some(Payload::Disconnect(_)));
+            if let Some(Payload::Heartbeat(ref hb)) = env.payload {
+                vlog!(3, "[etrs] hb→client acks={:?}", hb.last_received_seq);
+            }
+            let _ = quic::write_msg(&mut ctrl_send, &env).await;
+            if is_disconnect {
+                break;
+            }
+        }
+    });
+
+    // ── Control reader: QUIC ctrl recv stream → dispatch ─────────────────
+    let master_r = Arc::clone(&master);
+    let session_ctrl = Arc::clone(&session_state);
+    let mut ctrl_reader_task = tokio::spawn(async move {
+        loop {
+            match quic::read_msg(&mut ctrl_recv).await {
+                Ok(Some(env)) => match env.payload {
+                    Some(Payload::TerminalResize(tr)) => {
+                        let m = master_r.lock().await;
+                        let _ = m.resize(PtySize {
+                            rows: tr.rows as u16,
+                            cols: tr.cols as u16,
+                            pixel_width: 0,
+                            pixel_height: 0,
+                        });
+                        vlog!(3, "[etrs] resize {}x{}", tr.cols, tr.rows);
+                    }
+                    Some(Payload::Disconnect(_)) => return true,
+                    Some(Payload::Heartbeat(hb)) => {
+                        session_ctrl
+                            .lock()
+                            .await
+                            .apply_server_acks(&hb.last_received_seq);
+                        vlog!(3, "[etrs] hb←client acks={:?}", hb.last_received_seq);
+                    }
+                    _ => {}
+                },
+                _ => return false,
+            }
+        }
+    });
+
+    // ── Heartbeat task ────────────────────────────────────────────────────
+    let hb_ctrl_tx = ctrl_ob_tx.clone();
+    let session_hb = Arc::clone(&session_state);
+    let mut hb_task = tokio::spawn(async move {
+        use etr::protocol::Heartbeat;
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let last_received_seq = session_hb.lock().await.last_received_map();
+            if hb_ctrl_tx
+                .send(Envelope {
+                    payload: Some(Payload::Heartbeat(Heartbeat { last_received_seq })),
+                })
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    // ── Wait for any task to finish ───────────────────────────────────────
+    let clean = tokio::select! {
+        r = &mut ctrl_reader_task => r.unwrap_or(false),
+        _ = &mut pty_writer_task  => false,
+        _ = &mut pty_reader_task  => false,
+        _ = &mut ctrl_writer_task => false,
+        _ = &mut hb_task          => false,
+        _ = &mut dispatch_task    => false,
+    };
+
+    ctrl_reader_task.abort();
+    pty_writer_task.abort();
+    pty_reader_task.abort();
+    ctrl_writer_task.abort();
+    hb_task.abort();
+    dispatch_task.abort();
+
+    vlog!(1, "[etrs] connection from {} ended (clean={})", peer, clean);
+    clean
+}
+
+// ── Forward helpers (server side) ────────────────────────────────────────────
+
+async fn serve_tcp_forward(
+    so: StreamOpen,
+    mut quic_send: quinn::SendStream,
+    mut quic_recv: quinn::RecvStream,
+    _session: Arc<Mutex<SessionState>>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let addr = format!("{}:{}", so.remote_host, so.remote_port);
+    let tcp = match TcpStream::connect(&addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            vlog!(1, "[etrs] TCP connect to {addr} failed: {e}");
+            let _ = quic_send.finish();
+            return;
+        }
+    };
+    vlog!(2, "[etrs] TCP forward → {addr}");
+
+    let (mut tcp_r, mut tcp_w) = tcp.into_split();
+
+    let mut t1 = tokio::spawn(async move {
+        let mut buf = vec![0u8; 8192];
+        loop {
+            match tcp_r.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if quic_send.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = quic_send.finish();
+    });
+
+    let mut t2 = tokio::spawn(async move {
+        let mut buf = vec![0u8; 8192];
+        loop {
+            match quic_recv.read(&mut buf).await {
+                Ok(None) | Err(_) => break,
+                Ok(Some(0)) => continue,
+                Ok(Some(n)) => {
+                    if tcp_w.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = tcp_w.shutdown().await;
+    });
+
+    tokio::select! {
+        _ = &mut t1 => {}
+        _ = &mut t2 => {}
+    }
+    t1.abort();
+    t2.abort();
+    vlog!(2, "[etrs] TCP forward to {addr} closed");
+}
+
+async fn serve_udp_forward(
+    so: StreamOpen,
+    mut quic_send: quinn::SendStream,
+    mut quic_recv: quinn::RecvStream,
+    _session: Arc<Mutex<SessionState>>,
+) {
+    use tokio::net::UdpSocket;
+
+    let remote_addr = format!("{}:{}", so.remote_host, so.remote_port);
+    let remote_addr_log = remote_addr.clone();
+    let socket = match UdpSocket::bind("0.0.0.0:0").await {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            vlog!(1, "[etrs] UDP bind failed: {e}");
+            let _ = quic_send.finish();
+            return;
+        }
+    };
+    vlog!(2, "[etrs] UDP forward → {remote_addr}");
+
+    let last_peer: Arc<std::sync::Mutex<Option<(String, u32)>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let last_peer2 = Arc::clone(&last_peer);
+    let socket2 = Arc::clone(&socket);
+
+    // Remote replies → QUIC (as UdpDatagram envelopes).
+    let mut reply_task = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+        while let Ok((n, _src)) = socket2.recv_from(&mut buf).await {
+            let (peer_addr, peer_port) = {
+                let g = last_peer2.lock().unwrap();
+                match g.as_ref() {
+                    Some((a, p)) => (a.clone(), *p),
+                    None => continue,
+                }
+            };
+            let env = Envelope {
+                payload: Some(Payload::UdpDatagram(UdpDatagram {
+                    peer_addr,
+                    peer_port,
+                    data: buf[..n].to_vec(),
+                })),
+            };
+            if quic::write_msg(&mut quic_send, &env).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // QUIC (UdpDatagram envelopes) → remote UDP.
+    let mut send_task = tokio::spawn(async move {
+        while let Ok(Some(env)) = quic::read_msg(&mut quic_recv).await {
+            if let Some(Payload::UdpDatagram(dg)) = env.payload {
+                if !dg.peer_addr.is_empty() {
+                    *last_peer.lock().unwrap() = Some((dg.peer_addr.clone(), dg.peer_port));
+                }
+                let _ = socket.send_to(&dg.data, &remote_addr).await;
+            }
+        }
+    });
+
+    tokio::select! {
+        _ = &mut reply_task => {}
+        _ = &mut send_task  => {}
+    }
+    reply_task.abort();
+    send_task.abort();
+    vlog!(2, "[etrs] UDP forward to {remote_addr_log} closed");
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
