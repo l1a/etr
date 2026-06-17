@@ -104,6 +104,18 @@ pub enum StreamType {
     PortForward = 1,
 }
 
+/// Transport protocol for a port-forward stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
+pub enum ForwardProto {
+    /// TCP forwarding: one stream per connection, full close propagation.
+    Tcp = 0,
+    /// UDP forwarding: one shared stream per `-L` spec, shared server-side socket.
+    /// Each `StreamData` carries the original sender's address so the server
+    /// can route replies back to the right local client.
+    Udp = 1,
+}
+
 /// Sent by the client to initiate or resume a session.  Plaintext on the wire.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct ClientHello {
@@ -160,6 +172,9 @@ pub struct StreamOpen {
     /// For port-forward streams: the remote port.
     #[prost(uint32, tag = "4")]
     pub remote_port: u32,
+    /// TCP or UDP.  Defaults to TCP (0) when absent.
+    #[prost(enumeration = "ForwardProto", tag = "5")]
+    pub forward_proto: i32,
 }
 
 /// Close a stream cleanly or signal an error.
@@ -182,6 +197,13 @@ pub struct StreamData {
     pub seq_num: u64,
     #[prost(bytes = "vec", tag = "3")]
     pub data: Vec<u8>,
+    /// UDP port-forward only: IP address of the local sender (client→server)
+    /// or the intended local recipient (server→client).  Empty for TCP / terminal.
+    #[prost(string, tag = "4")]
+    pub peer_addr: String,
+    /// UDP port-forward only: port of the local sender / recipient.  0 otherwise.
+    #[prost(uint32, tag = "5")]
+    pub peer_port: u32,
 }
 
 /// Acknowledge all stream data up to and including `ack_seq`.
@@ -272,6 +294,7 @@ mod tests {
                 stream_id: 3,
                 seq_num: 99,
                 data: b"hello world".to_vec(),
+                ..Default::default()
             })),
         };
         let bytes = env.encode_to_vec();
@@ -304,6 +327,7 @@ mod tests {
                 stream_type: StreamType::PortForward as i32,
                 remote_host: "localhost".to_string(),
                 remote_port: 5432,
+                forward_proto: ForwardProto::Tcp as i32,
             })),
         };
         let close = Envelope {

@@ -13,6 +13,7 @@
 //! - [`handshake`]: 1-RTT client and server handshake state machines.
 pub mod config;
 pub mod crypto;
+pub mod forward;
 pub mod handshake;
 pub mod protocol;
 pub mod session;

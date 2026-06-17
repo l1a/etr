@@ -14,6 +14,8 @@ use tokio::sync::{Mutex, mpsc};
 
 use etr::config::Config;
 use etr::crypto::{CipherSuiteId, generate_session_id};
+use etr::forward::ForwardSpec;
+use etr::protocol::{ForwardProto, StreamType};
 
 /// Log file for verbose output — set once at startup when running interactively.
 static LOG_FILE: std::sync::OnceLock<std::sync::Mutex<std::fs::File>> = std::sync::OnceLock::new();
@@ -98,6 +100,12 @@ struct Cli {
     /// Overrides config file. Default: all supported suites, strongest first.
     #[arg(long = "cipher", value_name = "NAME")]
     ciphers: Vec<String>,
+
+    /// Local port forwarding (repeatable): local_port:remote_host:remote_port[/tcp|/udp]
+    /// Works like ssh -L. Default protocol: tcp.
+    /// Example: -L 8080:localhost:80  -L 5353:8.8.8.8:53/udp
+    #[arg(short = 'L', value_name = "SPEC")]
+    forward: Vec<String>,
 
     /// Generate shell completions for the specified shell
     #[arg(long, value_enum, value_name = "SHELL")]
@@ -194,6 +202,21 @@ async fn main() -> io::Result<()> {
     };
     let cipher_suites = resolve_ciphers(&cipher_names)?;
 
+    // Parse -L forwarding specs.
+    let mut forward_specs: Vec<ForwardSpec> = Vec::new();
+    for s in &cli.forward {
+        match ForwardSpec::parse(s) {
+            Ok(spec) => {
+                vlog!(cli.verbose, 1, "[etr] Forwarding: {spec}");
+                forward_specs.push(spec);
+            }
+            Err(e) => {
+                eprintln!("[etr] error: {e}");
+                return Ok(());
+            }
+        }
+    }
+
     let session_id = generate_session_id();
     let passkey = generate_passkey();
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
@@ -225,6 +248,7 @@ async fn main() -> io::Result<()> {
         session_id,
         session,
         cipher_suites,
+        forward_specs,
         cli.verbose,
     )
     .await
@@ -324,6 +348,7 @@ fn bootstrap_ssh(
     )))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_connection_loop(
     target: String,
     port: u16,
@@ -331,6 +356,7 @@ async fn run_connection_loop(
     session_id: [u8; 16],
     session: Arc<Mutex<SessionState>>,
     cipher_suites: Vec<u32>,
+    forward_specs: Vec<ForwardSpec>,
     verbose: u8,
 ) -> io::Result<()> {
     let host = if let Some(idx) = target.find('@') {
@@ -460,6 +486,7 @@ async fn run_connection_loop(
             Arc::clone(&cipher),
             Arc::clone(&session),
             Arc::clone(&stdin_rx),
+            forward_specs.clone(),
             verbose,
         )
         .await;
@@ -482,6 +509,7 @@ async fn run_connection_loop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_session(
     socket: Arc<UdpSocket>,
     server_addr: SocketAddr,
@@ -489,11 +517,12 @@ async fn run_session(
     cipher: Arc<etr::crypto::AeadCipher>,
     session: Arc<Mutex<SessionState>>,
     stdin_rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
+    forward_specs: Vec<ForwardSpec>,
     verbose: u8,
 ) -> io::Result<()> {
     let (send_tx, mut send_rx) = mpsc::channel::<Envelope>(1000);
 
-    // Replay any unacknowledged outbound data.
+    // Replay any unacknowledged outbound data (terminal stream only).
     {
         let s = session.lock().await;
         let peer_acks: HashMap<u32, u64> = HashMap::new();
@@ -505,9 +534,58 @@ async fn run_session(
                             stream_id,
                             seq_num: seq,
                             data,
+                            ..Default::default()
                         })),
                     })
                     .await;
+            }
+        }
+    }
+
+    // Map from stream_id → channel for data arriving from the server for that forward stream.
+    let forward_sinks: Arc<Mutex<HashMap<u32, mpsc::Sender<StreamData>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
+    // Shared stream-ID counter; stream 0 is reserved for the terminal.
+    let next_stream_id = Arc::new(std::sync::atomic::AtomicU32::new(1));
+
+    // Launch a task for each -L spec.
+    let mut fwd_task_handles = Vec::new();
+    for spec in &forward_specs {
+        match spec.proto {
+            ForwardProto::Tcp => {
+                let handle = tokio::spawn(run_tcp_acceptor(
+                    spec.clone(),
+                    send_tx.clone(),
+                    Arc::clone(&forward_sinks),
+                    Arc::clone(&next_stream_id),
+                    verbose,
+                ));
+                fwd_task_handles.push(handle);
+            }
+            ForwardProto::Udp => {
+                let stream_id = next_stream_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (fwd_tx, fwd_rx) = mpsc::channel::<StreamData>(256);
+                forward_sinks.lock().await.insert(stream_id, fwd_tx);
+                let _ = send_tx
+                    .send(Envelope {
+                        payload: Some(Payload::StreamOpen(etr::protocol::StreamOpen {
+                            stream_id,
+                            stream_type: StreamType::PortForward as i32,
+                            remote_host: spec.remote_host.clone(),
+                            remote_port: spec.remote_port as u32,
+                            forward_proto: ForwardProto::Udp as i32,
+                        })),
+                    })
+                    .await;
+                let handle = tokio::spawn(run_udp_forward_client(
+                    spec.clone(),
+                    stream_id,
+                    send_tx.clone(),
+                    fwd_rx,
+                    verbose,
+                ));
+                fwd_task_handles.push(handle);
             }
         }
     }
@@ -573,16 +651,18 @@ async fn run_session(
                         stream_id: 0,
                         seq_num: seq,
                         data: payload,
+                        ..Default::default()
                     })),
                 })
                 .await;
         }
     });
 
-    // Task: receive packets from the server and write terminal output to stdout.
+    // Task: receive packets from the server and dispatch them.
     let socket_r = Arc::clone(&socket);
     let cipher_r = Arc::clone(&cipher);
     let session_r = Arc::clone(&session);
+    let fwd_sinks_r = Arc::clone(&forward_sinks);
     let mut reader_task = tokio::spawn(async move {
         let mut stdout = io::stdout();
         loop {
@@ -627,6 +707,15 @@ async fn run_session(
                             st.next_in_seq += 1;
                         }
                     }
+                }
+                Some(Payload::StreamData(sd)) => {
+                    // Route to the appropriate forward-stream handler.
+                    if let Some(tx) = fwd_sinks_r.lock().await.get(&sd.stream_id) {
+                        let _ = tx.send(sd).await;
+                    }
+                }
+                Some(Payload::StreamClose(sc)) if sc.stream_id != 0 => {
+                    fwd_sinks_r.lock().await.remove(&sc.stream_id);
                 }
                 Some(Payload::Disconnect(_)) => {
                     return Err(io::Error::new(
@@ -695,8 +784,226 @@ async fn run_session(
     reader_task.abort();
     resize_task.abort();
     hb_task.abort();
+    for h in fwd_task_handles {
+        h.abort();
+    }
 
     result
+}
+
+// ── Port-forward helpers (client side) ───────────────────────────────────────
+
+/// Listen on `spec.local_port` for TCP connections; open a new stream per connection.
+async fn run_tcp_acceptor(
+    spec: ForwardSpec,
+    send_tx: mpsc::Sender<Envelope>,
+    forward_sinks: Arc<Mutex<HashMap<u32, mpsc::Sender<StreamData>>>>,
+    next_stream_id: Arc<std::sync::atomic::AtomicU32>,
+    verbose: u8,
+) {
+    use tokio::net::TcpListener;
+    let listener = match TcpListener::bind(format!("127.0.0.1:{}", spec.local_port)).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!(
+                "[etr] cannot bind TCP listener on port {}: {e}",
+                spec.local_port
+            );
+            return;
+        }
+    };
+    vlog!(
+        verbose,
+        1,
+        "[etr] TCP forward  local:{} → {}:{}",
+        spec.local_port,
+        spec.remote_host,
+        spec.remote_port
+    );
+    loop {
+        match listener.accept().await {
+            Ok((stream, peer)) => {
+                let stream_id = next_stream_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                vlog!(
+                    verbose,
+                    2,
+                    "[etr] TCP connect from {peer} → stream {stream_id}"
+                );
+                let (fwd_tx, fwd_rx) = mpsc::channel::<StreamData>(256);
+                forward_sinks.lock().await.insert(stream_id, fwd_tx);
+                let _ = send_tx
+                    .send(Envelope {
+                        payload: Some(Payload::StreamOpen(etr::protocol::StreamOpen {
+                            stream_id,
+                            stream_type: StreamType::PortForward as i32,
+                            remote_host: spec.remote_host.clone(),
+                            remote_port: spec.remote_port as u32,
+                            forward_proto: ForwardProto::Tcp as i32,
+                        })),
+                    })
+                    .await;
+                tokio::spawn(run_tcp_connection(
+                    stream,
+                    stream_id,
+                    send_tx.clone(),
+                    fwd_rx,
+                    Arc::clone(&forward_sinks),
+                    verbose,
+                ));
+            }
+            Err(e) => {
+                vlog!(verbose, 1, "[etr] TCP accept error: {e}");
+                break;
+            }
+        }
+    }
+}
+
+/// Pipe one TCP connection ↔ one port-forward stream.
+async fn run_tcp_connection(
+    stream: tokio::net::TcpStream,
+    stream_id: u32,
+    send_tx: mpsc::Sender<Envelope>,
+    mut fwd_rx: mpsc::Receiver<StreamData>,
+    forward_sinks: Arc<Mutex<HashMap<u32, mpsc::Sender<StreamData>>>>,
+    verbose: u8,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (mut tcp_rx, mut tcp_tx) = stream.into_split();
+    let mut seq: u64 = 1;
+
+    // TCP → StreamData
+    let send_tx2 = send_tx.clone();
+    let mut reader = tokio::spawn(async move {
+        let mut buf = vec![0u8; 8192];
+        loop {
+            match tcp_rx.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let data = buf[..n].to_vec();
+                    let sn = seq;
+                    seq += 1;
+                    if send_tx2
+                        .send(Envelope {
+                            payload: Some(Payload::StreamData(StreamData {
+                                stream_id,
+                                seq_num: sn,
+                                data,
+                                ..Default::default()
+                            })),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        // TCP closed: tell the server.
+        let _ = send_tx2
+            .send(Envelope {
+                payload: Some(Payload::StreamClose(etr::protocol::StreamClose {
+                    stream_id,
+                    error_code: 0,
+                })),
+            })
+            .await;
+    });
+
+    // StreamData → TCP
+    let mut writer = tokio::spawn(async move {
+        while let Some(sd) = fwd_rx.recv().await {
+            if tcp_tx.write_all(&sd.data).await.is_err() {
+                break;
+            }
+        }
+        let _ = tcp_tx.shutdown().await;
+    });
+
+    tokio::select! {
+        _ = &mut reader => {}
+        _ = &mut writer => {}
+    }
+    reader.abort();
+    writer.abort();
+    forward_sinks.lock().await.remove(&stream_id);
+    vlog!(verbose, 2, "[etr] TCP stream {stream_id} closed");
+}
+
+/// Shared-socket UDP forward: one stream, many local senders.
+///
+/// Each datagram from a local sender is forwarded to the server with the
+/// sender's address embedded in `StreamData.peer_addr/peer_port`.  The server
+/// echoes those fields back in replies so we can route them to the right sender.
+async fn run_udp_forward_client(
+    spec: ForwardSpec,
+    stream_id: u32,
+    send_tx: mpsc::Sender<Envelope>,
+    mut fwd_rx: mpsc::Receiver<StreamData>,
+    verbose: u8,
+) {
+    use tokio::net::UdpSocket as TUdp;
+    let local_socket = match TUdp::bind(format!("0.0.0.0:{}", spec.local_port)).await {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            eprintln!(
+                "[etr] cannot bind UDP socket on port {}: {e}",
+                spec.local_port
+            );
+            return;
+        }
+    };
+    vlog!(
+        verbose,
+        1,
+        "[etr] UDP forward  local:{} → {}:{}",
+        spec.local_port,
+        spec.remote_host,
+        spec.remote_port
+    );
+
+    let local_socket2 = Arc::clone(&local_socket);
+    let send_tx2 = send_tx.clone();
+
+    // Local UDP datagrams → StreamData (with embedded sender addr).
+    let mut dgram_in = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+        let mut seq: u64 = 1;
+        while let Ok((n, src)) = local_socket2.recv_from(&mut buf).await {
+            let sn = seq;
+            seq += 1;
+            let _ = send_tx2
+                .send(Envelope {
+                    payload: Some(Payload::StreamData(StreamData {
+                        stream_id,
+                        seq_num: sn,
+                        data: buf[..n].to_vec(),
+                        peer_addr: src.ip().to_string(),
+                        peer_port: src.port() as u32,
+                    })),
+                })
+                .await;
+        }
+    });
+
+    // StreamData from server → local UDP sender (using embedded peer addr).
+    let mut dgram_out = tokio::spawn(async move {
+        while let Some(sd) = fwd_rx.recv().await {
+            if !sd.peer_addr.is_empty() && sd.peer_port > 0 {
+                let dest = format!("{}:{}", sd.peer_addr, sd.peer_port);
+                let _ = local_socket.send_to(&sd.data, &dest).await;
+            }
+        }
+    });
+
+    tokio::select! {
+        _ = &mut dgram_in  => {}
+        _ = &mut dgram_out => {}
+    }
+    dgram_in.abort();
+    dgram_out.abort();
+    vlog!(verbose, 2, "[etr] UDP stream {stream_id} closed");
 }
 
 #[cfg(test)]

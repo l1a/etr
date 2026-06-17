@@ -209,7 +209,7 @@ cargo install --path . --no-default-features
 
 # Code quality gate (run before pushing)
 just check            # cargo fmt --check + cargo clippy -D warnings
-just test             # cargo test (112 tests as of this writing)
+just test             # cargo test (122 tests as of this writing)
 ```
 
 ---
@@ -254,13 +254,15 @@ A one-shot invocation that opens a forwarded socket and keeps it alive across ne
 interruptions, without a PTY session. Example:
 
 ```bash
-etr -L 5432:db-host:5432 user@jumphost   # local port → remote
-etr -R 8080:localhost:8080 user@server   # remote port → local
+etr -L 5432:db-host:5432 user@jumphost    # local port → remote (TCP)
+etr -L 5353:8.8.8.8:53/udp user@jumphost # UDP forwarding
 ```
 
-**Current state**: the `PortForward` stream type is defined in the protocol and the
-stream multiplexing layer supports multiple streams, but the CLI has no `-L`/`-R` flags
-and the server has no port-forwarding logic.
+**Current state**: `-L local_port:remote_host:remote_port[/tcp|/udp]` is implemented for
+both TCP and UDP, running concurrently alongside the PTY session. TCP opens one stream
+per connection; UDP uses one shared stream per `-L` spec with last-sender reply routing.
+Runs without a PTY session if no terminal is attached. `-R` (remote-to-local) is not yet
+implemented.
 
 ---
 
@@ -276,8 +278,12 @@ and the server has no port-forwarding logic.
   latency, per-packet encrypt/decrypt throughput (all four cipher suites), PTY
   round-trip latency, and throughput under reconnect. Consider `criterion` for
   micro-benchmarks and a `just bench-local` recipe for end-to-end latency.
-- **Mode 2 — port forwarding**: add `-L`/`-R` CLI flags to `etr` and implement the
-  forwarding logic in `etrs`. The stream layer already supports it structurally.
+- **Mode 2 — `-R` remote forwarding**: `-L` (local-to-remote) is done; `-R` (remote port
+  → local) is not yet implemented.
+- **UDP reply routing**: current shared-socket design uses last-sender routing — replies
+  from the remote UDP target go to whichever local client sent the most recent datagram.
+  Works for single-sender and sequential request/response (DNS, STUN); not suitable for
+  multiple concurrent UDP senders to the same forwarded port.
 - **Multiple simultaneous sessions**: each `etr` invocation starts its own `etrs`
   child; there is no way to list or re-attach to an existing session from a new client.
   Session state (ID + passkey) is in-memory only.
@@ -289,7 +295,7 @@ and the server has no port-forwarding logic.
 
 ---
 
-## Test coverage (112 tests)
+## Test coverage (122 tests)
 
 | Module | What's tested |
 |--------|--------------|
@@ -304,4 +310,6 @@ and the server has no port-forwarding logic.
 | `session/mod` | Close/ack unknown stream, `last_received_map` semantics, collect_replays, `open_stream` idempotence |
 | `bin/etrs` | CLI defaults, verbose count, custom port, subcommand parsing |
 | `config` | TOML parse (full section, partial, empty), default values |
+| `forward` | `-L` spec parsing: TCP/UDP/IPv6, explicit proto, bad port, empty host, Display |
+| `protocol` | Header round-trip/rejection, `StreamData`/`ClientHello`/`StreamOpen`/`StreamClose` encode-decode |
 | `bin/etr` | CLI defaults, port parsing, target parsing, `--cipher` flag, `resolve_ciphers` |

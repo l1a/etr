@@ -36,7 +36,10 @@ fn payload_type(p: Option<&etr::protocol::Payload>) -> &'static str {
 }
 
 use etr::handshake::process_client_hello;
-use etr::protocol::{Disconnect, Envelope, Heartbeat, PacketHeader, Payload, StreamData};
+use etr::protocol::{
+    Disconnect, Envelope, ForwardProto, Heartbeat, PacketHeader, Payload, StreamClose, StreamData,
+    StreamType,
+};
 use etr::session::SessionState;
 use etr::transport::{ReceivedPacket, decode_data_packet, recv_packet, send_packet};
 
@@ -228,6 +231,7 @@ async fn run_session(
                                     stream_id: 0,
                                     seq_num: seq,
                                     data,
+                                    ..Default::default()
                                 })),
                             });
                         }
@@ -356,6 +360,7 @@ async fn run_session(
                         stream_id,
                         seq_num: seq,
                         data,
+                        ..Default::default()
                     })),
                 });
             }
@@ -385,11 +390,19 @@ async fn run_session(
             }
         });
 
+        // Per-connection registry of active forward-stream handlers.
+        // stream_id → channel for data arriving from the client.
+        let fwd_tasks: Arc<
+            tokio::sync::Mutex<std::collections::HashMap<u32, mpsc::Sender<StreamData>>>,
+        > = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
         // Reader task — returns true on clean Disconnect, false on timeout/replacement.
         let cipher_r = Arc::clone(&cipher);
         let session_r = Arc::clone(&session_state);
         let pty_tx = pty_in_tx.clone();
         let master_r = Arc::clone(&master);
+        let ob_tx_r = ob_tx.clone();
+        let fwd_tasks_r = Arc::clone(&fwd_tasks);
         let mut reader = tokio::spawn(async move {
             loop {
                 match tokio::time::timeout(Duration::from_secs(15), ib_rx.recv()).await {
@@ -426,6 +439,47 @@ async fn run_session(
                                         st.next_in_seq += 1;
                                     }
                                 }
+                            }
+                            Some(Payload::StreamData(sd)) => {
+                                // Route to the forward-stream handler.
+                                if let Some(tx) = fwd_tasks_r.lock().await.get(&sd.stream_id) {
+                                    let _ = tx.send(sd).await;
+                                }
+                            }
+                            Some(Payload::StreamOpen(so))
+                                if so.stream_type == StreamType::PortForward as i32 =>
+                            {
+                                let (fwd_tx, fwd_rx) = mpsc::channel::<StreamData>(256);
+                                fwd_tasks_r.lock().await.insert(so.stream_id, fwd_tx);
+                                let ob = ob_tx_r.clone();
+                                let ft = Arc::clone(&fwd_tasks_r);
+                                match ForwardProto::try_from(so.forward_proto)
+                                    .unwrap_or(ForwardProto::Tcp)
+                                {
+                                    ForwardProto::Tcp => {
+                                        tokio::spawn(serve_tcp_forward(
+                                            so.stream_id,
+                                            so.remote_host,
+                                            so.remote_port as u16,
+                                            fwd_rx,
+                                            ob,
+                                            ft,
+                                        ));
+                                    }
+                                    ForwardProto::Udp => {
+                                        tokio::spawn(serve_udp_forward(
+                                            so.stream_id,
+                                            so.remote_host,
+                                            so.remote_port as u16,
+                                            fwd_rx,
+                                            ob,
+                                            ft,
+                                        ));
+                                    }
+                                }
+                            }
+                            Some(Payload::StreamClose(sc)) if sc.stream_id != 0 => {
+                                fwd_tasks_r.lock().await.remove(&sc.stream_id);
                             }
                             Some(Payload::TerminalResize(tr)) => {
                                 let m = master_r.lock().await;
@@ -503,6 +557,206 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
         .collect()
+}
+
+// ── Port-forward helpers (server side) ───────────────────────────────────────
+
+type FwdRegistry =
+    Arc<tokio::sync::Mutex<std::collections::HashMap<u32, mpsc::Sender<StreamData>>>>;
+
+/// Connect to `remote_host:remote_port` via TCP and pipe data with the client stream.
+async fn serve_tcp_forward(
+    stream_id: u32,
+    remote_host: String,
+    remote_port: u16,
+    mut fwd_rx: mpsc::Receiver<StreamData>,
+    ob_tx: mpsc::Sender<Envelope>,
+    fwd_registry: FwdRegistry,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let addr = format!("{remote_host}:{remote_port}");
+    let stream = match TcpStream::connect(&addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            vlog!(1, "[etrs] TCP connect to {addr} failed: {e}");
+            let _ = ob_tx
+                .send(Envelope {
+                    payload: Some(Payload::StreamClose(StreamClose {
+                        stream_id,
+                        error_code: 1,
+                    })),
+                })
+                .await;
+            fwd_registry.lock().await.remove(&stream_id);
+            return;
+        }
+    };
+    vlog!(2, "[etrs] TCP forward stream {stream_id} → {addr}");
+
+    let (mut tcp_rx, mut tcp_tx) = stream.into_split();
+
+    // Remote TCP → StreamData to client.
+    let ob2 = ob_tx.clone();
+    let mut reader = tokio::spawn(async move {
+        let mut buf = vec![0u8; 8192];
+        let mut seq: u64 = 1;
+        loop {
+            match tcp_rx.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let sn = seq;
+                    seq += 1;
+                    if ob2
+                        .send(Envelope {
+                            payload: Some(Payload::StreamData(StreamData {
+                                stream_id,
+                                seq_num: sn,
+                                data: buf[..n].to_vec(),
+                                ..Default::default()
+                            })),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = ob2
+            .send(Envelope {
+                payload: Some(Payload::StreamClose(StreamClose {
+                    stream_id,
+                    error_code: 0,
+                })),
+            })
+            .await;
+    });
+
+    // StreamData from client → remote TCP.
+    let mut writer = tokio::spawn(async move {
+        while let Some(sd) = fwd_rx.recv().await {
+            if tcp_tx.write_all(&sd.data).await.is_err() {
+                break;
+            }
+        }
+        let _ = tcp_tx.shutdown().await;
+    });
+
+    tokio::select! {
+        _ = &mut reader => {}
+        _ = &mut writer => {}
+    }
+    reader.abort();
+    writer.abort();
+    fwd_registry.lock().await.remove(&stream_id);
+    vlog!(2, "[etrs] TCP forward stream {stream_id} closed");
+}
+
+/// Bind a UDP socket and forward datagrams to `remote_host:remote_port`.
+///
+/// All client datagrams go to the same remote target (shared-socket model).
+/// The `peer_addr`/`peer_port` embedded in each client `StreamData` is echoed
+/// back in the reply so the client can route it to the right local sender.
+/// Last-sender routing is used when a reply arrives and multiple local senders
+/// have been seen — sufficient for single-sender use cases and sequential
+/// request/response protocols (DNS, STUN, etc.).
+async fn serve_udp_forward(
+    stream_id: u32,
+    remote_host: String,
+    remote_port: u16,
+    mut fwd_rx: mpsc::Receiver<StreamData>,
+    ob_tx: mpsc::Sender<Envelope>,
+    fwd_registry: FwdRegistry,
+) {
+    use tokio::net::UdpSocket as TUdp;
+
+    let remote_addr = format!("{remote_host}:{remote_port}");
+    let socket = match TUdp::bind("0.0.0.0:0").await {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            vlog!(1, "[etrs] UDP bind failed for stream {stream_id}: {e}");
+            let _ = ob_tx
+                .send(Envelope {
+                    payload: Some(Payload::StreamClose(StreamClose {
+                        stream_id,
+                        error_code: 1,
+                    })),
+                })
+                .await;
+            fwd_registry.lock().await.remove(&stream_id);
+            return;
+        }
+    };
+    vlog!(2, "[etrs] UDP forward stream {stream_id} → {remote_addr}");
+
+    // Track the most-recent local sender so replies can be routed back.
+    let last_peer: Arc<std::sync::Mutex<Option<(String, u32)>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let last_peer2 = Arc::clone(&last_peer);
+
+    let socket2 = Arc::clone(&socket);
+    let ob2 = ob_tx.clone();
+
+    // Incoming replies from the remote → StreamData to client.
+    let mut reply_task = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+        let mut seq: u64 = 1;
+        #[allow(clippy::while_let_loop)] // loop has a `continue` branch, not just break
+        loop {
+            match socket2.recv_from(&mut buf).await {
+                Ok((n, _src)) => {
+                    let (peer_addr, peer_port) = {
+                        let g = last_peer2.lock().unwrap();
+                        match g.as_ref() {
+                            Some((a, p)) => (a.clone(), *p),
+                            None => continue, // no sender yet; discard
+                        }
+                    };
+                    let sn = seq;
+                    seq += 1;
+                    if ob2
+                        .send(Envelope {
+                            payload: Some(Payload::StreamData(StreamData {
+                                stream_id,
+                                seq_num: sn,
+                                data: buf[..n].to_vec(),
+                                peer_addr,
+                                peer_port,
+                            })),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Client StreamData → remote UDP.
+    let mut send_task = tokio::spawn(async move {
+        while let Some(sd) = fwd_rx.recv().await {
+            // Update last-seen sender for reply routing.
+            if !sd.peer_addr.is_empty() {
+                *last_peer.lock().unwrap() = Some((sd.peer_addr.clone(), sd.peer_port));
+            }
+            let _ = socket.send_to(&sd.data, &remote_addr).await;
+        }
+    });
+
+    tokio::select! {
+        _ = &mut reply_task => {}
+        _ = &mut send_task  => {}
+    }
+    reply_task.abort();
+    send_task.abort();
+    fwd_registry.lock().await.remove(&stream_id);
+    vlog!(2, "[etrs] UDP forward stream {stream_id} closed");
 }
 
 #[cfg(test)]
