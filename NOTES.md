@@ -257,7 +257,7 @@ ssh-copy-id localhost     # or append ~/.ssh/id_*.pub to ~/.ssh/authorized_keys
 just check-tools          # verifies tmux, ssh, passwordless localhost SSH
 
 # Full automated end-to-end test (happy path + reconnect)
-just test-local
+just e2e-local
 
 # Memory/throughput stress test (1 PTY + 2 -L forward streams, all directions)
 just stress-local

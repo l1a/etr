@@ -77,7 +77,7 @@ install-release: build-release
 
 # ── Local end-to-end testing ─────────────────────────────────────────────────
 
-# Verify tools needed for test-local (tmux, ssh, passwordless localhost access)
+# Verify tools needed for e2e-local (tmux, ssh, passwordless localhost access)
 check-tools:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -113,7 +113,7 @@ check-tools:
 #
 # etr is launched as the tmux session command (not via send-keys) to avoid
 # the .zshrc startup race and so that #{pane_pid} == etr's PID directly.
-test-local: check-tools install
+e2e-local: check-tools install
     #!/usr/bin/env bash
     set -euo pipefail
 
