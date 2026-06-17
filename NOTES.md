@@ -297,6 +297,9 @@ last-sender reply routing.  Runs without a PTY session if no terminal is attache
 
 ## Known gaps / next steps
 
+- **`utmp`/`wtmp` registration**: register the session with the Linux `who` database
+  (write a `utmp`/`wtmp` entry) the way `ssh` and `mosh` do, so the user appears in
+  `who`, `w`, and `last` output.  Crate candidates: `utmp-classic`, `utemper`.
 - **Benchmarking**: no performance benchmarks exist.  Key areas to measure: QUIC
   connection latency, PTY round-trip latency, throughput under reconnect, and
   port-forward throughput.  Consider `criterion` for micro-benchmarks.
