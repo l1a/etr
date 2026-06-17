@@ -2,6 +2,7 @@
 use clap::{ArgAction, Parser};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::{self, Read, Write};
+use std::os::unix::io::{FromRawFd, IntoRawFd};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
@@ -68,37 +69,64 @@ fn main() -> io::Result<()> {
 
     // Generate ephemeral self-signed QUIC certificate.
     let (cert, key) = quic::generate_self_signed_cert();
+    let cert_hex = hex_encode(cert.as_ref());
 
-    // Build the QUIC server endpoint synchronously so we know the actual port
-    // before forking.
+    // quinn::Endpoint requires a tokio runtime, so we can't create it before
+    // forking.  Instead, open a pipe: the child creates the endpoint (getting
+    // an OS-assigned port), writes the port back to the parent, then the parent
+    // prints "PORT <n> CERT <hex>" to SSH stdout and exits.
+    let (owned_r, owned_w) = nix::unistd::pipe()
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    // Convert to raw fds so they can be used after the fork without ownership tracking.
+    let pipe_r: i32 = owned_r.into_raw_fd();
+    let pipe_w: i32 = owned_w.into_raw_fd();
+
+    // Fork: parent waits for port from child; child runs the tokio session.
+    use nix::unistd::{ForkResult, fork, setsid};
+    match unsafe { fork() }.map_err(|e| io::Error::other(e.to_string()))? {
+        ForkResult::Parent { .. } => {
+            // Close write end; read the 2-byte port the child sends.
+            nix::unistd::close(pipe_w).ok();
+            let mut port_bytes = [0u8; 2];
+            let mut reader = unsafe { std::fs::File::from_raw_fd(pipe_r) };
+            reader.read_exact(&mut port_bytes)?;
+            let actual_port = u16::from_be_bytes(port_bytes);
+            println!("PORT {actual_port} CERT {cert_hex}");
+            io::stdout().flush()?;
+            return Ok(());
+        }
+        ForkResult::Child => {
+            // Close read end; we'll write the port after binding.
+            nix::unistd::close(pipe_r).ok();
+            setsid().ok();
+        }
+    }
+
+    // Child: build the Tokio runtime, create the quinn endpoint, send port to
+    // parent, then detach stdio and run the session.
     let bind_str = format!("{}:{}", cli.bind, cli.port);
     let bind_addr: std::net::SocketAddr = bind_str
         .parse()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e}")))?;
-    let server_cfg =
-        quic::server_config(cert.clone(), key).map_err(io::Error::other)?;
-    let endpoint = quinn::Endpoint::server(server_cfg, bind_addr).map_err(io::Error::other)?;
-    let actual_port = endpoint.local_addr()?.port();
 
-    // Tell the client: port + cert DER (hex-encoded) for TLS pinning.
-    println!("PORT {actual_port} CERT {}", hex_encode(cert.as_ref()));
-    io::stdout().flush()?;
-
-    // Fork: parent exits (SSH session closes cleanly); child runs the session.
-    use nix::unistd::{ForkResult, fork, setsid};
-    match unsafe { fork() }.map_err(|e| io::Error::other(e.to_string()))? {
-        ForkResult::Parent { .. } => return Ok(()),
-        ForkResult::Child => {
-            setsid().ok();
-            detach_stdio()?;
-        }
-    }
-
-    // Child: build the Tokio runtime and run the session.
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(run_session(endpoint, session_id, passkey, term))
+        .block_on(async move {
+            let server_cfg = quic::server_config(cert, key).map_err(io::Error::other)?;
+            let endpoint = quinn::Endpoint::server(server_cfg, bind_addr)
+                .map_err(io::Error::other)?;
+            let actual_port = endpoint.local_addr()?.port();
+
+            // Send port to parent (2 bytes big-endian), then close the pipe.
+            let port_bytes = actual_port.to_be_bytes();
+            let mut writer = unsafe { std::fs::File::from_raw_fd(pipe_w) };
+            writer.write_all(&port_bytes)?;
+            drop(writer); // closes pipe_w
+
+            detach_stdio()?;
+            run_session(endpoint, session_id, passkey, term).await
+        })
 }
 
 fn detach_stdio() -> io::Result<()> {
