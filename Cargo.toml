@@ -8,6 +8,16 @@ repository = "https://github.com/l1a/etr"
 readme = "README.md"
 keywords = ["terminal", "ssh", "remote-shell", "mosh", "reconnect"]
 categories = ["command-line-utilities", "network-programming"]
+exclude = [
+    ".clauderc",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "GEMINI.md",
+    "NOTES.md",
+    "justfile",
+    "scripts/",
+    ".github/",
+]
 
 [dependencies]
 tokio = { version = "1.38", features = ["full"] }
