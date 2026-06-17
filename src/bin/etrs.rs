@@ -8,8 +8,7 @@ use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 
 use etr::protocol::{
-    Disconnect, Envelope, ForwardProto, Payload, SessionAccept, StreamOpen,
-    UdpDatagram,
+    Disconnect, Envelope, ForwardProto, Payload, SessionAccept, StreamOpen, UdpDatagram,
 };
 use etr::quic::{self, TAG_CONTROL, TAG_FORWARD, TAG_PTY};
 use etr::session::SessionState;
@@ -75,8 +74,7 @@ fn main() -> io::Result<()> {
     // forking.  Instead, open a pipe: the child creates the endpoint (getting
     // an OS-assigned port), writes the port back to the parent, then the parent
     // prints "PORT <n> CERT <hex>" to SSH stdout and exits.
-    let (owned_r, owned_w) = nix::unistd::pipe()
-        .map_err(|e| io::Error::other(e.to_string()))?;
+    let (owned_r, owned_w) = nix::unistd::pipe().map_err(|e| io::Error::other(e.to_string()))?;
     // Convert to raw fds so they can be used after the fork without ownership tracking.
     let pipe_r: i32 = owned_r.into_raw_fd();
     let pipe_w: i32 = owned_w.into_raw_fd();
@@ -114,8 +112,8 @@ fn main() -> io::Result<()> {
         .build()?
         .block_on(async move {
             let server_cfg = quic::server_config(cert, key).map_err(io::Error::other)?;
-            let endpoint = quinn::Endpoint::server(server_cfg, bind_addr)
-                .map_err(io::Error::other)?;
+            let endpoint =
+                quinn::Endpoint::server(server_cfg, bind_addr).map_err(io::Error::other)?;
             let actual_port = endpoint.local_addr()?.port();
 
             // Send port to parent (2 bytes big-endian), then close the pipe.
@@ -355,7 +353,12 @@ async fn handle_connection(
     master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
 ) -> bool {
     let peer = conn.remote_address();
-    vlog!(1, "[etrs] connection from {} session={}", peer, hex_encode(&session_id));
+    vlog!(
+        1,
+        "[etrs] connection from {} session={}",
+        peer,
+        hex_encode(&session_id)
+    );
 
     // ── Control stream: first stream the client opens ─────────────────────
     let (mut ctrl_send, mut ctrl_recv) = match conn.accept_bi().await {
@@ -419,7 +422,10 @@ async fn handle_connection(
             last_received_seq: server_last,
         })),
     };
-    if quic::write_msg(&mut ctrl_send, &session_accept).await.is_err() {
+    if quic::write_msg(&mut ctrl_send, &session_accept)
+        .await
+        .is_err()
+    {
         return false;
     }
 
@@ -439,10 +445,8 @@ async fn handle_connection(
 
     // ── Wait for the PTY stream (second stream the client opens) ──────────
     // Meanwhile, accept incoming streams and dispatch them in a separate task.
-    let (pty_stream_tx, pty_stream_rx) = tokio::sync::oneshot::channel::<(
-        quinn::SendStream,
-        quinn::RecvStream,
-    )>();
+    let (pty_stream_tx, pty_stream_rx) =
+        tokio::sync::oneshot::channel::<(quinn::SendStream, quinn::RecvStream)>();
 
     let conn_dispatch = conn.clone();
     let session_state_fwd = Arc::clone(&session_state);
@@ -471,8 +475,8 @@ async fn handle_connection(
                         },
                         _ => break,
                     };
-                    let proto = ForwardProto::try_from(so.forward_proto)
-                        .unwrap_or(ForwardProto::Tcp);
+                    let proto =
+                        ForwardProto::try_from(so.forward_proto).unwrap_or(ForwardProto::Tcp);
                     let ss = Arc::clone(&session_state_fwd);
                     match proto {
                         ForwardProto::Tcp => {
@@ -502,7 +506,10 @@ async fn handle_connection(
     let mut pty_writer_task = tokio::spawn(async move {
         while let Some((seq, data)) = pty_ob_rx.recv().await {
             vlog!(3, "[etrs] pty→client seq={seq} bytes={}", data.len());
-            if quic::write_pty_chunk(&mut pty_send, seq, &data).await.is_err() {
+            if quic::write_pty_chunk(&mut pty_send, seq, &data)
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -557,7 +564,10 @@ async fn handle_connection(
                     }
                     Some(Payload::Disconnect(_)) => return true,
                     Some(Payload::Heartbeat(hb)) => {
-                        session_ctrl.lock().await.apply_server_acks(&hb.last_received_seq);
+                        session_ctrl
+                            .lock()
+                            .await
+                            .apply_server_acks(&hb.last_received_seq);
                         vlog!(3, "[etrs] hb←client acks={:?}", hb.last_received_seq);
                     }
                     _ => {}
@@ -604,12 +614,7 @@ async fn handle_connection(
     hb_task.abort();
     dispatch_task.abort();
 
-    vlog!(
-        1,
-        "[etrs] connection from {} ended (clean={})",
-        peer,
-        clean
-    );
+    vlog!(1, "[etrs] connection from {} ended (clean={})", peer, clean);
     clean
 }
 

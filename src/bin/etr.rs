@@ -337,8 +337,8 @@ async fn run_connection_loop(
     } else {
         "0.0.0.0:0"
     };
-    let mut endpoint = quinn::Endpoint::client(bind_addr.parse().unwrap())
-        .map_err(io::Error::other)?;
+    let mut endpoint =
+        quinn::Endpoint::client(bind_addr.parse().unwrap()).map_err(io::Error::other)?;
     endpoint.set_default_client_config(cli_cfg);
 
     // Single stdin reader shared across all reconnect iterations.
@@ -518,7 +518,12 @@ async fn run_session(
         loop {
             match quic::read_pty_chunk(&mut pty_recv).await {
                 Ok(Some((seq, data))) => {
-                    vlog!(verbose, 3, "[etr] pty←server seq={seq} bytes={}", data.len());
+                    vlog!(
+                        verbose,
+                        3,
+                        "[etr] pty←server seq={seq} bytes={}",
+                        data.len()
+                    );
                     {
                         let mut s = session_r.lock().await;
                         if let Some(st) = s.stream_mut(0) {
@@ -529,7 +534,10 @@ async fn run_session(
                 }
                 Ok(None) => break,
                 Err(_) => {
-                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "PTY stream closed"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "PTY stream closed",
+                    ));
                 }
             }
         }
@@ -555,7 +563,12 @@ async fn run_session(
                 st.record_send(seq, payload.clone());
                 seq
             };
-            vlog!(verbose, 3, "[etr] stdin→server seq={seq} bytes={}", payload.len());
+            vlog!(
+                verbose,
+                3,
+                "[etr] stdin→server seq={seq} bytes={}",
+                payload.len()
+            );
             if quic::write_pty_chunk(&mut pty_send, seq, &payload)
                 .await
                 .is_err()
@@ -567,29 +580,36 @@ async fn run_session(
 
     // ── Control reader task: ctrl_recv → dispatch ─────────────────────────
     let session_ctrl = Arc::clone(&session);
-    let mut ctrl_reader_task: tokio::task::JoinHandle<io::Result<()>> =
-        tokio::spawn(async move {
-            loop {
-                match quic::read_msg(&mut ctrl_recv).await {
-                    Ok(Some(env)) => match env.payload {
-                        Some(Payload::Disconnect(_)) => {
-                            return Err(io::Error::new(
-                                io::ErrorKind::ConnectionAborted,
-                                "clean disconnect from server",
-                            ));
-                        }
-                        Some(Payload::Heartbeat(hb)) => {
-                            session_ctrl.lock().await.apply_server_acks(&hb.last_received_seq);
-                            vlog!(verbose, 3, "[etr] hb←server acks={:?}", hb.last_received_seq);
-                        }
-                        _ => {}
-                    },
-                    Ok(None) => break,
-                    Err(e) => return Err(e),
-                }
+    let mut ctrl_reader_task: tokio::task::JoinHandle<io::Result<()>> = tokio::spawn(async move {
+        loop {
+            match quic::read_msg(&mut ctrl_recv).await {
+                Ok(Some(env)) => match env.payload {
+                    Some(Payload::Disconnect(_)) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            "clean disconnect from server",
+                        ));
+                    }
+                    Some(Payload::Heartbeat(hb)) => {
+                        session_ctrl
+                            .lock()
+                            .await
+                            .apply_server_acks(&hb.last_received_seq);
+                        vlog!(
+                            verbose,
+                            3,
+                            "[etr] hb←server acks={:?}",
+                            hb.last_received_seq
+                        );
+                    }
+                    _ => {}
+                },
+                Ok(None) => break,
+                Err(e) => return Err(e),
             }
-            Ok(())
-        });
+        }
+        Ok(())
+    });
 
     // ── Resize task: SIGWINCH → ctrl_send ────────────────────────────────
     // Use a channel so ctrl_send isn't shared across tasks.
@@ -611,39 +631,38 @@ async fn run_session(
 
     // ── Heartbeat + resize writer: ctrl_send ──────────────────────────────
     let session_hb = Arc::clone(&session);
-    let mut ctrl_send_task: tokio::task::JoinHandle<io::Result<()>> =
-        tokio::spawn(async move {
-            // Send initial terminal size.
-            if let Ok((cols, rows)) = crossterm::terminal::size() {
-                let env = Envelope {
-                    payload: Some(Payload::TerminalResize(TerminalResize {
-                        rows: rows as u32,
-                        cols: cols as u32,
-                    })),
-                };
-                quic::write_msg(&mut ctrl_send, &env).await?;
-            }
+    let mut ctrl_send_task: tokio::task::JoinHandle<io::Result<()>> = tokio::spawn(async move {
+        // Send initial terminal size.
+        if let Ok((cols, rows)) = crossterm::terminal::size() {
+            let env = Envelope {
+                payload: Some(Payload::TerminalResize(TerminalResize {
+                    rows: rows as u32,
+                    cols: cols as u32,
+                })),
+            };
+            quic::write_msg(&mut ctrl_send, &env).await?;
+        }
 
-            let mut hb_interval = tokio::time::interval(Duration::from_secs(5));
-            hb_interval.tick().await; // skip the immediate first tick
-            loop {
-                tokio::select! {
-                    _ = hb_interval.tick() => {
-                        let last_received_seq = session_hb.lock().await.last_received_map();
-                        vlog!(verbose, 3, "[etr] hb→server acks={last_received_seq:?}");
-                        let env = Envelope {
-                            payload: Some(Payload::Heartbeat(Heartbeat { last_received_seq })),
-                        };
-                        quic::write_msg(&mut ctrl_send, &env).await?;
-                    }
-                    Some(tr) = resize_rx.recv() => {
-                        vlog!(verbose, 3, "[etr] resize {}x{}", tr.cols, tr.rows);
-                        let env = Envelope { payload: Some(Payload::TerminalResize(tr)) };
-                        quic::write_msg(&mut ctrl_send, &env).await?;
-                    }
+        let mut hb_interval = tokio::time::interval(Duration::from_secs(5));
+        hb_interval.tick().await; // skip the immediate first tick
+        loop {
+            tokio::select! {
+                _ = hb_interval.tick() => {
+                    let last_received_seq = session_hb.lock().await.last_received_map();
+                    vlog!(verbose, 3, "[etr] hb→server acks={last_received_seq:?}");
+                    let env = Envelope {
+                        payload: Some(Payload::Heartbeat(Heartbeat { last_received_seq })),
+                    };
+                    quic::write_msg(&mut ctrl_send, &env).await?;
+                }
+                Some(tr) = resize_rx.recv() => {
+                    vlog!(verbose, 3, "[etr] resize {}x{}", tr.cols, tr.rows);
+                    let env = Envelope { payload: Some(Payload::TerminalResize(tr)) };
+                    quic::write_msg(&mut ctrl_send, &env).await?;
                 }
             }
-        });
+        }
+    });
 
     // ── Forward tasks ─────────────────────────────────────────────────────
     let mut fwd_handles = Vec::new();
@@ -651,12 +670,8 @@ async fn run_session(
         let conn2 = conn.clone();
         let spec2 = spec.clone();
         let handle = match spec.proto {
-            ForwardProto::Tcp => {
-                tokio::spawn(run_tcp_acceptor_quic(spec2, conn2, verbose))
-            }
-            ForwardProto::Udp => {
-                tokio::spawn(run_udp_forward_client_quic(spec2, conn2, verbose))
-            }
+            ForwardProto::Tcp => tokio::spawn(run_tcp_acceptor_quic(spec2, conn2, verbose)),
+            ForwardProto::Udp => tokio::spawn(run_udp_forward_client_quic(spec2, conn2, verbose)),
         };
         fwd_handles.push(handle);
     }

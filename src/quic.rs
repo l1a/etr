@@ -158,10 +158,8 @@ mod tests {
         let srv_cfg = server_config(cert.clone(), key).unwrap();
         let cli_cfg = client_config(cert).unwrap();
 
-        let server_ep =
-            quinn::Endpoint::server(srv_cfg, "127.0.0.1:0".parse().unwrap()).unwrap();
-        let mut client_ep =
-            quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_ep = quinn::Endpoint::server(srv_cfg, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let mut client_ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
         client_ep.set_default_client_config(cli_cfg);
         (server_ep, client_ep)
     }
