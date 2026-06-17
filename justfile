@@ -206,4 +206,5 @@ log:
 clean:
     -pkill -x etrs 2>/dev/null
     -tmux kill-session -t "{{TMUX_SESS}}" 2>/dev/null
+    cargo clean
     @echo "cleaned up"

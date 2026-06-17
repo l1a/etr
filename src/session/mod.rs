@@ -1,30 +1,26 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Session state: per-session bookkeeping across reconnections.
+//! Session state: per-session bookkeeping that survives QUIC reconnections.
 //!
 //! A [`SessionState`] lives for the lifetime of a logical session (potentially
-//! surviving many UDP reconnections).  It owns all [`StreamState`] instances
-//! and the AEAD cipher derived at handshake time.
+//! spanning many QUIC reconnects).  It owns all [`StreamState`] instances.
+//! QUIC provides reliable in-order delivery within a connection, so
+//! [`StreamState`] is used only for cross-connection replay, not gap detection.
 pub mod stream;
 
 pub use stream::{StreamLifecycle, StreamState};
 
 use std::collections::HashMap;
 
-use crate::crypto::AeadCipher;
 use crate::protocol::StreamType;
 
-/// Per-session state shared between the handshake and data-plane code.
+/// Per-session state shared between connection setup and data-plane code.
 pub struct SessionState {
     /// 16-byte session identifier; stable across reconnections.
     pub session_id: [u8; 16],
-    /// Passkey bootstrapped via SSH; used for hello-key derivation.
+    /// Passkey bootstrapped via SSH; used to authenticate reconnecting clients.
     pub passkey: String,
-    /// Negotiated AEAD cipher, set after the handshake completes.
-    pub cipher: Option<AeadCipher>,
     /// Per-stream state indexed by stream ID.
     pub streams: HashMap<u32, StreamState>,
-    /// Monotonically increasing packet-level sequence number (AEAD nonce).
-    pub next_packet_seq: u64,
 }
 
 impl SessionState {
@@ -33,11 +29,8 @@ impl SessionState {
         let mut state = Self {
             session_id,
             passkey,
-            cipher: None,
             streams: HashMap::new(),
-            next_packet_seq: 1,
         };
-        // Stream 0 is always the terminal.
         state
             .streams
             .insert(0, StreamState::new(0, StreamType::Terminal));
@@ -70,7 +63,12 @@ impl SessionState {
         }
     }
 
-    /// Snapshot of each stream's `next_in_seq - 1` for inclusion in handshake messages.
+    /// Snapshot of each stream's last-received seq for inclusion in handshake messages.
+    ///
+    /// The value is `next_in_seq - 1`, which equals the highest seq number the
+    /// peer has successfully delivered to us.  Returns nothing for a stream that
+    /// has received no messages yet (`next_in_seq == 1` → `last == 0`, which
+    /// tells the peer "replay everything").
     pub fn last_received_map(&self) -> HashMap<u32, u64> {
         self.streams
             .iter()
@@ -81,7 +79,7 @@ impl SessionState {
             .collect()
     }
 
-    /// Apply the server's ack map: trim each stream's send history.
+    /// Apply the peer's ack map: trim each stream's send history.
     pub fn apply_server_acks(&mut self, server_acks: &HashMap<u32, u64>) {
         for (&stream_id, &ack_seq) in server_acks {
             if let Some(s) = self.streams.get_mut(&stream_id) {
@@ -92,7 +90,7 @@ impl SessionState {
 
     /// Collect all replay packets needed after a reconnect, keyed by stream.
     ///
-    /// `peer_last_received` is the map from the peer's handshake message.
+    /// `peer_last_received` maps stream_id → highest seq the peer has seen.
     pub fn collect_replays(
         &self,
         peer_last_received: &HashMap<u32, u64>,
@@ -109,13 +107,6 @@ impl SessionState {
                 }
             })
             .collect()
-    }
-
-    /// Allocate and return the next packet-level sequence number.
-    pub fn next_packet_seq(&mut self) -> u64 {
-        let seq = self.next_packet_seq;
-        self.next_packet_seq += 1;
-        seq
     }
 }
 
@@ -168,33 +159,22 @@ mod tests {
     }
 
     #[test]
-    fn test_packet_seq_increments() {
-        let mut s = make_state();
-        assert_eq!(s.next_packet_seq(), 1);
-        assert_eq!(s.next_packet_seq(), 2);
-        assert_eq!(s.next_packet_seq(), 3);
-    }
-
-    #[test]
     fn test_close_stream_nonexistent_noop() {
         let mut s = make_state();
-        s.close_stream(99); // must not panic
+        s.close_stream(99);
         assert!(s.stream(99).is_none());
     }
 
     #[test]
     fn test_apply_server_acks_unknown_stream_ignored() {
         let mut s = make_state();
-        // Stream 5 does not exist; applying an ack for it must be a no-op.
         let acks = [(5u32, 100u64)].into();
-        s.apply_server_acks(&acks); // must not panic
+        s.apply_server_acks(&acks);
         assert!(s.stream(5).is_none());
     }
 
     #[test]
     fn test_last_received_map_nothing_received() {
-        // next_in_seq starts at 1; checked_sub(1) == Some(0), so stream 0 appears
-        // with value 0, which tells the peer to replay all history (seq > 0).
         let s = make_state();
         let map = s.last_received_map();
         assert_eq!(map[&0], 0);
@@ -203,7 +183,7 @@ mod tests {
     #[test]
     fn test_last_received_map_after_receive() {
         let mut s = make_state();
-        s.stream_mut(0).unwrap().next_in_seq = 4; // received up to seq 3
+        s.stream_mut(0).unwrap().next_in_seq = 4;
         let map = s.last_received_map();
         assert_eq!(map[&0], 3);
     }
@@ -215,7 +195,6 @@ mod tests {
         st.record_send(1, b"x".to_vec());
         st.record_send(2, b"y".to_vec());
 
-        // Peer has received nothing (empty map → last == 0 for every stream).
         let replays = s.collect_replays(&HashMap::new());
         let r = &replays[&0];
         assert_eq!(r.len(), 2);
@@ -225,7 +204,7 @@ mod tests {
 
     #[test]
     fn test_collect_replays_empty_history_omitted() {
-        let s = make_state(); // stream 0 exists but has no history
+        let s = make_state();
         let replays = s.collect_replays(&HashMap::new());
         assert!(replays.is_empty());
     }
@@ -240,7 +219,7 @@ mod tests {
     fn test_open_stream_idempotent() {
         let mut s = make_state();
         s.open_stream(2, StreamType::PortForward);
-        s.open_stream(2, StreamType::PortForward); // second call is a no-op
+        s.open_stream(2, StreamType::PortForward);
         assert!(s.streams.contains_key(&2));
         assert_eq!(s.streams.iter().filter(|(id, _)| **id == 2).count(), 1);
     }

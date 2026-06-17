@@ -3,31 +3,24 @@ use clap::{ArgAction, CommandFactory, Parser, ValueEnum};
 use clap_complete::Shell;
 use clap_complete_nushell::Nushell;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
-use std::net::SocketAddr;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::UdpSocket;
 use tokio::sync::{Mutex, mpsc};
 
 use etr::config::Config;
-use etr::crypto::{CipherSuiteId, generate_session_id};
 use etr::forward::ForwardSpec;
-use etr::protocol::{ForwardProto, StreamType};
+use etr::protocol::{
+    Envelope, ForwardProto, Heartbeat, Payload, SessionOpen, StreamOpen, TerminalResize,
+    UdpDatagram,
+};
+use etr::quic::{self, TAG_CONTROL, TAG_FORWARD, TAG_PTY};
+use etr::session::SessionState;
 
-/// Log file for verbose output — set once at startup when running interactively.
 static LOG_FILE: std::sync::OnceLock<std::sync::Mutex<std::fs::File>> = std::sync::OnceLock::new();
-
-/// Set to true when raw mode is active; suppresses stderr logging to avoid
-/// corrupting the terminal display.
 static IN_RAW_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Log at `$level`:
-/// - before raw mode: stderr (always visible) + log file (if open)
-/// - during raw mode: log file only (stderr would corrupt the display)
-/// - no log file open and not in raw mode: stderr
 macro_rules! vlog {
     ($verbose:expr, $level:expr, $($arg:tt)*) => {
         if $verbose >= $level {
@@ -53,26 +46,6 @@ fn client_log_path() -> std::path::PathBuf {
         .join("etr.log")
 }
 
-fn payload_type(p: Option<&Payload>) -> &'static str {
-    match p {
-        Some(Payload::ClientHello(_)) => "ClientHello",
-        Some(Payload::ServerHello(_)) => "ServerHello",
-        Some(Payload::StreamOpen(_)) => "StreamOpen",
-        Some(Payload::StreamClose(_)) => "StreamClose",
-        Some(Payload::StreamData(_)) => "StreamData",
-        Some(Payload::StreamAck(_)) => "StreamAck",
-        Some(Payload::TerminalResize(_)) => "TerminalResize",
-        Some(Payload::Heartbeat(_)) => "Heartbeat",
-        Some(Payload::Disconnect(_)) => "Disconnect",
-        None => "Empty",
-    }
-}
-use etr::handshake::ClientHandshake;
-use etr::protocol::{Envelope, Heartbeat, PacketHeader, Payload, StreamData, TerminalResize};
-use etr::session::SessionState;
-use etr::transport::{decode_data_packet, decode_plaintext_packet, recv_packet, send_packet};
-use prost::Message as _;
-
 #[derive(Parser, Debug)]
 #[command(
     name = "etr",
@@ -87,19 +60,13 @@ struct Cli {
     #[arg(short = 's', long)]
     ssh_port: Option<u16>,
 
-    /// Verbosity: -v connection events, -vv cipher details, -vvv packet trace
+    /// Verbosity: -v connection events, -vv QUIC details, -vvv stream trace
     #[arg(short = 'v', action = ArgAction::Count)]
     verbose: u8,
 
     /// Path to the etrs binary on the remote host (default: relies on PATH)
     #[arg(long)]
     server_path: Option<String>,
-
-    /// Cipher suite to use, in preference order (repeatable).
-    /// Available: ml-kem-1024, ml-kem-768, x25519-aes, x25519-chacha
-    /// Overrides config file. Default: all supported suites, strongest first.
-    #[arg(long = "cipher", value_name = "NAME")]
-    ciphers: Vec<String>,
 
     /// Local port forwarding (repeatable): local_port:remote_host:remote_port[/tcp|/udp]
     /// Works like ssh -L. Default protocol: tcp.
@@ -151,9 +118,6 @@ async fn main() -> io::Result<()> {
         return Ok(());
     }
 
-    // In interactive mode, route verbose logs to a file so they don't corrupt
-    // the raw-mode terminal display. Print the path once so the user knows
-    // where to look.
     if cli.verbose > 0 && io::stdin().is_terminal() {
         let log_path = client_log_path();
         if let Some(parent) = log_path.parent() {
@@ -172,7 +136,7 @@ async fn main() -> io::Result<()> {
         }
     }
 
-    let target_input = match cli.target {
+    let target = match cli.target {
         Some(t) => t,
         None => {
             let _ = Cli::command().print_help();
@@ -180,9 +144,6 @@ async fn main() -> io::Result<()> {
         }
     };
 
-    let target = target_input;
-
-    // Load config file, then apply CLI overrides.
     let cfg = Config::load();
     let ssh_port = cli
         .ssh_port
@@ -192,17 +153,6 @@ async fn main() -> io::Result<()> {
         .or(cfg.client.server_path)
         .unwrap_or_else(|| "etrs".to_string());
 
-    // Resolve cipher preference list: CLI flags > config file > compiled-in defaults.
-    let cipher_names = if !cli.ciphers.is_empty() {
-        cli.ciphers
-    } else if !cfg.client.ciphers.is_empty() {
-        cfg.client.ciphers
-    } else {
-        vec![] // empty = use CipherSuiteId::client_preference() defaults
-    };
-    let cipher_suites = resolve_ciphers(&cipher_names)?;
-
-    // Parse -L forwarding specs.
     let mut forward_specs: Vec<ForwardSpec> = Vec::new();
     for s in &cli.forward {
         match ForwardSpec::parse(s) {
@@ -228,26 +178,27 @@ async fn main() -> io::Result<()> {
         target
     );
 
-    let server_port = bootstrap_ssh(
+    let (server_port, server_cert) = bootstrap_ssh(
         &target,
         ssh_port,
         &session_id,
         &passkey,
         &term,
         &server_path,
+        cli.verbose,
     )?;
 
-    vlog!(cli.verbose, 2, "[etr] etrs bound to port {}", server_port);
+    vlog!(cli.verbose, 2, "[etr] etrs bound to port {server_port}");
 
     let session = Arc::new(Mutex::new(SessionState::new(session_id, passkey.clone())));
 
     if let Err(e) = run_connection_loop(
         target,
         server_port,
+        server_cert,
         passkey,
         session_id,
         session,
-        cipher_suites,
         forward_specs,
         cli.verbose,
     )
@@ -260,7 +211,22 @@ async fn main() -> io::Result<()> {
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
+}
+
+fn generate_session_id() -> [u8; 16] {
+    use rand::Rng;
+    rand::thread_rng().r#gen()
 }
 
 fn generate_passkey() -> String {
@@ -272,31 +238,8 @@ fn generate_passkey() -> String {
         .collect()
 }
 
-fn resolve_ciphers(names: &[String]) -> io::Result<Vec<u32>> {
-    if names.is_empty() {
-        return Ok(CipherSuiteId::client_preference());
-    }
-    let mut suites = Vec::with_capacity(names.len());
-    for name in names {
-        match CipherSuiteId::from_name(name) {
-            Some(s) => suites.push(s.as_u32()),
-            None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "unknown cipher '{}'. Valid names: {}",
-                        name,
-                        CipherSuiteId::all_short_names().join(", ")
-                    ),
-                ));
-            }
-        }
-    }
-    Ok(suites)
-}
-
-/// SSH to the target, start `etrs`, send session credentials via stdin,
-/// and read back the UDP port that `etrs` bound.
+/// SSH to the target, start `etrs`, send session credentials, and read back
+/// the QUIC port and server cert DER from etrs stdout.
 fn bootstrap_ssh(
     target: &str,
     ssh_port: u16,
@@ -304,13 +247,20 @@ fn bootstrap_ssh(
     passkey: &str,
     term: &str,
     server_path: &str,
-) -> io::Result<u16> {
+    verbose: u8,
+) -> io::Result<(u16, Vec<u8>)> {
     let session_id_hex = hex_encode(session_id);
-    let mut child = Command::new("ssh")
-        .arg("-p")
-        .arg(ssh_port.to_string())
-        .arg(target)
-        .arg(server_path)
+    let v_flag = match verbose {
+        0 => String::new(),
+        n => format!("-{}", "v".repeat(n as usize)),
+    };
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-p").arg(ssh_port.to_string()).arg(target);
+    cmd.arg(server_path);
+    if !v_flag.is_empty() {
+        cmd.arg(&v_flag);
+    }
+    let mut child = cmd
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
@@ -320,7 +270,6 @@ fn bootstrap_ssh(
         .stdin
         .take()
         .ok_or_else(|| io::Error::other("Failed to open SSH stdin pipe"))?;
-    // Format: SESSION_ID_HEX/PASSKEY/TERM  (3 fields, no reg_port)
     stdin.write_all(format!("{}/{}/{}\n", session_id_hex, passkey, term).as_bytes())?;
     stdin.flush()?;
     drop(stdin);
@@ -333,17 +282,23 @@ fn bootstrap_ssh(
         )));
     }
 
-    // Parse "PORT <number>" from etrs stdout.
+    // Parse "PORT <n> CERT <cert_hex>" from etrs stdout.
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
-        if let Some(port_str) = line.trim().strip_prefix("PORT ")
-            && let Ok(port) = port_str.trim().parse::<u16>()
-        {
-            return Ok(port);
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("PORT ") {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if parts.len() >= 3
+                && parts[1] == "CERT"
+                && let Ok(port) = parts[0].parse::<u16>()
+                && let Some(cert) = hex_decode(parts[2])
+            {
+                return Ok((port, cert));
+            }
         }
     }
     Err(io::Error::other(format!(
-        "etrs did not report a port (stdout: {:?})",
+        "etrs did not report PORT/CERT (stdout: {:?})",
         stdout.trim()
     )))
 }
@@ -352,10 +307,10 @@ fn bootstrap_ssh(
 async fn run_connection_loop(
     target: String,
     port: u16,
+    server_cert: Vec<u8>,
     passkey: String,
     session_id: [u8; 16],
     session: Arc<Mutex<SessionState>>,
-    cipher_suites: Vec<u32>,
     forward_specs: Vec<ForwardSpec>,
     verbose: u8,
 ) -> io::Result<()> {
@@ -364,16 +319,29 @@ async fn run_connection_loop(
     } else {
         &target
     };
-    let server_addr = tokio::net::lookup_host(format!("{}:{}", host, port))
+    let server_addr = tokio::net::lookup_host(format!("{host}:{port}"))
         .await?
         .next()
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("could not resolve host: {}", host),
+                format!("could not resolve host: {host}"),
             )
         })?;
 
+    // Build QUIC client endpoint + config (reused across reconnects).
+    let cert = rustls::pki_types::CertificateDer::from(server_cert);
+    let cli_cfg = quic::client_config(cert)?;
+    let bind_addr = if server_addr.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    let mut endpoint = quinn::Endpoint::client(bind_addr.parse().unwrap())
+        .map_err(io::Error::other)?;
+    endpoint.set_default_client_config(cli_cfg);
+
+    // Single stdin reader shared across all reconnect iterations.
     let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>(1000);
     let stdin_rx = Arc::new(Mutex::new(stdin_rx));
 
@@ -393,97 +361,41 @@ async fn run_connection_loop(
     let mut first = true;
     loop {
         if !first {
-            vlog!(verbose, 1, "\r\n[etr] Reconnecting to {}...", server_addr);
+            vlog!(verbose, 1, "\r\n[etr] Reconnecting to {server_addr}...");
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
         first = false;
 
-        let bind_addr = if server_addr.is_ipv6() {
-            "[::]:0"
-        } else {
-            "0.0.0.0:0"
-        };
-        let socket = match UdpSocket::bind(bind_addr).await {
-            Ok(s) => Arc::new(s),
-            Err(e) => {
-                eprintln!("[etr] Bind error: {:?}", e);
-                continue;
-            }
-        };
-
-        let last_received = {
-            let s = session.lock().await;
-            s.last_received_map()
-        };
-
         vlog!(
             verbose,
             2,
-            "[etr] Sending ClientHello  session={} suites={:?}",
-            hex_encode(&session_id),
-            cipher_suites
-        );
-
-        let (hs, hello_header, hello_envelope) = ClientHandshake::reconnect(
-            session_id,
-            passkey.clone(),
-            last_received,
-            cipher_suites.clone(),
-        );
-
-        if let Err(e) =
-            send_packet(&socket, server_addr, &hello_header, &hello_envelope, None).await
-        {
-            vlog!(verbose, 1, "[etr] Failed to send ClientHello: {:?}", e);
-            continue;
-        }
-
-        // Wait for ServerHello (with timeout).
-        let pkt = match tokio::time::timeout(Duration::from_secs(10), recv_packet(&socket)).await {
-            Ok(Ok(Some(p))) => p,
-            _ => {
-                vlog!(verbose, 1, "[etr] ServerHello timeout");
-                continue;
-            }
-        };
-
-        if !pkt.header.is_handshake() || pkt.header.session_id != session_id {
-            continue;
-        }
-
-        let (cipher, suite, server_acks) = match hs.process_server_hello(&pkt.payload_bytes) {
-            Ok(r) => r,
-            Err(e) => {
-                vlog!(verbose, 1, "[etr] Handshake failed: {}", e);
-                continue;
-            }
-        };
-
-        vlog!(
-            verbose,
-            2,
-            "[etr] Handshake complete  suite={}  session={}",
-            suite,
+            "[etr] Connecting  session={}",
             hex_encode(&session_id)
         );
 
-        let cipher = Arc::new(cipher);
+        let conn = match endpoint.connect(server_addr, "etr") {
+            Ok(c) => c,
+            Err(e) => {
+                vlog!(verbose, 1, "[etr] Connect error: {e}");
+                continue;
+            }
+        };
+        let conn = match conn.await {
+            Ok(c) => c,
+            Err(e) => {
+                vlog!(verbose, 1, "[etr] QUIC handshake failed: {e}");
+                continue;
+            }
+        };
 
-        vlog!(verbose, 1, "\r\n[etr] Connected. Session active.");
-
-        {
-            let mut s = session.lock().await;
-            s.apply_server_acks(&server_acks);
-            s.cipher = None; // replaced below per-connection
-        }
+        vlog!(verbose, 2, "[etr] QUIC connected to {server_addr}");
 
         enable_raw_mode().unwrap();
         IN_RAW_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
         let result = run_session(
-            socket,
-            server_addr,
+            conn,
             session_id,
-            Arc::clone(&cipher),
+            passkey.clone(),
             Arc::clone(&session),
             Arc::clone(&stdin_rx),
             forward_specs.clone(),
@@ -503,131 +415,127 @@ async fn run_connection_loop(
                 std::process::exit(0);
             }
             Err(e) => {
-                vlog!(verbose, 1, "[etr] Session dropped: {:?}", e);
+                vlog!(verbose, 1, "[etr] Session dropped: {e:?}");
             }
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_session(
-    socket: Arc<UdpSocket>,
-    server_addr: SocketAddr,
+    conn: quinn::Connection,
     session_id: [u8; 16],
-    cipher: Arc<etr::crypto::AeadCipher>,
+    passkey: String,
     session: Arc<Mutex<SessionState>>,
     stdin_rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
     forward_specs: Vec<ForwardSpec>,
     verbose: u8,
 ) -> io::Result<()> {
-    let (send_tx, mut send_rx) = mpsc::channel::<Envelope>(1000);
+    // ── Open control stream ───────────────────────────────────────────────
+    let (mut ctrl_send, mut ctrl_recv) = conn.open_bi().await.map_err(io::Error::other)?;
+    ctrl_send
+        .write_all(&[TAG_CONTROL])
+        .await
+        .map_err(io::Error::other)?;
 
-    // Replay any unacknowledged outbound data (terminal stream only).
+    let last_received = {
+        let s = session.lock().await;
+        s.last_received_map()
+    };
+
+    let session_open = Envelope {
+        payload: Some(Payload::SessionOpen(SessionOpen {
+            session_id: session_id.to_vec(),
+            passkey: passkey.clone(),
+            last_received_seq: last_received,
+        })),
+    };
+    quic::write_msg(&mut ctrl_send, &session_open).await?;
+
+    // Read SessionAccept.
+    let server_acks = match quic::read_msg(&mut ctrl_recv).await? {
+        Some(env) => match env.payload {
+            Some(Payload::SessionAccept(sa)) => sa.last_received_seq,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "expected SessionAccept",
+                ));
+            }
+        },
+        None => {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "control stream closed before SessionAccept",
+            ));
+        }
+    };
+
+    vlog!(verbose, 1, "\r\n[etr] Connected. Session active.");
+
+    // Trim send history using server's ack map.
+    {
+        let mut s = session.lock().await;
+        s.apply_server_acks(&server_acks);
+    }
+
+    // ── Open PTY stream ───────────────────────────────────────────────────
+    let (mut pty_send, mut pty_recv) = conn.open_bi().await.map_err(io::Error::other)?;
+    pty_send
+        .write_all(&[TAG_PTY])
+        .await
+        .map_err(io::Error::other)?;
+
+    // Replay any unacknowledged stdin the server hasn't seen.
     {
         let s = session.lock().await;
-        let peer_acks: HashMap<u32, u64> = HashMap::new();
-        for (stream_id, replays) in s.collect_replays(&peer_acks) {
-            for (seq, data) in replays {
-                let _ = send_tx
-                    .send(Envelope {
-                        payload: Some(Payload::StreamData(StreamData {
-                            stream_id,
-                            seq_num: seq,
-                            data,
-                            ..Default::default()
-                        })),
-                    })
-                    .await;
+        let replays = s.collect_replays(&server_acks);
+        if let Some(stream0_replays) = replays.get(&0) {
+            for (seq, data) in stream0_replays {
+                quic::write_pty_chunk(&mut pty_send, *seq, data).await?;
             }
         }
     }
 
-    // Map from stream_id → channel for data arriving from the server for that forward stream.
-    let forward_sinks: Arc<Mutex<HashMap<u32, mpsc::Sender<StreamData>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-
-    // Shared stream-ID counter; stream 0 is reserved for the terminal.
-    let next_stream_id = Arc::new(std::sync::atomic::AtomicU32::new(1));
-
-    // Launch a task for each -L spec.
-    let mut fwd_task_handles = Vec::new();
-    for spec in &forward_specs {
-        match spec.proto {
-            ForwardProto::Tcp => {
-                let handle = tokio::spawn(run_tcp_acceptor(
-                    spec.clone(),
-                    send_tx.clone(),
-                    Arc::clone(&forward_sinks),
-                    Arc::clone(&next_stream_id),
-                    verbose,
-                ));
-                fwd_task_handles.push(handle);
+    // ── stdout writer task ────────────────────────────────────────────────
+    let (stdout_tx, mut stdout_rx) = mpsc::channel::<Vec<u8>>(512);
+    let mut stdout_task = tokio::spawn(async move {
+        use std::io::BufWriter;
+        let mut out = BufWriter::with_capacity(256 * 1024, io::stdout());
+        while let Some(data) = stdout_rx.recv().await {
+            let _ = out.write_all(&data);
+            while let Ok(more) = stdout_rx.try_recv() {
+                let _ = out.write_all(&more);
             }
-            ForwardProto::Udp => {
-                let stream_id = next_stream_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let (fwd_tx, fwd_rx) = mpsc::channel::<StreamData>(256);
-                forward_sinks.lock().await.insert(stream_id, fwd_tx);
-                let _ = send_tx
-                    .send(Envelope {
-                        payload: Some(Payload::StreamOpen(etr::protocol::StreamOpen {
-                            stream_id,
-                            stream_type: StreamType::PortForward as i32,
-                            remote_host: spec.remote_host.clone(),
-                            remote_port: spec.remote_port as u32,
-                            forward_proto: ForwardProto::Udp as i32,
-                        })),
-                    })
-                    .await;
-                let handle = tokio::spawn(run_udp_forward_client(
-                    spec.clone(),
-                    stream_id,
-                    send_tx.clone(),
-                    fwd_rx,
-                    verbose,
-                ));
-                fwd_task_handles.push(handle);
-            }
-        }
-    }
-
-    // Send current terminal size.
-    if let Ok((cols, rows)) = crossterm::terminal::size() {
-        let _ = send_tx
-            .send(Envelope {
-                payload: Some(Payload::TerminalResize(TerminalResize {
-                    rows: rows as u32,
-                    cols: cols as u32,
-                })),
-            })
-            .await;
-    }
-
-    // Task: write outbound packets to the socket.
-    let socket_w = Arc::clone(&socket);
-    let cipher_w = Arc::clone(&cipher);
-    let session_w = Arc::clone(&session);
-    let mut writer_task = tokio::spawn(async move {
-        while let Some(envelope) = send_rx.recv().await {
-            let seq = {
-                let mut s = session_w.lock().await;
-                s.next_packet_seq()
-            };
-            let header = PacketHeader::new(0, session_id, seq);
-            vlog!(
-                verbose,
-                3,
-                "[etr] → {} seq={} {}b",
-                payload_type(envelope.payload.as_ref()),
-                seq,
-                envelope.encoded_len()
-            );
-            let _ = send_packet(&socket_w, server_addr, &header, &envelope, Some(&cipher_w)).await;
+            let _ = out.flush();
         }
     });
 
-    // Task: forward stdin to the server as StreamData on stream 0.
+    // ── PTY recv task: QUIC PTY recv → stdout ────────────────────────────
+    let session_r = Arc::clone(&session);
+    let stdout_tx2 = stdout_tx.clone();
+    let mut pty_recv_task = tokio::spawn(async move {
+        loop {
+            match quic::read_pty_chunk(&mut pty_recv).await {
+                Ok(Some((seq, data))) => {
+                    {
+                        let mut s = session_r.lock().await;
+                        if let Some(st) = s.stream_mut(0) {
+                            st.next_in_seq = seq + 1;
+                        }
+                    }
+                    let _ = stdout_tx2.try_send(data);
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "PTY stream closed"));
+                }
+            }
+        }
+        Ok(())
+    });
+
+    // ── stdin task: stdin → QUIC PTY send ────────────────────────────────
     let session_stdin = Arc::clone(&session);
-    let send_tx_stdin = send_tx.clone();
     let mut stdin_task = tokio::spawn(async move {
         loop {
             let payload = {
@@ -645,124 +553,7 @@ async fn run_session(
                 st.record_send(seq, payload.clone());
                 seq
             };
-            let _ = send_tx_stdin
-                .send(Envelope {
-                    payload: Some(Payload::StreamData(StreamData {
-                        stream_id: 0,
-                        seq_num: seq,
-                        data: payload,
-                        ..Default::default()
-                    })),
-                })
-                .await;
-        }
-    });
-
-    // Task: receive packets from the server and dispatch them.
-    let socket_r = Arc::clone(&socket);
-    let cipher_r = Arc::clone(&cipher);
-    let session_r = Arc::clone(&session);
-    let fwd_sinks_r = Arc::clone(&forward_sinks);
-    let mut reader_task = tokio::spawn(async move {
-        let mut stdout = io::stdout();
-        loop {
-            let pkt =
-                match tokio::time::timeout(Duration::from_secs(15), recv_packet(&socket_r)).await {
-                    Ok(Ok(Some(p))) => p,
-                    Ok(Ok(None)) => continue,
-                    Ok(Err(e)) => return Err(e),
-                    Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "idle timeout")),
-                };
-
-            if pkt.header.session_id != session_id {
-                continue;
-            }
-
-            let envelope = if pkt.header.is_handshake() {
-                decode_plaintext_packet(&pkt.payload_bytes)?
-            } else {
-                decode_data_packet(&pkt.payload_bytes, pkt.header.packet_seq, &cipher_r)?
-            };
-
-            vlog!(
-                verbose,
-                3,
-                "[etr] ← {} seq={} {}b",
-                payload_type(envelope.payload.as_ref()),
-                pkt.header.packet_seq,
-                pkt.payload_bytes.len()
-            );
-
-            match envelope.payload {
-                Some(Payload::StreamData(sd)) if sd.stream_id == 0 => {
-                    let expected = {
-                        let s = session_r.lock().await;
-                        s.stream(0).map(|st| st.next_in_seq).unwrap_or(1)
-                    };
-                    if sd.seq_num == expected {
-                        let _ = stdout.write_all(&sd.data);
-                        let _ = stdout.flush();
-                        let mut s = session_r.lock().await;
-                        if let Some(st) = s.stream_mut(0) {
-                            st.next_in_seq += 1;
-                        }
-                    }
-                }
-                Some(Payload::StreamData(sd)) => {
-                    // Route to the appropriate forward-stream handler.
-                    if let Some(tx) = fwd_sinks_r.lock().await.get(&sd.stream_id) {
-                        let _ = tx.send(sd).await;
-                    }
-                }
-                Some(Payload::StreamClose(sc)) if sc.stream_id != 0 => {
-                    fwd_sinks_r.lock().await.remove(&sc.stream_id);
-                }
-                Some(Payload::Disconnect(_)) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::ConnectionAborted,
-                        "clean disconnect from server",
-                    ));
-                }
-                Some(Payload::Heartbeat(_)) => {
-                    vlog!(verbose, 3, "[etr] ← heartbeat");
-                }
-                _ => {}
-            }
-        }
-    });
-
-    // Task: send SIGWINCH resize events.
-    let send_tx_resize = send_tx.clone();
-    let mut resize_task = tokio::spawn(async move {
-        use tokio::signal::unix::{SignalKind, signal};
-        if let Ok(mut sigwinch) = signal(SignalKind::window_change()) {
-            while sigwinch.recv().await.is_some() {
-                if let Ok((cols, rows)) = crossterm::terminal::size() {
-                    let _ = send_tx_resize
-                        .send(Envelope {
-                            payload: Some(Payload::TerminalResize(TerminalResize {
-                                rows: rows as u32,
-                                cols: cols as u32,
-                            })),
-                        })
-                        .await;
-                }
-            }
-        }
-    });
-
-    // Task: heartbeats every 5 s.
-    let send_tx_hb = send_tx.clone();
-    let mut hb_task = tokio::spawn(async move {
-        let mut hb_count: u64 = 0;
-        loop {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            hb_count += 1;
-            vlog!(verbose, 3, "[etr] → heartbeat #{}", hb_count);
-            if send_tx_hb
-                .send(Envelope {
-                    payload: Some(Payload::Heartbeat(Heartbeat {})),
-                })
+            if quic::write_pty_chunk(&mut pty_send, seq, &payload)
                 .await
                 .is_err()
             {
@@ -771,44 +562,125 @@ async fn run_session(
         }
     });
 
+    // ── Control reader task: ctrl_recv → dispatch ─────────────────────────
+    let mut ctrl_reader_task: tokio::task::JoinHandle<io::Result<()>> =
+        tokio::spawn(async move {
+            loop {
+                match quic::read_msg(&mut ctrl_recv).await {
+                    Ok(Some(env)) => match env.payload {
+                        Some(Payload::Disconnect(_)) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::ConnectionAborted,
+                                "clean disconnect from server",
+                            ));
+                        }
+                        Some(Payload::Heartbeat(_)) => {}
+                        _ => {}
+                    },
+                    Ok(None) => break,
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(())
+        });
+
+    // ── Resize task: SIGWINCH → ctrl_send ────────────────────────────────
+    // Use a channel so ctrl_send isn't shared across tasks.
+    let (resize_tx, mut resize_rx) = mpsc::channel::<TerminalResize>(4);
+
+    let mut sigwinch_task = tokio::spawn(async move {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let Ok(mut sigwinch) = signal(SignalKind::window_change()) {
+            while sigwinch.recv().await.is_some() {
+                if let Ok((cols, rows)) = crossterm::terminal::size() {
+                    let _ = resize_tx.try_send(TerminalResize {
+                        rows: rows as u32,
+                        cols: cols as u32,
+                    });
+                }
+            }
+        }
+    });
+
+    // ── Heartbeat + resize writer: ctrl_send ──────────────────────────────
+    let mut ctrl_send_task: tokio::task::JoinHandle<io::Result<()>> =
+        tokio::spawn(async move {
+            // Send initial terminal size.
+            if let Ok((cols, rows)) = crossterm::terminal::size() {
+                let env = Envelope {
+                    payload: Some(Payload::TerminalResize(TerminalResize {
+                        rows: rows as u32,
+                        cols: cols as u32,
+                    })),
+                };
+                quic::write_msg(&mut ctrl_send, &env).await?;
+            }
+
+            let mut hb_interval = tokio::time::interval(Duration::from_secs(5));
+            hb_interval.tick().await; // skip the immediate first tick
+            loop {
+                tokio::select! {
+                    _ = hb_interval.tick() => {
+                        let env = Envelope { payload: Some(Payload::Heartbeat(Heartbeat {})) };
+                        quic::write_msg(&mut ctrl_send, &env).await?;
+                    }
+                    Some(tr) = resize_rx.recv() => {
+                        let env = Envelope { payload: Some(Payload::TerminalResize(tr)) };
+                        quic::write_msg(&mut ctrl_send, &env).await?;
+                    }
+                }
+            }
+        });
+
+    // ── Forward tasks ─────────────────────────────────────────────────────
+    let mut fwd_handles = Vec::new();
+    for spec in &forward_specs {
+        let conn2 = conn.clone();
+        let spec2 = spec.clone();
+        let handle = match spec.proto {
+            ForwardProto::Tcp => {
+                tokio::spawn(run_tcp_acceptor_quic(spec2, conn2, verbose))
+            }
+            ForwardProto::Udp => {
+                tokio::spawn(run_udp_forward_client_quic(spec2, conn2, verbose))
+            }
+        };
+        fwd_handles.push(handle);
+    }
+
+    // ── Wait for any task to complete ─────────────────────────────────────
     let result = tokio::select! {
-        _ = &mut writer_task  => Ok(()),
-        _ = &mut stdin_task   => Ok(()),
-        r = &mut reader_task  => r.unwrap_or_else(|e| Err(io::Error::other(e.to_string()))),
-        _ = &mut resize_task  => Ok(()),
-        _ = &mut hb_task      => Ok(()),
+        r = &mut ctrl_reader_task => r.unwrap_or_else(|e| Err(io::Error::other(e.to_string()))),
+        _ = &mut stdin_task        => Ok(()),
+        r = &mut pty_recv_task     => r.unwrap_or_else(|e| Err(io::Error::other(e.to_string()))),
+        _ = &mut ctrl_send_task    => Ok(()),
+        _ = &mut sigwinch_task     => Ok(()),
+        _ = &mut stdout_task       => Ok(()),
     };
 
-    writer_task.abort();
+    ctrl_reader_task.abort();
     stdin_task.abort();
-    reader_task.abort();
-    resize_task.abort();
-    hb_task.abort();
-    for h in fwd_task_handles {
+    pty_recv_task.abort();
+    ctrl_send_task.abort();
+    sigwinch_task.abort();
+    stdout_task.abort();
+    for h in fwd_handles {
         h.abort();
     }
 
     result
 }
 
-// ── Port-forward helpers (client side) ───────────────────────────────────────
+// ── Forward helpers (client side) ────────────────────────────────────────────
 
-/// Listen on `spec.local_port` for TCP connections; open a new stream per connection.
-async fn run_tcp_acceptor(
-    spec: ForwardSpec,
-    send_tx: mpsc::Sender<Envelope>,
-    forward_sinks: Arc<Mutex<HashMap<u32, mpsc::Sender<StreamData>>>>,
-    next_stream_id: Arc<std::sync::atomic::AtomicU32>,
-    verbose: u8,
-) {
+/// Accept local TCP connections and open a QUIC forward stream per connection.
+async fn run_tcp_acceptor_quic(spec: ForwardSpec, conn: quinn::Connection, verbose: u8) {
     use tokio::net::TcpListener;
+
     let listener = match TcpListener::bind(format!("127.0.0.1:{}", spec.local_port)).await {
         Ok(l) => l,
         Err(e) => {
-            eprintln!(
-                "[etr] cannot bind TCP listener on port {}: {e}",
-                spec.local_port
-            );
+            eprintln!("[etr] cannot bind TCP port {}: {e}", spec.local_port);
             return;
         }
     };
@@ -820,137 +692,100 @@ async fn run_tcp_acceptor(
         spec.remote_host,
         spec.remote_port
     );
+
     loop {
-        match listener.accept().await {
-            Ok((stream, peer)) => {
-                let stream_id = next_stream_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                vlog!(
-                    verbose,
-                    2,
-                    "[etr] TCP connect from {peer} → stream {stream_id}"
-                );
-                let (fwd_tx, fwd_rx) = mpsc::channel::<StreamData>(256);
-                forward_sinks.lock().await.insert(stream_id, fwd_tx);
-                let _ = send_tx
-                    .send(Envelope {
-                        payload: Some(Payload::StreamOpen(etr::protocol::StreamOpen {
-                            stream_id,
-                            stream_type: StreamType::PortForward as i32,
-                            remote_host: spec.remote_host.clone(),
-                            remote_port: spec.remote_port as u32,
-                            forward_proto: ForwardProto::Tcp as i32,
-                        })),
-                    })
-                    .await;
-                tokio::spawn(run_tcp_connection(
-                    stream,
-                    stream_id,
-                    send_tx.clone(),
-                    fwd_rx,
-                    Arc::clone(&forward_sinks),
-                    verbose,
-                ));
-            }
+        let (tcp_stream, peer) = match listener.accept().await {
+            Ok(s) => s,
             Err(e) => {
                 vlog!(verbose, 1, "[etr] TCP accept error: {e}");
                 break;
             }
-        }
+        };
+        vlog!(verbose, 2, "[etr] TCP connect from {peer}");
+
+        let conn2 = conn.clone();
+        let spec2 = spec.clone();
+        tokio::spawn(async move {
+            let (mut quic_send, quic_recv) = match conn2.open_bi().await {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let so = Envelope {
+                payload: Some(Payload::StreamOpen(StreamOpen {
+                    stream_id: 0,
+                    stream_type: etr::protocol::StreamType::PortForward as i32,
+                    remote_host: spec2.remote_host.clone(),
+                    remote_port: spec2.remote_port as u32,
+                    forward_proto: ForwardProto::Tcp as i32,
+                })),
+            };
+            if quic_send.write_all(&[TAG_FORWARD]).await.is_err() {
+                return;
+            }
+            if quic::write_msg(&mut quic_send, &so).await.is_err() {
+                return;
+            }
+            run_tcp_connection_quic(tcp_stream, quic_send, quic_recv).await;
+        });
     }
 }
 
-/// Pipe one TCP connection ↔ one port-forward stream.
-async fn run_tcp_connection(
+/// Pipe one TCP connection ↔ one QUIC forward stream.
+async fn run_tcp_connection_quic(
     stream: tokio::net::TcpStream,
-    stream_id: u32,
-    send_tx: mpsc::Sender<Envelope>,
-    mut fwd_rx: mpsc::Receiver<StreamData>,
-    forward_sinks: Arc<Mutex<HashMap<u32, mpsc::Sender<StreamData>>>>,
-    verbose: u8,
+    mut quic_send: quinn::SendStream,
+    mut quic_recv: quinn::RecvStream,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let (mut tcp_rx, mut tcp_tx) = stream.into_split();
-    let mut seq: u64 = 1;
+    let (mut tcp_r, mut tcp_w) = stream.into_split();
 
-    // TCP → StreamData
-    let send_tx2 = send_tx.clone();
-    let mut reader = tokio::spawn(async move {
+    let mut t1 = tokio::spawn(async move {
         let mut buf = vec![0u8; 8192];
         loop {
-            match tcp_rx.read(&mut buf).await {
+            match tcp_r.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    let data = buf[..n].to_vec();
-                    let sn = seq;
-                    seq += 1;
-                    if send_tx2
-                        .send(Envelope {
-                            payload: Some(Payload::StreamData(StreamData {
-                                stream_id,
-                                seq_num: sn,
-                                data,
-                                ..Default::default()
-                            })),
-                        })
-                        .await
-                        .is_err()
-                    {
+                    if quic_send.write_all(&buf[..n]).await.is_err() {
                         break;
                     }
                 }
             }
         }
-        // TCP closed: tell the server.
-        let _ = send_tx2
-            .send(Envelope {
-                payload: Some(Payload::StreamClose(etr::protocol::StreamClose {
-                    stream_id,
-                    error_code: 0,
-                })),
-            })
-            .await;
+        let _ = quic_send.finish();
     });
 
-    // StreamData → TCP
-    let mut writer = tokio::spawn(async move {
-        while let Some(sd) = fwd_rx.recv().await {
-            if tcp_tx.write_all(&sd.data).await.is_err() {
-                break;
+    let mut t2 = tokio::spawn(async move {
+        let mut buf = vec![0u8; 8192];
+        loop {
+            match quic_recv.read(&mut buf).await {
+                Ok(None) | Err(_) => break,
+                Ok(Some(0)) => continue,
+                Ok(Some(n)) => {
+                    if tcp_w.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
             }
         }
-        let _ = tcp_tx.shutdown().await;
+        let _ = tcp_w.shutdown().await;
     });
 
     tokio::select! {
-        _ = &mut reader => {}
-        _ = &mut writer => {}
+        _ = &mut t1 => {}
+        _ = &mut t2 => {}
     }
-    reader.abort();
-    writer.abort();
-    forward_sinks.lock().await.remove(&stream_id);
-    vlog!(verbose, 2, "[etr] TCP stream {stream_id} closed");
+    t1.abort();
+    t2.abort();
 }
 
-/// Shared-socket UDP forward: one stream, many local senders.
-///
-/// Each datagram from a local sender is forwarded to the server with the
-/// sender's address embedded in `StreamData.peer_addr/peer_port`.  The server
-/// echoes those fields back in replies so we can route them to the right sender.
-async fn run_udp_forward_client(
-    spec: ForwardSpec,
-    stream_id: u32,
-    send_tx: mpsc::Sender<Envelope>,
-    mut fwd_rx: mpsc::Receiver<StreamData>,
-    verbose: u8,
-) {
-    use tokio::net::UdpSocket as TUdp;
-    let local_socket = match TUdp::bind(format!("0.0.0.0:{}", spec.local_port)).await {
+/// Open one QUIC forward stream for a UDP `-L` spec; pipe local datagrams through it.
+async fn run_udp_forward_client_quic(spec: ForwardSpec, conn: quinn::Connection, verbose: u8) {
+    use tokio::net::UdpSocket;
+
+    let local_socket = match UdpSocket::bind(format!("0.0.0.0:{}", spec.local_port)).await {
         Ok(s) => Arc::new(s),
         Err(e) => {
-            eprintln!(
-                "[etr] cannot bind UDP socket on port {}: {e}",
-                spec.local_port
-            );
+            eprintln!("[etr] cannot bind UDP port {}: {e}", spec.local_port);
             return;
         }
     };
@@ -963,36 +798,58 @@ async fn run_udp_forward_client(
         spec.remote_port
     );
 
-    let local_socket2 = Arc::clone(&local_socket);
-    let send_tx2 = send_tx.clone();
+    let (mut quic_send, mut quic_recv) = match conn.open_bi().await {
+        Ok(s) => s,
+        Err(e) => {
+            vlog!(verbose, 1, "[etr] open_bi error for UDP forward: {e}");
+            return;
+        }
+    };
 
-    // Local UDP datagrams → StreamData (with embedded sender addr).
+    let so = Envelope {
+        payload: Some(Payload::StreamOpen(StreamOpen {
+            stream_id: 0,
+            stream_type: etr::protocol::StreamType::PortForward as i32,
+            remote_host: spec.remote_host.clone(),
+            remote_port: spec.remote_port as u32,
+            forward_proto: ForwardProto::Udp as i32,
+        })),
+    };
+    if quic_send.write_all(&[TAG_FORWARD]).await.is_err() {
+        return;
+    }
+    if quic::write_msg(&mut quic_send, &so).await.is_err() {
+        return;
+    }
+
+    let local_socket2 = Arc::clone(&local_socket);
+
+    // Local UDP datagrams → QUIC (as UdpDatagram envelopes).
     let mut dgram_in = tokio::spawn(async move {
         let mut buf = vec![0u8; 65535];
-        let mut seq: u64 = 1;
         while let Ok((n, src)) = local_socket2.recv_from(&mut buf).await {
-            let sn = seq;
-            seq += 1;
-            let _ = send_tx2
-                .send(Envelope {
-                    payload: Some(Payload::StreamData(StreamData {
-                        stream_id,
-                        seq_num: sn,
-                        data: buf[..n].to_vec(),
-                        peer_addr: src.ip().to_string(),
-                        peer_port: src.port() as u32,
-                    })),
-                })
-                .await;
+            let env = Envelope {
+                payload: Some(Payload::UdpDatagram(UdpDatagram {
+                    peer_addr: src.ip().to_string(),
+                    peer_port: src.port() as u32,
+                    data: buf[..n].to_vec(),
+                })),
+            };
+            if quic::write_msg(&mut quic_send, &env).await.is_err() {
+                break;
+            }
         }
     });
 
-    // StreamData from server → local UDP sender (using embedded peer addr).
+    // QUIC (UdpDatagram envelopes) → local UDP senders.
     let mut dgram_out = tokio::spawn(async move {
-        while let Some(sd) = fwd_rx.recv().await {
-            if !sd.peer_addr.is_empty() && sd.peer_port > 0 {
-                let dest = format!("{}:{}", sd.peer_addr, sd.peer_port);
-                let _ = local_socket.send_to(&sd.data, &dest).await;
+        while let Ok(Some(env)) = quic::read_msg(&mut quic_recv).await {
+            if let Some(Payload::UdpDatagram(dg)) = env.payload
+                && !dg.peer_addr.is_empty()
+                && dg.peer_port > 0
+            {
+                let dest = format!("{}:{}", dg.peer_addr, dg.peer_port);
+                let _ = local_socket.send_to(&dg.data, &dest).await;
             }
         }
     });
@@ -1003,7 +860,6 @@ async fn run_udp_forward_client(
     }
     dgram_in.abort();
     dgram_out.abort();
-    vlog!(verbose, 2, "[etr] UDP stream {stream_id} closed");
 }
 
 #[cfg(test)]
@@ -1051,50 +907,9 @@ mod tests {
     }
 
     #[test]
-    fn test_cipher_flag_single() {
-        let cli = Cli::try_parse_from(["etr", "--cipher", "x25519-aes", "host"]).unwrap();
-        assert_eq!(cli.ciphers, vec!["x25519-aes"]);
-    }
-
-    #[test]
-    fn test_cipher_flag_multiple() {
-        let cli = Cli::try_parse_from([
-            "etr",
-            "--cipher",
-            "ml-kem-1024",
-            "--cipher",
-            "x25519-chacha",
-            "host",
-        ])
-        .unwrap();
-        assert_eq!(cli.ciphers, vec!["ml-kem-1024", "x25519-chacha"]);
-    }
-
-    #[test]
-    fn test_cipher_flag_default_is_empty() {
-        let cli = Cli::try_parse_from(["etr", "host"]).unwrap();
-        assert!(cli.ciphers.is_empty());
-    }
-
-    #[test]
-    fn test_resolve_ciphers_empty_returns_defaults() {
-        let suites = resolve_ciphers(&[]).unwrap();
-        assert!(!suites.is_empty());
-        assert_eq!(suites, CipherSuiteId::client_preference());
-    }
-
-    #[test]
-    fn test_resolve_ciphers_valid_names() {
-        let suites =
-            resolve_ciphers(&["x25519-aes".to_string(), "x25519-chacha".to_string()]).unwrap();
-        assert_eq!(suites, vec![3u32, 4u32]);
-    }
-
-    #[test]
-    fn test_resolve_ciphers_unknown_name_errors() {
-        let result = resolve_ciphers(&["not-a-cipher".to_string()]);
+    fn test_no_cipher_flag() {
+        // --cipher is removed; the parser should have no such argument.
+        let result = Cli::try_parse_from(["etr", "--cipher", "x25519-aes", "host"]);
         assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("not-a-cipher"));
     }
 }
