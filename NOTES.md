@@ -234,7 +234,7 @@ just install-release  # copies target/release/{etr,etrs} to ~/.cargo/bin
 
 # Code quality gate (run before pushing)
 just check            # cargo fmt --check + cargo clippy -D warnings
-just test             # cargo test (57 tests as of this writing)
+just test             # cargo test (57 tests)
 ```
 
 ---
