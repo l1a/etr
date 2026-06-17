@@ -500,6 +500,7 @@ async fn handle_connection(
     // ── PTY output writer: ob_rx → QUIC PTY send stream ──────────────────
     let mut pty_writer_task = tokio::spawn(async move {
         while let Some((seq, data)) = pty_ob_rx.recv().await {
+            vlog!(3, "[etrs] pty→client seq={seq} bytes={}", data.len());
             if quic::write_pty_chunk(&mut pty_send, seq, &data).await.is_err() {
                 break;
             }
@@ -511,6 +512,7 @@ async fn handle_connection(
     let pty_in_tx2 = pty_in_tx.clone();
     let mut pty_reader_task = tokio::spawn(async move {
         while let Ok(Some((seq, data))) = quic::read_pty_chunk(&mut pty_recv).await {
+            vlog!(3, "[etrs] pty←client seq={seq} bytes={}", data.len());
             {
                 let mut s = session_r.lock().await;
                 if let Some(st) = s.stream_mut(0) {
@@ -525,6 +527,9 @@ async fn handle_connection(
     let mut ctrl_writer_task = tokio::spawn(async move {
         while let Some(env) = ctrl_ob_rx.recv().await {
             let is_disconnect = matches!(env.payload, Some(Payload::Disconnect(_)));
+            if let Some(Payload::Heartbeat(ref hb)) = env.payload {
+                vlog!(3, "[etrs] hb→client acks={:?}", hb.last_received_seq);
+            }
             let _ = quic::write_msg(&mut ctrl_send, &env).await;
             if is_disconnect {
                 break;
@@ -534,6 +539,7 @@ async fn handle_connection(
 
     // ── Control reader: QUIC ctrl recv stream → dispatch ─────────────────
     let master_r = Arc::clone(&master);
+    let session_ctrl = Arc::clone(&session_state);
     let mut ctrl_reader_task = tokio::spawn(async move {
         loop {
             match quic::read_msg(&mut ctrl_recv).await {
@@ -549,7 +555,10 @@ async fn handle_connection(
                         vlog!(3, "[etrs] resize {}x{}", tr.cols, tr.rows);
                     }
                     Some(Payload::Disconnect(_)) => return true,
-                    Some(Payload::Heartbeat(_)) => {}
+                    Some(Payload::Heartbeat(hb)) => {
+                        session_ctrl.lock().await.apply_server_acks(&hb.last_received_seq);
+                        vlog!(3, "[etrs] hb←client acks={:?}", hb.last_received_seq);
+                    }
                     _ => {}
                 },
                 _ => return false,
@@ -559,13 +568,15 @@ async fn handle_connection(
 
     // ── Heartbeat task ────────────────────────────────────────────────────
     let hb_ctrl_tx = ctrl_ob_tx.clone();
+    let session_hb = Arc::clone(&session_state);
     let mut hb_task = tokio::spawn(async move {
         use etr::protocol::Heartbeat;
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
+            let last_received_seq = session_hb.lock().await.last_received_map();
             if hb_ctrl_tx
                 .send(Envelope {
-                    payload: Some(Payload::Heartbeat(Heartbeat {})),
+                    payload: Some(Payload::Heartbeat(Heartbeat { last_received_seq })),
                 })
                 .await
                 .is_err()

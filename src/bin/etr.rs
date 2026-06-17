@@ -517,6 +517,7 @@ async fn run_session(
         loop {
             match quic::read_pty_chunk(&mut pty_recv).await {
                 Ok(Some((seq, data))) => {
+                    vlog!(verbose, 3, "[etr] pty←server seq={seq} bytes={}", data.len());
                     {
                         let mut s = session_r.lock().await;
                         if let Some(st) = s.stream_mut(0) {
@@ -553,6 +554,7 @@ async fn run_session(
                 st.record_send(seq, payload.clone());
                 seq
             };
+            vlog!(verbose, 3, "[etr] stdin→server seq={seq} bytes={}", payload.len());
             if quic::write_pty_chunk(&mut pty_send, seq, &payload)
                 .await
                 .is_err()
@@ -563,6 +565,7 @@ async fn run_session(
     });
 
     // ── Control reader task: ctrl_recv → dispatch ─────────────────────────
+    let session_ctrl = Arc::clone(&session);
     let mut ctrl_reader_task: tokio::task::JoinHandle<io::Result<()>> =
         tokio::spawn(async move {
             loop {
@@ -574,7 +577,10 @@ async fn run_session(
                                 "clean disconnect from server",
                             ));
                         }
-                        Some(Payload::Heartbeat(_)) => {}
+                        Some(Payload::Heartbeat(hb)) => {
+                            session_ctrl.lock().await.apply_server_acks(&hb.last_received_seq);
+                            vlog!(verbose, 3, "[etr] hb←server acks={:?}", hb.last_received_seq);
+                        }
                         _ => {}
                     },
                     Ok(None) => break,
@@ -603,6 +609,7 @@ async fn run_session(
     });
 
     // ── Heartbeat + resize writer: ctrl_send ──────────────────────────────
+    let session_hb = Arc::clone(&session);
     let mut ctrl_send_task: tokio::task::JoinHandle<io::Result<()>> =
         tokio::spawn(async move {
             // Send initial terminal size.
@@ -621,10 +628,15 @@ async fn run_session(
             loop {
                 tokio::select! {
                     _ = hb_interval.tick() => {
-                        let env = Envelope { payload: Some(Payload::Heartbeat(Heartbeat {})) };
+                        let last_received_seq = session_hb.lock().await.last_received_map();
+                        vlog!(verbose, 3, "[etr] hb→server acks={last_received_seq:?}");
+                        let env = Envelope {
+                            payload: Some(Payload::Heartbeat(Heartbeat { last_received_seq })),
+                        };
                         quic::write_msg(&mut ctrl_send, &env).await?;
                     }
                     Some(tr) = resize_rx.recv() => {
+                        vlog!(verbose, 3, "[etr] resize {}x{}", tr.cols, tr.rows);
                         let env = Envelope { payload: Some(Payload::TerminalResize(tr)) };
                         quic::write_msg(&mut ctrl_send, &env).await?;
                     }

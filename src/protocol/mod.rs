@@ -98,8 +98,15 @@ pub struct TerminalResize {
 }
 
 /// Keepalive message exchanged on the control stream to detect idle timeouts.
+///
+/// `last_received_seq` piggybacks the sender's receive watermark so the peer
+/// can continuously trim its send history without waiting for a reconnect.
 #[derive(Clone, PartialEq, prost::Message)]
-pub struct Heartbeat {}
+pub struct Heartbeat {
+    /// Highest seq received per stream (stream_id → seq).  Empty map = pure keepalive.
+    #[prost(map = "uint32, uint64", tag = "1")]
+    pub last_received_seq: std::collections::HashMap<u32, u64>,
+}
 
 /// Clean-disconnect signal on the control stream.
 /// The receiver should not attempt to reconnect.
@@ -204,7 +211,10 @@ mod tests {
     #[test]
     fn test_heartbeat_disconnect_round_trip() {
         for payload in [
-            Payload::Heartbeat(Heartbeat {}),
+            Payload::Heartbeat(Heartbeat {
+                last_received_seq: [(0u32, 42u64)].into(),
+            }),
+            Payload::Heartbeat(Heartbeat::default()),
             Payload::Disconnect(Disconnect {}),
         ] {
             let env = Envelope {

@@ -191,7 +191,7 @@ mod tests {
         let (mut send, _) = conn.open_bi().await.unwrap();
 
         let env = Envelope {
-            payload: Some(Payload::Heartbeat(Heartbeat {})),
+            payload: Some(Payload::Heartbeat(Heartbeat::default())),
         };
         write_msg(&mut send, &env).await.unwrap();
         let got = srv_task.await.unwrap();
