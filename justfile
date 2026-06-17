@@ -218,7 +218,7 @@ test-local: check-tools install
 # than 20 MB above its baseline (well above the 4 MB send-history cap + quinn
 # buffers).
 #
-# Requires: python3, nc (ncat), tmux, passwordless SSH to localhost.
+# Requires: python3, tmux, passwordless SSH to localhost.
 stress-local: check-tools install
     #!/usr/bin/env bash
     set -euo pipefail
@@ -231,6 +231,7 @@ stress-local: check-tools install
     STRESS_SESS="etr_stress"
 
     TCP_ECHO_PID="" UDP_ECHO_PID="" TCP_PUMP_PID="" UDP_PUMP_PID=""
+    SCRIPTS="{{justfile_directory()}}/scripts/stress"
 
     cleanup() {
         echo "--- cleanup ---"
@@ -242,33 +243,13 @@ stress-local: check-tools install
 
     mkdir -p "$(dirname "{{LOG_FILE}}")"
 
-    # ── Echo servers (run locally; etrs will connect "localhost:PORT") ────────
+    # ── Echo servers ──────────────────────────────────────────────────────────
     echo "==> TCP echo server on :${TCP_ECHO_PORT}..."
-    python3 -c "
-import socket, threading, sys
-def echo(c):
-    try:
-        while d := c.recv(65536): c.sendall(d)
-    except: pass
-    finally: c.close()
-s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(('', $TCP_ECHO_PORT)); s.listen(20)
-while True:
-    c, _ = s.accept(); threading.Thread(target=echo, args=(c,), daemon=True).start()
-" &
+    python3 "$SCRIPTS/tcp_echo.py" "$TCP_ECHO_PORT" &
     TCP_ECHO_PID=$!
 
     echo "==> UDP echo server on :${UDP_ECHO_PORT}..."
-    python3 -c "
-import socket
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(('', $UDP_ECHO_PORT))
-while True:
-    data, addr = s.recvfrom(65535)
-    try: s.sendto(data, addr)
-    except: pass
-" &
+    python3 "$SCRIPTS/udp_echo.py" "$UDP_ECHO_PORT" &
     UDP_ECHO_PID=$!
     sleep 0.3
 
@@ -302,49 +283,17 @@ while True:
     echo "==> etrs PID=$ETRS_PID  RSS_start=${RSS_START} KB"
 
     # ── PTY stress: heavy output server→client; sink stdin client→server ──────
-    # Server generates a continuous stream of random base64 (PTY output path).
-    # Remote shell sinks /dev/urandom into /dev/null (client→server stdin path).
     tmux send-keys -t "$STRESS_SESS" \
-        "dd if=/dev/urandom bs=65536 2>/dev/null | base64 > /dev/null & \
-         dd if=/dev/urandom bs=65536 of=/dev/null 2>/dev/null &" Enter
+        "dd if=/dev/urandom bs=65536 2>/dev/null | base64 > /dev/null & dd if=/dev/urandom bs=65536 of=/dev/null 2>/dev/null &" Enter
     sleep 0.5
 
-    # ── TCP pump: blast data through the forward, discard echoes ─────────────
+    # ── TCP and UDP pumps ─────────────────────────────────────────────────────
     echo "==> TCP pump on :${TCP_FWD_PORT}..."
-    python3 -c "
-import socket, threading, os
-s = socket.socket(); s.connect(('127.0.0.1', $TCP_FWD_PORT))
-s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-chunk = os.urandom(65536)
-def drain():
-    while True:
-        try: s.recv(65536)
-        except: break
-threading.Thread(target=drain, daemon=True).start()
-while True:
-    try: s.sendall(chunk)
-    except: break
-" &
+    python3 "$SCRIPTS/tcp_pump.py" "$TCP_FWD_PORT" &
     TCP_PUMP_PID=$!
 
-    # ── UDP pump: send datagrams, receive echoes ───────────────────────────────
     echo "==> UDP pump on :${UDP_FWD_PORT}..."
-    python3 -c "
-import socket, threading, time, os
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.settimeout(0.5)
-chunk = os.urandom(1400)
-def drain():
-    while True:
-        try: s.recv(65535)
-        except socket.timeout: pass
-        except: break
-threading.Thread(target=drain, daemon=True).start()
-while True:
-    try: s.sendto(chunk, ('127.0.0.1', $UDP_FWD_PORT))
-    except: break
-    time.sleep(0.001)
-" &
+    python3 "$SCRIPTS/udp_pump.py" "$UDP_FWD_PORT" &
     UDP_PUMP_PID=$!
 
     # ── Sample RSS every 2 s ──────────────────────────────────────────────────
@@ -359,7 +308,6 @@ while True:
         if ! kill -0 "$ETRS_PID" 2>/dev/null; then
             echo "FAIL: etrs died at t=${t}s" >&2; ETRS_DIED=1; break
         fi
-        # also check etr is alive
         if ! tmux has-session -t "$STRESS_SESS" 2>/dev/null; then
             echo "FAIL: tmux session (etr) disappeared at t=${t}s" >&2; ETRS_DIED=1; break
         fi
@@ -372,7 +320,7 @@ while True:
     [[ $ETRS_DIED -eq 1 ]] && exit 1
 
     # ── Kill background PTY flood, check etr still responds ──────────────────
-    tmux send-keys -t "$STRESS_SESS" "kill \$(jobs -p) 2>/dev/null; echo STRESS_OK" Enter
+    tmux send-keys -t "$STRESS_SESS" 'kill $(jobs -p) 2>/dev/null; echo STRESS_OK' Enter
     sleep 2
     PANE=$(tmux capture-pane -t "$STRESS_SESS" -p 2>/dev/null)
     if ! echo "$PANE" | grep -q "STRESS_OK"; then
