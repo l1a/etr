@@ -403,6 +403,7 @@ async fn handle_connection(
     }
 
     vlog!(2, "[etrs] session verified peer={peer}");
+    vlog!(2, "[etrs] {}", etr::quic::tls_info());
 
     // Collect replays and build SessionAccept.
     let (replays, server_last) = {

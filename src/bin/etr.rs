@@ -389,6 +389,7 @@ async fn run_connection_loop(
         };
 
         vlog!(verbose, 2, "[etr] QUIC connected to {server_addr}");
+        vlog!(verbose, 2, "[etr] {}", quic::tls_info());
 
         enable_raw_mode().unwrap();
         IN_RAW_MODE.store(true, std::sync::atomic::Ordering::Relaxed);

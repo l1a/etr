@@ -49,6 +49,18 @@ pub fn client_config(cert: CertificateDer<'static>) -> io::Result<ClientConfig> 
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
+/// A one-line description of the TLS configuration in use for QUIC connections.
+///
+/// QUIC mandates TLS 1.3; quinn/rustls negotiates one of three cipher suites
+/// (AES-256-GCM-SHA384, AES-128-GCM-SHA256, or ChaCha20-Poly1305-SHA256).
+/// The specific suite chosen by a given handshake is not exposed in quinn's
+/// public API, so we describe the full configured set.
+pub fn tls_info() -> &'static str {
+    "TLS 1.3/QUIC \
+     (AES-256-GCM-SHA384 | AES-128-GCM-SHA256 | ChaCha20-Poly1305-SHA256, \
+     cert-pinned)"
+}
+
 /// Read the 1-byte stream tag from a recv stream.
 pub async fn read_tag(recv: &mut RecvStream) -> io::Result<u8> {
     let mut buf = [0u8; 1];
