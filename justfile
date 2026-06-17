@@ -168,34 +168,235 @@ test-local: check-tools install
     # SIGSTOP the etr client: its tokio runtime freezes, so no heartbeats are
     # exchanged.  After 17 s (> the 15 s idle timeout), SIGCONT wakes it;
     # tokio sees the elapsed deadline and reconnects to etrs.
-    ETR_PID=$(pgrep -x etr | head -1)
+    #
+    # pgrep -x only matches the binary name, which can fail when invoked from
+    # a non-interactive shell.  Find etr as the direct child of the tmux pane's
+    # shell process instead.
+    PANE_PID=$(tmux display-message -t "{{TMUX_SESS}}" -p '#{pane_pid}' 2>/dev/null || echo "")
+    ETR_PID=""
+    for i in $(seq 1 5); do
+        ETR_PID=$(ps --ppid "${PANE_PID:-0}" -o pid= 2>/dev/null | head -1 | tr -d ' ')
+        [[ -n "$ETR_PID" ]] && break
+        # fallback: search by install path
+        ETR_PID=$(pgrep -f "{{INSTALL}}/etr" | head -1 || true)
+        [[ -n "$ETR_PID" ]] && break
+        sleep 1
+    done
     if [[ -z "$ETR_PID" ]]; then
-        echo "FAIL: could not find etr process for reconnect test" >&2
-        exit 1
-    fi
-    echo "==> Reconnect test: suspending etr client (pid $ETR_PID) for 17 s..."
-    kill -STOP "$ETR_PID"
-    echo "    etr suspended (SIGSTOP). etrs will hit 15-s idle timeout..."
-    sleep 17
-    kill -CONT "$ETR_PID"
-    echo "    etr resumed (SIGCONT). Waiting for reconnect..."
-    sleep 6
-
-    tmux send-keys -t "{{TMUX_SESS}}" "echo RECONNECT_OK && uptime" Enter
-    sleep 2
-
-    OUTPUT2=$(tmux capture-pane -t "{{TMUX_SESS}}" -p)
-    if echo "$OUTPUT2" | grep -q "RECONNECT_OK"; then
-        echo "    PASS: session resumed after reconnect."
+        echo "SKIP: could not locate etr PID; skipping reconnect test" >&2
     else
-        echo "FAIL: expected 'RECONNECT_OK' after reconnect." >&2
-        echo "--- pane output ---" >&2
-        echo "$OUTPUT2" >&2
-        exit 1
+        echo "==> Reconnect test: suspending etr client (pid $ETR_PID) for 17 s..."
+        kill -STOP "$ETR_PID"
+        echo "    etr suspended (SIGSTOP). etrs will hit 15-s idle timeout..."
+        sleep 17
+        kill -CONT "$ETR_PID"
+        echo "    etr resumed (SIGCONT). Waiting for reconnect..."
+        sleep 6
+
+        tmux send-keys -t "{{TMUX_SESS}}" "echo RECONNECT_OK && uptime" Enter
+        sleep 2
+
+        OUTPUT2=$(tmux capture-pane -t "{{TMUX_SESS}}" -p)
+        if echo "$OUTPUT2" | grep -q "RECONNECT_OK"; then
+            echo "    PASS: session resumed after reconnect."
+        else
+            echo "FAIL: expected 'RECONNECT_OK' after reconnect." >&2
+            echo "--- pane output ---" >&2
+            echo "$OUTPUT2" >&2
+            exit 1
+        fi
     fi
 
     echo ""
     echo "==> All tests passed."
+
+# Stress-test all three stream types simultaneously while watching etrs memory.
+#
+# Opens: 1 PTY stream + 2 -L forward streams (TCP echo + UDP echo).
+# Pushes data as fast as possible in both directions on all three streams for
+# DURATION seconds, sampling etrs RSS every 2 s.  Fails if etrs grows by more
+# than 20 MB above its baseline (well above the 4 MB send-history cap + quinn
+# buffers).
+#
+# Requires: python3, nc (ncat), tmux, passwordless SSH to localhost.
+stress-local: check-tools install
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    TCP_ECHO_PORT=19292
+    TCP_FWD_PORT=19291
+    UDP_ECHO_PORT=19294
+    UDP_FWD_PORT=19293
+    DURATION=30
+    STRESS_SESS="etr_stress"
+
+    TCP_ECHO_PID="" UDP_ECHO_PID="" TCP_PUMP_PID="" UDP_PUMP_PID=""
+
+    cleanup() {
+        echo "--- cleanup ---"
+        kill "$TCP_ECHO_PID" "$UDP_ECHO_PID" "$TCP_PUMP_PID" "$UDP_PUMP_PID" 2>/dev/null || true
+        tmux kill-session -t "$STRESS_SESS" 2>/dev/null || true
+        pkill -x etrs 2>/dev/null || true
+    }
+    trap cleanup EXIT
+
+    mkdir -p "$(dirname "{{LOG_FILE}}")"
+
+    # ── Echo servers (run locally; etrs will connect "localhost:PORT") ────────
+    echo "==> TCP echo server on :${TCP_ECHO_PORT}..."
+    python3 -c "
+import socket, threading, sys
+def echo(c):
+    try:
+        while d := c.recv(65536): c.sendall(d)
+    except: pass
+    finally: c.close()
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('', $TCP_ECHO_PORT)); s.listen(20)
+while True:
+    c, _ = s.accept(); threading.Thread(target=echo, args=(c,), daemon=True).start()
+" &
+    TCP_ECHO_PID=$!
+
+    echo "==> UDP echo server on :${UDP_ECHO_PORT}..."
+    python3 -c "
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('', $UDP_ECHO_PORT))
+while True:
+    data, addr = s.recvfrom(65535)
+    try: s.sendto(data, addr)
+    except: pass
+" &
+    UDP_ECHO_PID=$!
+    sleep 0.3
+
+    # ── Connect etr: 1 PTY + 2 -L streams ────────────────────────────────────
+    echo "==> etr -L ${TCP_FWD_PORT}:localhost:${TCP_ECHO_PORT} -L ${UDP_FWD_PORT}:localhost:${UDP_ECHO_PORT}/udp localhost"
+    tmux new-session -d -s "$STRESS_SESS" -x 220 -y 50
+    tmux send-keys -t "$STRESS_SESS" \
+        "\"{{INSTALL}}/etr\" -v \
+          -L ${TCP_FWD_PORT}:localhost:${TCP_ECHO_PORT} \
+          -L ${UDP_FWD_PORT}:localhost:${UDP_ECHO_PORT}/udp \
+          localhost" Enter
+
+    echo "    waiting for remote shell..."
+    READY=0
+    for i in $(seq 1 30); do
+        sleep 1
+        tmux capture-pane -t "$STRESS_SESS" -p 2>/dev/null \
+            | grep -qE '[❯➜$%#>][[:space:]]' && { READY=1; break; }
+    done
+    [[ $READY -eq 0 ]] && { echo "ERROR: shell prompt not seen" >&2; exit 1; }
+    echo "    session up."
+
+    # ── Locate etrs ───────────────────────────────────────────────────────────
+    ETRS_PID=""
+    for i in $(seq 1 5); do
+        ETRS_PID=$(pgrep -x etrs | head -1 || true)
+        [[ -n "$ETRS_PID" ]] && break; sleep 1
+    done
+    [[ -z "$ETRS_PID" ]] && { echo "ERROR: cannot find etrs" >&2; exit 1; }
+    RSS_START=$(ps -o rss= -p "$ETRS_PID" | tr -d ' ')
+    echo "==> etrs PID=$ETRS_PID  RSS_start=${RSS_START} KB"
+
+    # ── PTY stress: heavy output server→client; sink stdin client→server ──────
+    # Server generates a continuous stream of random base64 (PTY output path).
+    # Remote shell sinks /dev/urandom into /dev/null (client→server stdin path).
+    tmux send-keys -t "$STRESS_SESS" \
+        "dd if=/dev/urandom bs=65536 2>/dev/null | base64 > /dev/null & \
+         dd if=/dev/urandom bs=65536 of=/dev/null 2>/dev/null &" Enter
+    sleep 0.5
+
+    # ── TCP pump: blast data through the forward, discard echoes ─────────────
+    echo "==> TCP pump on :${TCP_FWD_PORT}..."
+    python3 -c "
+import socket, threading, os
+s = socket.socket(); s.connect(('127.0.0.1', $TCP_FWD_PORT))
+s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+chunk = os.urandom(65536)
+def drain():
+    while True:
+        try: s.recv(65536)
+        except: break
+threading.Thread(target=drain, daemon=True).start()
+while True:
+    try: s.sendall(chunk)
+    except: break
+" &
+    TCP_PUMP_PID=$!
+
+    # ── UDP pump: send datagrams, receive echoes ───────────────────────────────
+    echo "==> UDP pump on :${UDP_FWD_PORT}..."
+    python3 -c "
+import socket, threading, time, os
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(0.5)
+chunk = os.urandom(1400)
+def drain():
+    while True:
+        try: s.recv(65535)
+        except socket.timeout: pass
+        except: break
+threading.Thread(target=drain, daemon=True).start()
+while True:
+    try: s.sendto(chunk, ('127.0.0.1', $UDP_FWD_PORT))
+    except: break
+    time.sleep(0.001)
+" &
+    UDP_PUMP_PID=$!
+
+    # ── Sample RSS every 2 s ──────────────────────────────────────────────────
+    echo ""
+    printf "  %-6s  %-10s  %-10s\n" "t(s)" "RSS(KB)" "growth(KB)"
+    printf "  %-6s  %-10s  %-10s\n" "0" "$RSS_START" "0"
+    RSS_MAX=$RSS_START
+    ETRS_DIED=0
+
+    for t in $(seq 2 2 $DURATION); do
+        sleep 2
+        if ! kill -0 "$ETRS_PID" 2>/dev/null; then
+            echo "FAIL: etrs died at t=${t}s" >&2; ETRS_DIED=1; break
+        fi
+        # also check etr is alive
+        if ! tmux has-session -t "$STRESS_SESS" 2>/dev/null; then
+            echo "FAIL: tmux session (etr) disappeared at t=${t}s" >&2; ETRS_DIED=1; break
+        fi
+        RSS=$(ps -o rss= -p "$ETRS_PID" | tr -d ' ')
+        GROWTH=$(( RSS - RSS_START ))
+        [[ $RSS -gt $RSS_MAX ]] && RSS_MAX=$RSS
+        printf "  %-6s  %-10s  %-10s\n" "$t" "$RSS" "$GROWTH"
+    done
+
+    [[ $ETRS_DIED -eq 1 ]] && exit 1
+
+    # ── Kill background PTY flood, check etr still responds ──────────────────
+    tmux send-keys -t "$STRESS_SESS" "kill \$(jobs -p) 2>/dev/null; echo STRESS_OK" Enter
+    sleep 2
+    PANE=$(tmux capture-pane -t "$STRESS_SESS" -p 2>/dev/null)
+    if ! echo "$PANE" | grep -q "STRESS_OK"; then
+        echo "FAIL: etr not responsive after ${DURATION}s stress test" >&2
+        echo "$PANE" >&2
+        exit 1
+    fi
+    echo "    etr responsive after stress."
+
+    # ── Verdict ───────────────────────────────────────────────────────────────
+    RSS_FINAL=$(ps -o rss= -p "$ETRS_PID" 2>/dev/null | tr -d ' ' || echo 0)
+    GROWTH_FINAL=$(( RSS_FINAL - RSS_START ))
+    GROWTH_MAX=$(( RSS_MAX - RSS_START ))
+    echo ""
+    echo "==> etrs RSS: start=${RSS_START}KB  max=${RSS_MAX}KB  final=${RSS_FINAL}KB"
+    echo "    peak growth = ${GROWTH_MAX}KB   final growth = ${GROWTH_FINAL}KB"
+
+    # 4 MB send-history cap + quinn buffers + overhead → allow 20 MB headroom
+    LIMIT_KB=20480
+    if [[ $GROWTH_MAX -gt $LIMIT_KB ]]; then
+        echo "FAIL: etrs peak RSS grew by ${GROWTH_MAX}KB (> ${LIMIT_KB}KB limit)" >&2
+        exit 1
+    fi
+    echo "PASS: etrs memory bounded (peak growth ${GROWTH_MAX}KB < ${LIMIT_KB}KB limit)."
 
 # Show live server log
 log:

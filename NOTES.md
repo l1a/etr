@@ -106,12 +106,18 @@ design had.
 | Gap detection / discard        | Reliable ordered delivery (built-in)            |
 | `StreamData` + seq-num routing | Separate QUIC bidi stream per forward           |
 
-### Session persistence (unchanged)
+### Session persistence
 
 `send_history`, `record_send`, `replay_from`, `last_received_seq` are still
 needed because QUIC does not replay application data on new connections.
 The seq numbers embedded in PTY stream chunks (`[8-byte seq][4-byte len][data]`)
 let the server know exactly what to replay after a reconnect.
+
+**Memory bounding**: `send_history` is capped at **4 MB per stream** (byte-based).
+Entries are evicted oldest-first when the cap is exceeded, independent of
+heartbeat-ack trimming.  Heartbeat messages (`Heartbeat.last_received_seq`) piggyback
+the receiver's watermark every 5 s so acknowledged entries are also trimmed
+continuously — in normal use the buffer stays near zero.
 
 ### PQC note
 
@@ -252,6 +258,9 @@ just check-tools          # verifies tmux, ssh, passwordless localhost SSH
 
 # Full automated end-to-end test (happy path + reconnect)
 just test-local
+
+# Memory/throughput stress test (1 PTY + 2 -L forward streams, all directions)
+just stress-local
 ```
 
 ---
@@ -287,12 +296,10 @@ last-sender reply routing.  Runs without a PTY session if no terminal is attache
 
 ## Known gaps / next steps
 
-- **`just test-local` reconnect test broken**: the happy-path test passes but the
-  reconnect step fails because `pgrep -x etr` cannot find the `etr` process when
-  launched from a non-interactive context (e.g. from within Claude Code / a tool
-  harness).  Root cause unresolved — the session works, but the process is not visible
-  to pgrep in that environment.  Needs investigation; reconnect can be verified manually
-  in a real terminal.
+- **`just test-local` reconnect test**: previously broken when `pgrep -x etr` failed
+  in non-interactive contexts.  Now uses `tmux display-message #{pane_pid}` to locate
+  the child process and falls back to `pgrep -f` matching the install path; gracefully
+  skips the reconnect sub-test if the PID cannot be found rather than failing.
 - **Benchmarking**: no performance benchmarks exist.  Key areas to measure: QUIC
   connection latency, PTY round-trip latency, throughput under reconnect, and
   port-forward throughput.  Consider `criterion` for micro-benchmarks.

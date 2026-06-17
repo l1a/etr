@@ -17,6 +17,13 @@ pub enum StreamLifecycle {
     Closed,
 }
 
+/// Maximum bytes of send history retained per stream.
+///
+/// This bounds reconnect-replay memory.  5 s of acks × even a very fast PTY
+/// (≈ 10 MB/s) stays well inside 4 MB; the heartbeat-ack mechanism trims
+/// the buffer continuously so in normal use it stays near zero.
+const MAX_HISTORY_BYTES: usize = 4 * 1024 * 1024; // 4 MB
+
 /// State for one logical stream within a session.
 ///
 /// Stream 0 is always the terminal PTY.  Higher-numbered streams are
@@ -31,7 +38,8 @@ pub struct StreamState {
     pub next_in_seq: u64,
     /// Ring-buffer of `(seq_num, payload)` for replay on reconnect.
     send_history: VecDeque<(u64, Vec<u8>)>,
-    max_history: usize,
+    /// Running byte total of all payloads in `send_history`.
+    history_bytes: usize,
     pub lifecycle: StreamLifecycle,
 }
 
@@ -45,16 +53,22 @@ impl StreamState {
             next_out_seq: 1,
             next_in_seq: 1,
             send_history: VecDeque::new(),
-            max_history: 10_000,
+            history_bytes: 0,
             lifecycle: StreamLifecycle::Open,
         }
     }
 
-    /// Record a sent payload in the history buffer.
+    /// Record a sent payload in the history buffer, evicting oldest entries
+    /// once the byte total exceeds [`MAX_HISTORY_BYTES`].
     pub fn record_send(&mut self, seq_num: u64, payload: Vec<u8>) {
+        self.history_bytes += payload.len();
         self.send_history.push_back((seq_num, payload));
-        if self.send_history.len() > self.max_history {
-            self.send_history.pop_front();
+        while self.history_bytes > MAX_HISTORY_BYTES {
+            if let Some((_, evicted)) = self.send_history.pop_front() {
+                self.history_bytes -= evicted.len();
+            } else {
+                break;
+            }
         }
     }
 
@@ -62,11 +76,18 @@ impl StreamState {
     pub fn acknowledge_up_to(&mut self, ack_seq: u64) {
         while let Some(&(seq, _)) = self.send_history.front() {
             if seq <= ack_seq {
-                self.send_history.pop_front();
+                if let Some((_, data)) = self.send_history.pop_front() {
+                    self.history_bytes -= data.len();
+                }
             } else {
                 break;
             }
         }
+    }
+
+    /// Current byte total of buffered send history (for diagnostics).
+    pub fn history_bytes(&self) -> usize {
+        self.history_bytes
     }
 
     /// Return all history entries with `seq_num > peer_last_received` for replay.
@@ -84,20 +105,20 @@ mod tests {
     use super::*;
 
     fn make_stream() -> StreamState {
-        let mut s = StreamState::new(0, StreamType::Terminal);
-        s.max_history = 4;
-        s
+        StreamState::new(0, StreamType::Terminal)
     }
 
     #[test]
-    fn test_record_and_evict() {
+    fn test_record_and_evict_by_bytes() {
         let mut s = make_stream();
-        for i in 1u64..=5 {
-            s.record_send(i, vec![i as u8]);
-        }
-        // max_history=4, so seq 1 evicted
-        assert_eq!(s.send_history.len(), 4);
-        assert_eq!(s.send_history.front().unwrap().0, 2);
+        // Stuff > MAX_HISTORY_BYTES worth of data; oldest should be evicted.
+        let chunk = vec![0u8; MAX_HISTORY_BYTES / 2 + 1];
+        s.record_send(1, chunk.clone());
+        s.record_send(2, chunk.clone());
+        s.record_send(3, chunk.clone());
+        // After 3 large chunks seq 1 must have been evicted.
+        assert!(s.send_history.front().unwrap().0 > 1);
+        assert!(s.history_bytes <= MAX_HISTORY_BYTES + chunk.len());
     }
 
     #[test]
@@ -109,6 +130,7 @@ mod tests {
         s.acknowledge_up_to(2);
         assert_eq!(s.send_history.len(), 2);
         assert_eq!(s.send_history.front().unwrap().0, 3);
+        assert_eq!(s.history_bytes, 2);
     }
 
     #[test]
@@ -146,21 +168,24 @@ mod tests {
         }
         s.acknowledge_up_to(u64::MAX);
         assert!(s.send_history.is_empty());
+        assert_eq!(s.history_bytes, 0);
     }
 
     #[test]
     fn test_acknowledge_up_to_empty_history_noop() {
         let mut s = make_stream();
-        s.acknowledge_up_to(100); // should not panic
+        s.acknowledge_up_to(100);
         assert!(s.send_history.is_empty());
+        assert_eq!(s.history_bytes, 0);
     }
 
     #[test]
     fn test_acknowledge_up_to_past_end_noop() {
         let mut s = make_stream();
         s.record_send(1, b"x".to_vec());
-        s.acknowledge_up_to(0); // nothing to trim
+        s.acknowledge_up_to(0);
         assert_eq!(s.send_history.len(), 1);
+        assert_eq!(s.history_bytes, 1);
     }
 
     #[test]
