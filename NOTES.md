@@ -9,11 +9,12 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: working end-to-end on localhost
+## Current state: v0.3.0 — shipped to crates.io
 
 The full round-trip works: `etr <host>` on the client, SSH bootstrap that starts
 `etrs` on the fly, QUIC connection with cert pinning, live PTY session, heartbeat
-keepalive, and transparent reconnect after network loss.
+keepalive, transparent reconnect after network loss, and `-L` TCP/UDP port forwarding.
+Published to crates.io; `cargo install etr` installs both binaries.
 
 ---
 
@@ -232,7 +233,7 @@ just install          # copies target/debug/{etr,etrs} to ~/.cargo/bin
 cargo build --release
 just install-release  # copies target/release/{etr,etrs} to ~/.cargo/bin
 
-# Code quality gate (run before pushing)
+# Code quality gate — run before every commit
 just check            # cargo fmt --check + cargo clippy -D warnings
 just test             # cargo test (57 tests)
 ```
