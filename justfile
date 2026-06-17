@@ -254,31 +254,65 @@ stress-local: check-tools install
     sleep 0.3
 
     # ── Connect etr: 1 PTY + 2 -L streams ────────────────────────────────────
+    # Run etr DIRECTLY as the tmux session command (no intermediate shell).
+    # This avoids .zshrc startup delays and ensures the -L flags are received
+    # by the correct etr process, not by a nested remote shell.
     echo "==> etr -L ${TCP_FWD_PORT}:localhost:${TCP_ECHO_PORT} -L ${UDP_FWD_PORT}:localhost:${UDP_ECHO_PORT}/udp localhost"
-    tmux new-session -d -s "$STRESS_SESS" -x 220 -y 50
-    tmux send-keys -t "$STRESS_SESS" \
-        "\"{{INSTALL}}/etr\" -v \
-          -L ${TCP_FWD_PORT}:localhost:${TCP_ECHO_PORT} \
-          -L ${UDP_FWD_PORT}:localhost:${UDP_ECHO_PORT}/udp \
-          localhost" Enter
+    tmux new-session -d -s "$STRESS_SESS" -x 220 -y 50 -- \
+        "{{INSTALL}}/etr" -v \
+        -L "${TCP_FWD_PORT}:localhost:${TCP_ECHO_PORT}" \
+        -L "${UDP_FWD_PORT}:localhost:${UDP_ECHO_PORT}/udp" \
+        localhost
 
-    echo "    waiting for remote shell..."
+    # Wait for "[etr] Forwarding:" in the log file — set immediately when the
+    # -L specs are parsed, before the QUIC connection is opened.
+    echo "    waiting for -L specs to appear in log..."
     READY=0
     for i in $(seq 1 30); do
         sleep 1
-        tmux capture-pane -t "$STRESS_SESS" -p 2>/dev/null \
-            | grep -qE '[❯➜$%#>][[:space:]]' && { READY=1; break; }
+        grep -q "Forwarding: ${TCP_FWD_PORT}:" ~/.local/state/etr/etr.log 2>/dev/null && { READY=1; break; }
     done
-    [[ $READY -eq 0 ]] && { echo "ERROR: shell prompt not seen" >&2; exit 1; }
+    [[ $READY -eq 0 ]] && { echo "ERROR: [etr] Forwarding: ${TCP_FWD_PORT} not seen in log" >&2; exit 1; }
+    echo "    etr started with -L specs."
+
+    # Send a sentinel to the remote shell and wait for it to echo back.
+    SENTINEL="ETR_STRESS_READY_$$"
+    tmux send-keys -t "$STRESS_SESS" "echo ${SENTINEL}" Enter
+    echo "    waiting for remote shell sentinel..."
+    READY=0
+    for i in $(seq 1 30); do
+        sleep 1
+        tmux capture-pane -t "$STRESS_SESS" -p -S - 2>/dev/null \
+            | grep -q "${SENTINEL}" && { READY=1; break; }
+    done
+    [[ $READY -eq 0 ]] && { echo "ERROR: remote shell sentinel not seen" >&2; exit 1; }
     echo "    session up."
 
-    # ── Locate etrs ───────────────────────────────────────────────────────────
-    ETRS_PID=""
-    for i in $(seq 1 5); do
-        ETRS_PID=$(pgrep -x etrs | head -1 || true)
-        [[ -n "$ETRS_PID" ]] && break; sleep 1
+    # ── Locate etrs via the remote shell's parent PID ────────────────────────
+    # etrs is the direct parent of the remote shell (portable-pty fork+exec).
+    # We read /proc/$$/status inside the remote shell ($$ = shell PID, not
+    # the grep subprocess), so PPid gives the shell's parent = etrs.
+    # Use \$\$ so bash doesn't expand $$ before the command reaches the shell.
+    PPID_FILE="/tmp/.etr_stress_ppid_$$"
+    tmux send-keys -t "$STRESS_SESS" \
+        "awk '/^PPid:/{print \$2}' /proc/\$\$/status > ${PPID_FILE} && echo PPID_OK" Enter
+    # Wait for PPID_OK in pane to confirm the command completed
+    for i in $(seq 1 10); do
+        sleep 1
+        tmux capture-pane -t "$STRESS_SESS" -p -S - 2>/dev/null | grep -q "PPID_OK" && break
     done
-    [[ -z "$ETRS_PID" ]] && { echo "ERROR: cannot find etrs" >&2; exit 1; }
+    ETRS_PID=$(cat "$PPID_FILE" 2>/dev/null | tr -d '[:space:]' || true)
+    rm -f "$PPID_FILE"
+    if [[ -z "$ETRS_PID" ]] || ! kill -0 "$ETRS_PID" 2>/dev/null; then
+        echo "ERROR: cannot locate etrs (PPID method failed; got '${ETRS_PID:-}')" >&2
+        exit 1
+    fi
+    # Sanity-check: the PID should be named "etrs"
+    ETRS_COMM=$(ps -o comm= -p "$ETRS_PID" 2>/dev/null | tr -d ' ' || true)
+    if [[ "$ETRS_COMM" != "etrs" ]]; then
+        echo "ERROR: PID $ETRS_PID is '$ETRS_COMM', not 'etrs' — PPID lookup landed on wrong process" >&2
+        exit 1
+    fi
     RSS_START=$(ps -o rss= -p "$ETRS_PID" | tr -d ' ')
     echo "==> etrs PID=$ETRS_PID  RSS_start=${RSS_START} KB"
 
