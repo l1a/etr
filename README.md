@@ -100,6 +100,9 @@ etr -L 5432:db-host:5432 user@jumphost
 
 # UDP forwarding
 etr -L 5353:8.8.8.8:53/udp user@jumphost
+
+# Explicit bind address (e.g. wildcard * or specific IP)
+etr -L *:8080:localhost:80 user@host
 ```
 
 Reverse forwarding (`-R`) connects a remote port on the server to a local host:
@@ -109,7 +112,12 @@ etr -R 8080:localhost:80 user@host
 
 # UDP reverse forwarding
 etr -R 5353:127.0.0.1:53/udp user@host
+
+# Reverse forwarding with explicit bind address
+etr -R 0.0.0.0:8080:localhost:80 user@host
 ```
+
+By default, listeners bind to loopback addresses (`127.0.0.1` and `[::1]`). You can use the `-g`/`--gateway-ports` flag to automatically bind all local forwarded ports to wildcard interfaces (`0.0.0.0` and `[::]`), or specify an explicit bind address as the first component of the forward specification.
 
 Multiple `-L` and `-R` specifications can be mixed in a single session.
 
@@ -140,7 +148,6 @@ server_log_path = "/tmp/server.log"   # path to the server log file on remote ho
 
 - Linux only (PTY layer tested on Linux; macOS/Windows untested)
 - Sessions are not persistent across client reboots — the session ID and passkey are in-memory only
-- `-R` (remote-to-local port forwarding) is not yet implemented
 - Post-quantum key exchange (ML-KEM) is not yet implemented; standard TLS 1.3 uses X25519 ECDH
 
 ## License

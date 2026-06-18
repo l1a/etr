@@ -287,13 +287,14 @@ etr -L 5432:db-host:5432 user@jumphost    # local port → remote (TCP)
 etr -L 5353:8.8.8.8:53/udp user@jumphost # UDP forwarding
 ```
 
-**Current state**: `-L local_port:remote_host:remote_port[/tcp|/udp]` is implemented for
+**Current state**: `-L [bind_address:]local_port:remote_host:remote_port[/tcp|/udp]` is implemented for
 both TCP and UDP, running concurrently alongside the PTY session.  TCP opens one QUIC
-stream per connection; UDP uses one shared QUIC stream per `-L` spec with
-last-sender reply routing.  Listeners are bound to both `127.0.0.1` and `[::1]` loopbacks.
+stream per connection; UDP uses one shared QUIC stream per `-L` spec with last-sender reply routing.
+By default, local listeners are bound to both `127.0.0.1` and `[::1]` loopbacks. If `-g`/`--gateway-ports` is specified,
+they are bound to wildcard addresses (`0.0.0.0` and `[::]`). Specific bind addresses can be set in the spec.
 Runs without a PTY session if no terminal is attached.
-`-R` (remote-to-local) is implemented for both TCP and UDP, binding remote listeners on both
-`127.0.0.1` and `[::1]` loopbacks on the target machine.
+`-R [bind_address:]remote_port:local_host:local_port[/tcp|/udp]` is implemented for both TCP and UDP.
+By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks on the target machine, but explicit bind addresses (e.g. `*` or `0.0.0.0`) can be specified to allow external hosts to connect.
 
 ---
 

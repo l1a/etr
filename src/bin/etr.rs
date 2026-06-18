@@ -80,6 +80,11 @@ struct Cli {
     #[arg(short = 'R', value_name = "SPEC")]
     reverse_forward: Vec<String>,
 
+    /// Gateway ports: allow remote hosts to connect to local forwarded ports.
+    /// Works like ssh -g. Automatically binds local forwarded ports to all interfaces (0.0.0.0 and ::).
+    #[arg(short = 'g', long)]
+    gateway_ports: bool,
+
     /// Path to the client log file (default: $XDG_STATE_HOME/etr/etr.log)
     #[arg(long, value_name = "PATH")]
     log_path: Option<std::path::PathBuf>,
@@ -171,8 +176,15 @@ async fn main() -> io::Result<()> {
         .or(cfg.client.server_path)
         .unwrap_or_else(|| "etrs".to_string());
 
+    let forwards = if !cli.forward.is_empty() {
+        &cli.forward
+    } else if let Some(ref list) = cfg.client.forward {
+        list
+    } else {
+        &cli.forward
+    };
     let mut forward_specs: Vec<ForwardSpec> = Vec::new();
-    for s in &cli.forward {
+    for s in forwards {
         match ForwardSpec::parse(s) {
             Ok(spec) => {
                 vlog!(cli.verbose, 1, "[etr] Forwarding: {spec}");
@@ -185,8 +197,15 @@ async fn main() -> io::Result<()> {
         }
     }
 
+    let reverse_forwards = if !cli.reverse_forward.is_empty() {
+        &cli.reverse_forward
+    } else if let Some(ref list) = cfg.client.reverse_forward {
+        list
+    } else {
+        &cli.reverse_forward
+    };
     let mut reverse_forward_specs: Vec<String> = Vec::new();
-    for s in &cli.reverse_forward {
+    for s in reverse_forwards {
         match ForwardSpec::parse(s) {
             Ok(spec) => {
                 vlog!(cli.verbose, 1, "[etr] Reverse forwarding: {spec}");
@@ -198,6 +217,12 @@ async fn main() -> io::Result<()> {
             }
         }
     }
+
+    let gateway_ports = if cli.gateway_ports {
+        true
+    } else {
+        cfg.client.gateway_ports.unwrap_or(false)
+    };
 
     let session_id = generate_session_id();
     let passkey = generate_passkey();
@@ -236,6 +261,7 @@ async fn main() -> io::Result<()> {
         session,
         forward_specs,
         reverse_forward_specs,
+        gateway_ports,
         cli.verbose,
     )
     .await
@@ -354,6 +380,7 @@ async fn run_connection_loop(
     session: Arc<Mutex<SessionState>>,
     forward_specs: Vec<ForwardSpec>,
     reverse_forward_specs: Vec<String>,
+    gateway_ports: bool,
     verbose: u8,
 ) -> io::Result<()> {
     let host = if let Some(idx) = target.find('@') {
@@ -443,6 +470,7 @@ async fn run_connection_loop(
             Arc::clone(&stdin_rx),
             forward_specs.clone(),
             reverse_forward_specs.clone(),
+            gateway_ports,
             verbose,
         )
         .await;
@@ -474,6 +502,7 @@ async fn run_session(
     stdin_rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
     forward_specs: Vec<ForwardSpec>,
     reverse_forward_specs: Vec<String>,
+    gateway_ports: bool,
     verbose: u8,
 ) -> io::Result<()> {
     // ── Open control stream ───────────────────────────────────────────────
@@ -716,8 +745,15 @@ async fn run_session(
         let conn2 = conn.clone();
         let spec2 = spec.clone();
         let handle = match spec.proto {
-            ForwardProto::Tcp => tokio::spawn(run_tcp_acceptor_quic(spec2, conn2, verbose)),
-            ForwardProto::Udp => tokio::spawn(run_udp_forward_client_quic(spec2, conn2, verbose)),
+            ForwardProto::Tcp => {
+                tokio::spawn(run_tcp_acceptor_quic(spec2, conn2, gateway_ports, verbose))
+            }
+            ForwardProto::Udp => tokio::spawn(run_udp_forward_client_quic(
+                spec2,
+                conn2,
+                gateway_ports,
+                verbose,
+            )),
         };
         fwd_handles.push(handle);
     }
@@ -866,21 +902,30 @@ async fn run_session(
 // ── Forward helpers (client side) ────────────────────────────────────────────
 
 /// Accept local TCP connections and open a QUIC forward stream per connection.
-async fn run_tcp_acceptor_quic(spec: ForwardSpec, conn: quinn::Connection, verbose: u8) {
+async fn run_tcp_acceptor_quic(
+    spec: ForwardSpec,
+    conn: quinn::Connection,
+    gateway: bool,
+    verbose: u8,
+) {
     use tokio::net::TcpListener;
 
-    let bind_addr4 = format!("127.0.0.1:{}", spec.local_port);
-    let bind_addr6 = format!("[::1]:{}", spec.local_port);
+    let bind_addrs = spec.get_bind_addresses(gateway);
+    let mut listeners = Vec::new();
+    for addr in &bind_addrs {
+        let target = format!("{addr}:{}", spec.local_port);
+        match TcpListener::bind(&target).await {
+            Ok(l) => listeners.push(l),
+            Err(e) => {
+                vlog!(verbose, 1, "[etr] TCP bind to {target} failed: {e}");
+            }
+        }
+    }
 
-    let l4 = TcpListener::bind(&bind_addr4).await;
-    let l6 = TcpListener::bind(&bind_addr6).await;
-
-    if l4.is_err() && l6.is_err() {
+    if listeners.is_empty() {
         eprintln!(
-            "[etr] cannot bind TCP port {} on 127.0.0.1 or [::1]: l4_err={:?}, l6_err={:?}",
-            spec.local_port,
-            l4.err(),
-            l6.err()
+            "[etr] cannot bind TCP port {} on any of {:?}",
+            spec.local_port, bind_addrs
         );
         return;
     }
@@ -936,16 +981,13 @@ async fn run_tcp_acceptor_quic(spec: ForwardSpec, conn: quinn::Connection, verbo
     };
 
     let mut join_handles = Vec::new();
-    if let Ok(listener) = l4 {
+    for listener in listeners {
         join_handles.push(tokio::spawn(run_loop(
             listener,
             conn.clone(),
             spec.clone(),
             verbose,
         )));
-    }
-    if let Ok(listener) = l6 {
-        join_handles.push(tokio::spawn(run_loop(listener, conn, spec, verbose)));
     }
 
     for h in join_handles {
@@ -1002,20 +1044,30 @@ async fn run_tcp_connection_quic(
 }
 
 /// Open one QUIC forward stream for a UDP `-L` spec; pipe local datagrams through it.
-async fn run_udp_forward_client_quic(spec: ForwardSpec, conn: quinn::Connection, verbose: u8) {
-    let bind_addr4 = format!("127.0.0.1:{}", spec.local_port);
-    let bind_addr6 = format!("[::1]:{}", spec.local_port);
-
+async fn run_udp_forward_client_quic(
+    spec: ForwardSpec,
+    conn: quinn::Connection,
+    gateway: bool,
+    verbose: u8,
+) {
     use tokio::net::UdpSocket;
-    let s4 = UdpSocket::bind(&bind_addr4).await;
-    let s6 = UdpSocket::bind(&bind_addr6).await;
 
-    if s4.is_err() && s6.is_err() {
+    let bind_addrs = spec.get_bind_addresses(gateway);
+    let mut sockets = Vec::new();
+    for addr in &bind_addrs {
+        let target = format!("{addr}:{}", spec.local_port);
+        match UdpSocket::bind(&target).await {
+            Ok(s) => sockets.push(s),
+            Err(e) => {
+                vlog!(verbose, 1, "[etr] UDP bind to {target} failed: {e}");
+            }
+        }
+    }
+
+    if sockets.is_empty() {
         eprintln!(
-            "[etr] cannot bind UDP port {} on 127.0.0.1 or [::1]: s4_err={:?}, s6_err={:?}",
-            spec.local_port,
-            s4.err(),
-            s6.err()
+            "[etr] cannot bind UDP port {} on any of {:?}",
+            spec.local_port, bind_addrs
         );
         return;
     }
@@ -1030,17 +1082,12 @@ async fn run_udp_forward_client_quic(spec: ForwardSpec, conn: quinn::Connection,
     );
 
     let mut join_handles = Vec::new();
-    if let Ok(socket) = s4 {
+    for socket in sockets {
         join_handles.push(tokio::spawn(run_udp_forward_client_socket(
             socket,
             spec.clone(),
             conn.clone(),
             verbose,
-        )));
-    }
-    if let Ok(socket) = s6 {
-        join_handles.push(tokio::spawn(run_udp_forward_client_socket(
-            socket, spec, conn, verbose,
         )));
     }
 

@@ -326,6 +326,25 @@ e2e-reverse-local: check-tools install
         exit 1
     fi
 
+    # Verify TCP reverse forwarding over IPv6 loopback
+    echo "==> Testing TCP reverse forwarding over IPv6..."
+    TCP_OUT_IPV6=$(python3 -c '
+    import socket
+    s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    s.settimeout(3.0)
+    s.connect(("::1", '"${TCP_REMOTE_PORT}"'))
+    s.sendall(b"REVERSE_TCP_IPV6_OK\n")
+    print(s.recv(1024).decode())
+    s.close()
+    ' 2>/dev/null || true)
+
+    if [[ "$TCP_OUT_IPV6" == *"REVERSE_TCP_IPV6_OK"* ]]; then
+        echo "    PASS: TCP reverse forwarding over IPv6 functional."
+    else
+        echo "FAIL: TCP reverse forwarding over IPv6 check failed. Output: '${TCP_OUT_IPV6}'" >&2
+        exit 1
+    fi
+
     # Verify UDP reverse forwarding
     echo "==> Testing UDP reverse forwarding..."
     UDP_OUT=$(python3 -c '
@@ -344,6 +363,27 @@ e2e-reverse-local: check-tools install
         echo "    PASS: UDP reverse forwarding functional."
     else
         echo "FAIL: UDP reverse forwarding check failed. Output: '${UDP_OUT}'" >&2
+        exit 1
+    fi
+
+    # Verify UDP reverse forwarding over IPv6 loopback
+    echo "==> Testing UDP reverse forwarding over IPv6..."
+    UDP_OUT_IPV6=$(python3 -c '
+    import socket
+    s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+    s.settimeout(3.0)
+    s.sendto(b"REVERSE_UDP_IPV6_OK", ("::1", '"${UDP_REMOTE_PORT}"'))
+    try:
+        data, addr = s.recvfrom(1024)
+        print(data.decode())
+    except socket.timeout:
+        print("timeout")
+    ' 2>/dev/null || true)
+
+    if [[ "$UDP_OUT_IPV6" == *"REVERSE_UDP_IPV6_OK"* ]]; then
+        echo "    PASS: UDP reverse forwarding over IPv6 functional."
+    else
+        echo "FAIL: UDP reverse forwarding over IPv6 check failed. Output: '${UDP_OUT_IPV6}'" >&2
         exit 1
     fi
 

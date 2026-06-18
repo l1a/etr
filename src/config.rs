@@ -38,6 +38,15 @@ pub struct ClientConfig {
 
     /// Default path to the server log file on the remote host.
     pub server_log_path: Option<String>,
+
+    /// Default gateway_ports setting (allows external connections to forwarded ports).
+    pub gateway_ports: Option<bool>,
+
+    /// Default local port forwards.
+    pub forward: Option<Vec<String>>,
+
+    /// Default remote port forwards.
+    pub reverse_forward: Option<Vec<String>>,
 }
 
 impl Config {
@@ -135,5 +144,28 @@ mod tests {
     fn test_load_nonexistent_file_returns_default() {
         let cfg: Config = toml::from_str("").unwrap();
         assert!(cfg.client.ssh_port.is_none());
+    }
+
+    #[test]
+    fn test_parse_new_forward_options() {
+        let toml = r#"
+            [client]
+            gateway_ports = true
+            forward = ["8080:localhost:80", "*:3000:localhost:3000"]
+            reverse_forward = ["9090:localhost:90"]
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.client.gateway_ports, Some(true));
+        assert_eq!(
+            cfg.client.forward,
+            Some(vec![
+                "8080:localhost:80".to_string(),
+                "*:3000:localhost:3000".to_string()
+            ])
+        );
+        assert_eq!(
+            cfg.client.reverse_forward,
+            Some(vec!["9090:localhost:90".to_string()])
+        );
     }
 }

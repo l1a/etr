@@ -754,19 +754,24 @@ async fn run_tcp_reverse_listener(
 ) {
     use tokio::net::TcpListener;
 
-    let bind_addr4 = format!("127.0.0.1:{}", spec.local_port);
-    let bind_addr6 = format!("[::1]:{}", spec.local_port);
+    let bind_addrs = spec.get_bind_addresses(false);
+    let mut listeners = Vec::new();
+    for addr in &bind_addrs {
+        let target = format!("{addr}:{}", spec.local_port);
+        match TcpListener::bind(&target).await {
+            Ok(l) => listeners.push(l),
+            Err(e) => {
+                vlog!(1, "[etrs] reverse TCP bind to {target} failed: {e}");
+            }
+        }
+    }
 
-    let l4 = TcpListener::bind(&bind_addr4).await;
-    let l6 = TcpListener::bind(&bind_addr6).await;
-
-    if l4.is_err() && l6.is_err() {
+    if listeners.is_empty() {
         vlog!(
             1,
-            "[etrs] reverse TCP bind failed on {} for both 127.0.0.1 and [::1]: l4_err={:?}, l6_err={:?}",
+            "[etrs] cannot bind reverse TCP port {} on any of {:?}",
             spec.local_port,
-            l4.err(),
-            l6.err()
+            bind_addrs
         );
         return;
     }
@@ -825,15 +830,12 @@ async fn run_tcp_reverse_listener(
     };
 
     let mut join_handles = Vec::new();
-    if let Ok(listener) = l4 {
+    for listener in listeners {
         join_handles.push(tokio::spawn(run_loop(
             listener,
             Arc::clone(&active_conn),
             spec.clone(),
         )));
-    }
-    if let Ok(listener) = l6 {
-        join_handles.push(tokio::spawn(run_loop(listener, active_conn, spec)));
     }
 
     for h in join_handles {
@@ -847,19 +849,24 @@ async fn run_udp_reverse_listener(
 ) {
     use tokio::net::UdpSocket;
 
-    let bind_addr4 = format!("127.0.0.1:{}", spec.local_port);
-    let bind_addr6 = format!("[::1]:{}", spec.local_port);
+    let bind_addrs = spec.get_bind_addresses(false);
+    let mut sockets = Vec::new();
+    for addr in &bind_addrs {
+        let target = format!("{addr}:{}", spec.local_port);
+        match UdpSocket::bind(&target).await {
+            Ok(s) => sockets.push(s),
+            Err(e) => {
+                vlog!(1, "[etrs] reverse UDP bind to {target} failed: {e}");
+            }
+        }
+    }
 
-    let s4 = UdpSocket::bind(&bind_addr4).await;
-    let s6 = UdpSocket::bind(&bind_addr6).await;
-
-    if s4.is_err() && s6.is_err() {
+    if sockets.is_empty() {
         vlog!(
             1,
-            "[etrs] reverse UDP bind failed on {} for both 127.0.0.1 and [::1]: s4_err={:?}, s6_err={:?}",
+            "[etrs] cannot bind reverse UDP port {} on any of {:?}",
             spec.local_port,
-            s4.err(),
-            s6.err()
+            bind_addrs
         );
         return;
     }
@@ -871,18 +878,11 @@ async fn run_udp_reverse_listener(
     );
 
     let mut join_handles = Vec::new();
-    if let Ok(socket) = s4 {
+    for socket in sockets {
         join_handles.push(tokio::spawn(run_udp_reverse_listener_socket(
             socket,
             spec.clone(),
             Arc::clone(&active_conn),
-        )));
-    }
-    if let Ok(socket) = s6 {
-        join_handles.push(tokio::spawn(run_udp_reverse_listener_socket(
-            socket,
-            spec,
-            active_conn,
         )));
     }
 
