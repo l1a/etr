@@ -7,6 +7,7 @@ ETR_REL   := justfile_directory() + "/target/release/etr"
 ETRS_REL  := justfile_directory() + "/target/release/etrs"
 INSTALL   := home_directory() + "/.cargo/bin"
 LOG_FILE  := `echo "${XDG_STATE_HOME:-$HOME/.local/state}/etr/etrs.log"`
+MAN_DIR   := `echo "${XDG_DATA_HOME:-$HOME/.local/share}/man"`
 TMUX_SESS := "etr_test"
 
 # List available recipes
@@ -74,6 +75,31 @@ install-release: build-release
     cp "{{ETRS_REL}}" "{{INSTALL}}/etrs"
     cp "{{ETR_REL}}"  "{{INSTALL}}/etr"
     echo "Installed etrs and etr (release) to {{INSTALL}}"
+
+# ── Man pages ────────────────────────────────────────────────────────────────
+
+# Build man pages from man/*.md using pandoc
+man:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! command -v pandoc >/dev/null 2>&1; then
+        echo "ERROR: pandoc is required to build man pages" >&2
+        exit 1
+    fi
+    mkdir -p man/build
+    pandoc -s -t man man/etr.1.md  -o man/build/etr.1
+    pandoc -s -t man man/etrs.1.md -o man/build/etrs.1
+    echo "Built man/build/etr.1 and man/build/etrs.1"
+
+# Install man pages to XDG local man directory (~/.local/share/man/man1)
+install-man: man
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p "{{MAN_DIR}}/man1"
+    cp man/build/etr.1  "{{MAN_DIR}}/man1/etr.1"
+    cp man/build/etrs.1 "{{MAN_DIR}}/man1/etrs.1"
+    echo "Installed etr.1 and etrs.1 to {{MAN_DIR}}/man1"
+    echo "Tip: add {{MAN_DIR}} to MANPATH if not already present"
 
 # ── Local end-to-end testing ─────────────────────────────────────────────────
 
