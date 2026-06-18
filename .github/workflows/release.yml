@@ -25,20 +25,11 @@ jobs:
       - name: Build release binaries
         run: cargo build --release
 
-      - name: Generate shell completions
-        run: |
-          mkdir -p completions
-          target/release/etr --completions bash  > completions/etr.bash
-          target/release/etr --completions zsh   > completions/etr.zsh
-          target/release/etr --completions fish  > completions/etr.fish
-          target/release/etr --completions nushell > completions/etr.nu
-
       - name: Package release assets
         run: |
           mkdir -p dist
           cp target/release/etr  dist/etr-linux-x86_64
           cp target/release/etrs dist/etrs-linux-x86_64
-          cp -r completions dist/
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
