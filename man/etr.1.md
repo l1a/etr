@@ -52,17 +52,51 @@ SSH channel and pinned for subsequent QUIC connections.
     to avoid corrupting the raw-mode terminal display. Before the session
     enters raw mode, output goes to stderr.
 
-**-L** *local_port*:*remote_host*:*remote_port*\[/*tcp*|/*udp*\]
+**-L** \[*bind_address*:\]*local_port*:*remote_host*:*remote_port*\[/*tcp*|/*udp*\]
 :   Forward a local port to a remote destination, similar to **ssh -L**.
-    The protocol defaults to TCP if not specified. This option may be
-    repeated to open multiple forwards concurrently alongside the PTY
+    The protocol defaults to TCP if not specified. By default, the local listener
+    binds to both **127.0.0.1** and **[::1]** loopback interfaces.
+
+    If *bind_address* is specified as **\***, **0.0.0.0**, or **::**, the listener binds
+    a single dual-stack **[::]** socket, which accepts both IPv4 and IPv6 connections.
+    Alternatively, it can bind to a specific interface IP.
+    The **-g** / **\-\-gateway-ports** flag can also be used to bind all forwards to all interfaces.
+
+    This option may be repeated to open multiple forwards concurrently alongside the PTY
     session.
 
     Examples:
 
         -L 8080:localhost:80
+        -L *:3000:localhost:3000
+        -L [::1]:8080:localhost:80
         -L 5353:8.8.8.8:53/udp
         -L 5432:db.internal:5432/tcp
+
+**-R** \[*bind_address*:\]*remote_port*:*local_host*:*local_port*\[/*tcp*|/*udp*\]
+:   Forward a remote port on the server to a local destination, similar to **ssh -R**.
+    The protocol defaults to TCP if not specified. By default, the remote listener
+    on the server binds to both **127.0.0.1** and **[::1]** loopback interfaces.
+
+    If *bind_address* is specified as **\***, **0.0.0.0**, or **::**, the remote listener binds
+    a single dual-stack **[::]** socket on the server. Alternatively, it can bind to a specific
+    interface IP.  The **-g** / **\-\-gateway-ports** flag also causes remote listeners to bind
+    to all interfaces on the server.
+
+    This option may be repeated to open multiple reverse forwards concurrently alongside the PTY
+    session.
+
+    Examples:
+
+        -R 8080:localhost:80
+        -R 0.0.0.0:3000:localhost:3000
+        -R 5353:127.0.0.1:53/udp
+
+**-g**, **\-\-gateway-ports**
+:   Allow remote hosts to connect to forwarded ports. Similar to **ssh -g**.
+    Binds both local (**-L**) and remote (**-R**) forwarded ports to a single dual-stack
+    **[::]** socket, which accepts both IPv4 and IPv6 connections on all interfaces,
+    instead of binding to loopback only.
 
 **\-\-server-path** *PATH*
 :   Path to the **etrs** binary on the remote host. Defaults to **etrs**
@@ -103,6 +137,15 @@ log_path = "/tmp/client.log"
 
 # Default path to the server log file on the remote host
 server_log_path = "/tmp/server.log"
+
+# Allow remote hosts to connect to local forwarded ports (default: false)
+gateway_ports = true
+
+# Default local port forwards
+forward = ["8080:localhost:80", "*:3000:localhost:3000"]
+
+# Default remote port forwards
+reverse_forward = ["9090:localhost:90"]
 ```
 
 # FILES
@@ -152,6 +195,14 @@ Forward a UDP port (DNS) through a jump host:
 
     etr -L 5353:8.8.8.8:53/udp user@jumphost
 
+Reverse forward a remote port on the server to a local web server:
+
+    etr -R 8080:localhost:80 user@example.com
+
+Reverse forward allowing external connections to the server's port:
+
+    etr -R 0.0.0.0:8080:localhost:80 user@example.com
+
 Generate zsh completions:
 
     etr --completions zsh > ~/.zfunc/_etr
@@ -170,11 +221,9 @@ Generate zsh completions:
 
 # BUGS
 
-- **-R** (remote-to-local port forwarding) is not yet implemented.
 - Session state is not persisted; re-attaching from a different client
   machine is not supported.
-- **utmp**/**wtmp** registration is not yet implemented, so the session
-  does not appear in **who**(1) or **w**(1) output.
+
 
 # AUTHORS
 

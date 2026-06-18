@@ -74,6 +74,17 @@ struct Cli {
     #[arg(short = 'L', value_name = "SPEC")]
     forward: Vec<String>,
 
+    /// Remote port forwarding (repeatable): remote_port:local_host:local_port[/tcp|/udp]
+    /// Works like ssh -R. Default protocol: tcp.
+    /// Example: -R 8080:localhost:80  -R 5353:127.0.0.1:53/udp
+    #[arg(short = 'R', value_name = "SPEC")]
+    reverse_forward: Vec<String>,
+
+    /// Gateway ports: allow remote hosts to connect to local forwarded ports.
+    /// Works like ssh -g. Automatically binds local forwarded ports to all interfaces (0.0.0.0 and ::).
+    #[arg(short = 'g', long)]
+    gateway_ports: bool,
+
     /// Path to the client log file (default: $XDG_STATE_HOME/etr/etr.log)
     #[arg(long, value_name = "PATH")]
     log_path: Option<std::path::PathBuf>,
@@ -165,8 +176,15 @@ async fn main() -> io::Result<()> {
         .or(cfg.client.server_path)
         .unwrap_or_else(|| "etrs".to_string());
 
+    let forwards = if !cli.forward.is_empty() {
+        &cli.forward
+    } else if let Some(ref list) = cfg.client.forward {
+        list
+    } else {
+        &cli.forward
+    };
     let mut forward_specs: Vec<ForwardSpec> = Vec::new();
-    for s in &cli.forward {
+    for s in forwards {
         match ForwardSpec::parse(s) {
             Ok(spec) => {
                 vlog!(cli.verbose, 1, "[etr] Forwarding: {spec}");
@@ -178,6 +196,33 @@ async fn main() -> io::Result<()> {
             }
         }
     }
+
+    let reverse_forwards = if !cli.reverse_forward.is_empty() {
+        &cli.reverse_forward
+    } else if let Some(ref list) = cfg.client.reverse_forward {
+        list
+    } else {
+        &cli.reverse_forward
+    };
+    let mut reverse_forward_specs: Vec<String> = Vec::new();
+    for s in reverse_forwards {
+        match ForwardSpec::parse(s) {
+            Ok(spec) => {
+                vlog!(cli.verbose, 1, "[etr] Reverse forwarding: {spec}");
+                reverse_forward_specs.push(s.clone());
+            }
+            Err(e) => {
+                eprintln!("[etr] error: {e}");
+                return Ok(());
+            }
+        }
+    }
+
+    let gateway_ports = if cli.gateway_ports {
+        true
+    } else {
+        cfg.client.gateway_ports.unwrap_or(false)
+    };
 
     let session_id = generate_session_id();
     let passkey = generate_passkey();
@@ -215,6 +260,8 @@ async fn main() -> io::Result<()> {
         session_id,
         session,
         forward_specs,
+        reverse_forward_specs,
+        gateway_ports,
         cli.verbose,
     )
     .await
@@ -332,6 +379,8 @@ async fn run_connection_loop(
     session_id: [u8; 16],
     session: Arc<Mutex<SessionState>>,
     forward_specs: Vec<ForwardSpec>,
+    reverse_forward_specs: Vec<String>,
+    gateway_ports: bool,
     verbose: u8,
 ) -> io::Result<()> {
     let host = if let Some(idx) = target.find('@') {
@@ -420,6 +469,8 @@ async fn run_connection_loop(
             Arc::clone(&session),
             Arc::clone(&stdin_rx),
             forward_specs.clone(),
+            reverse_forward_specs.clone(),
+            gateway_ports,
             verbose,
         )
         .await;
@@ -442,6 +493,7 @@ async fn run_connection_loop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_session(
     conn: quinn::Connection,
     session_id: [u8; 16],
@@ -449,6 +501,8 @@ async fn run_session(
     session: Arc<Mutex<SessionState>>,
     stdin_rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
     forward_specs: Vec<ForwardSpec>,
+    reverse_forward_specs: Vec<String>,
+    gateway_ports: bool,
     verbose: u8,
 ) -> io::Result<()> {
     // ── Open control stream ───────────────────────────────────────────────
@@ -468,8 +522,11 @@ async fn run_session(
             session_id: session_id.to_vec(),
             passkey: passkey.clone(),
             last_received_seq: last_received,
+            reverse_forwards: reverse_forward_specs.clone(),
+            gateway_ports,
         })),
     };
+
     quic::write_msg(&mut ctrl_send, &session_open).await?;
 
     // Read SessionAccept.
@@ -690,11 +747,136 @@ async fn run_session(
         let conn2 = conn.clone();
         let spec2 = spec.clone();
         let handle = match spec.proto {
-            ForwardProto::Tcp => tokio::spawn(run_tcp_acceptor_quic(spec2, conn2, verbose)),
-            ForwardProto::Udp => tokio::spawn(run_udp_forward_client_quic(spec2, conn2, verbose)),
+            ForwardProto::Tcp => {
+                tokio::spawn(run_tcp_acceptor_quic(spec2, conn2, gateway_ports, verbose))
+            }
+            ForwardProto::Udp => tokio::spawn(run_udp_forward_client_quic(
+                spec2,
+                conn2,
+                gateway_ports,
+                verbose,
+            )),
         };
         fwd_handles.push(handle);
     }
+
+    // ── Reverse forward stream acceptor task ──────────────────────────────
+    let conn_clone = conn.clone();
+    let verbose_clone = verbose;
+    let reverse_acceptor_handle = tokio::spawn(async move {
+        while let Ok((mut quic_send, mut quic_recv)) = conn_clone.accept_bi().await {
+            let verbose = verbose_clone;
+            tokio::spawn(async move {
+                let tag = match quic::read_tag(&mut quic_recv).await {
+                    Ok(t) => t,
+                    Err(_) => return,
+                };
+                if tag != TAG_FORWARD {
+                    vlog!(
+                        verbose,
+                        1,
+                        "[etr] reverse forward error: expected TAG_FORWARD, got 0x{tag:02x}"
+                    );
+                    return;
+                }
+                let so = match quic::read_msg(&mut quic_recv).await {
+                    Ok(Some(env)) => match env.payload {
+                        Some(Payload::StreamOpen(so)) => so,
+                        _ => return,
+                    },
+                    _ => return,
+                };
+                let proto = ForwardProto::try_from(so.forward_proto).unwrap_or(ForwardProto::Tcp);
+                match proto {
+                    ForwardProto::Tcp => {
+                        let addr = format!("{}:{}", so.remote_host, so.remote_port);
+                        use tokio::net::TcpStream;
+                        vlog!(verbose, 2, "[etr] connecting to local TCP target {addr}");
+                        let tcp = match TcpStream::connect(&addr).await {
+                            Ok(t) => t,
+                            Err(e) => {
+                                vlog!(
+                                    verbose,
+                                    1,
+                                    "[etr] failed to connect to local target {addr}: {e}"
+                                );
+                                let _ = quic_send.finish();
+                                return;
+                            }
+                        };
+                        run_tcp_connection_quic(tcp, quic_send, quic_recv).await;
+                    }
+                    ForwardProto::Udp => {
+                        let addr = format!("{}:{}", so.remote_host, so.remote_port);
+                        vlog!(verbose, 2, "[etr] forwarding UDP reverse stream to {addr}");
+                        use tokio::net::UdpSocket;
+                        let socket = match UdpSocket::bind("0.0.0.0:0").await {
+                            Ok(s) => Arc::new(s),
+                            Err(e) => {
+                                vlog!(verbose, 1, "[etr] failed to bind local UDP socket: {e}");
+                                let _ = quic_send.finish();
+                                return;
+                            }
+                        };
+
+                        let socket2 = Arc::clone(&socket);
+                        let mut quic_send = quic_send;
+                        let verbose_reply = verbose;
+                        let mut reply_task = tokio::spawn(async move {
+                            let mut buf = vec![0u8; 65535];
+                            while let Ok((n, src)) = socket2.recv_from(&mut buf).await {
+                                vlog!(
+                                    verbose_reply,
+                                    3,
+                                    "[etr] UDP reverse fwd: read {n} bytes from local target {src}"
+                                );
+                                let env = Envelope {
+                                    payload: Some(Payload::UdpDatagram(UdpDatagram {
+                                        peer_addr: String::new(),
+                                        peer_port: 0,
+                                        data: buf[..n].to_vec(),
+                                    })),
+                                };
+                                if quic::write_msg(&mut quic_send, &env).await.is_err() {
+                                    vlog!(
+                                        verbose_reply,
+                                        1,
+                                        "[etr] UDP reverse fwd: failed to write reply to QUIC"
+                                    );
+                                    break;
+                                }
+                            }
+                        });
+
+                        let socket_send = Arc::clone(&socket);
+                        let verbose_send = verbose;
+                        let mut send_task = tokio::spawn(async move {
+                            while let Ok(Some(env)) = quic::read_msg(&mut quic_recv).await {
+                                if let Some(Payload::UdpDatagram(dg)) = env.payload {
+                                    vlog!(
+                                        verbose_send,
+                                        3,
+                                        "[etr] UDP reverse fwd: forwarding {} bytes to local target {addr}",
+                                        dg.data.len()
+                                    );
+                                    let _ = socket_send.send_to(&dg.data, &addr).await;
+                                }
+                            }
+                        });
+
+                        tokio::select! {
+                            _ = &mut reply_task => {}
+                            _ = &mut send_task => {}
+                        }
+                        reply_task.abort();
+                        send_task.abort();
+                        vlog!(verbose, 2, "[etr] UDP reverse fwd stream ended");
+                    }
+                }
+            });
+        }
+    });
+    fwd_handles.push(reverse_acceptor_handle);
 
     // ── Wait for any task to complete ─────────────────────────────────────
     let result = tokio::select! {
@@ -721,17 +903,40 @@ async fn run_session(
 
 // ── Forward helpers (client side) ────────────────────────────────────────────
 
-/// Accept local TCP connections and open a QUIC forward stream per connection.
-async fn run_tcp_acceptor_quic(spec: ForwardSpec, conn: quinn::Connection, verbose: u8) {
+/// Accept local TCP connections on the addresses resolved by `spec.get_bind_addresses(gateway)`
+/// and open one QUIC forward stream per connection toward the spec's remote host/port.
+///
+/// `gateway` mirrors the `-g` / `--gateway-ports` flag: when `true`, the listener binds
+/// a dual-stack `[::]` socket (all interfaces); when `false` it binds `127.0.0.1` + `[::1]`
+/// or whatever explicit bind address the spec contains.
+async fn run_tcp_acceptor_quic(
+    spec: ForwardSpec,
+    conn: quinn::Connection,
+    gateway: bool,
+    verbose: u8,
+) {
     use tokio::net::TcpListener;
 
-    let listener = match TcpListener::bind(format!("127.0.0.1:{}", spec.local_port)).await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("[etr] cannot bind TCP port {}: {e}", spec.local_port);
-            return;
+    let bind_addrs = spec.get_bind_addresses(gateway);
+    let mut listeners = Vec::new();
+    for addr in &bind_addrs {
+        let target = format!("{addr}:{}", spec.local_port);
+        match TcpListener::bind(&target).await {
+            Ok(l) => listeners.push(l),
+            Err(e) => {
+                vlog!(verbose, 1, "[etr] TCP bind to {target} failed: {e}");
+            }
         }
-    };
+    }
+
+    if listeners.is_empty() {
+        eprintln!(
+            "[etr] cannot bind TCP port {} on any of {:?}",
+            spec.local_port, bind_addrs
+        );
+        return;
+    }
+
     vlog!(
         verbose,
         1,
@@ -741,40 +946,59 @@ async fn run_tcp_acceptor_quic(spec: ForwardSpec, conn: quinn::Connection, verbo
         spec.remote_port
     );
 
-    loop {
-        let (tcp_stream, peer) = match listener.accept().await {
-            Ok(s) => s,
-            Err(e) => {
-                vlog!(verbose, 1, "[etr] TCP accept error: {e}");
-                break;
-            }
-        };
-        vlog!(verbose, 2, "[etr] TCP connect from {peer}");
-
-        let conn2 = conn.clone();
-        let spec2 = spec.clone();
-        tokio::spawn(async move {
-            let (mut quic_send, quic_recv) = match conn2.open_bi().await {
+    let run_loop = |listener: TcpListener,
+                    conn: quinn::Connection,
+                    spec: ForwardSpec,
+                    verbose: u8| async move {
+        loop {
+            let (tcp_stream, peer) = match listener.accept().await {
                 Ok(s) => s,
-                Err(_) => return,
+                Err(e) => {
+                    vlog!(verbose, 1, "[etr] TCP accept error: {e}");
+                    break;
+                }
             };
-            let so = Envelope {
-                payload: Some(Payload::StreamOpen(StreamOpen {
-                    stream_id: 0,
-                    stream_type: etr::protocol::StreamType::PortForward as i32,
-                    remote_host: spec2.remote_host.clone(),
-                    remote_port: spec2.remote_port as u32,
-                    forward_proto: ForwardProto::Tcp as i32,
-                })),
-            };
-            if quic_send.write_all(&[TAG_FORWARD]).await.is_err() {
-                return;
-            }
-            if quic::write_msg(&mut quic_send, &so).await.is_err() {
-                return;
-            }
-            run_tcp_connection_quic(tcp_stream, quic_send, quic_recv).await;
-        });
+            vlog!(verbose, 2, "[etr] TCP connect from {peer}");
+
+            let conn2 = conn.clone();
+            let spec2 = spec.clone();
+            tokio::spawn(async move {
+                let (mut quic_send, quic_recv) = match conn2.open_bi().await {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let so = Envelope {
+                    payload: Some(Payload::StreamOpen(StreamOpen {
+                        stream_id: 0,
+                        stream_type: etr::protocol::StreamType::PortForward as i32,
+                        remote_host: spec2.remote_host.clone(),
+                        remote_port: spec2.remote_port as u32,
+                        forward_proto: ForwardProto::Tcp as i32,
+                    })),
+                };
+                if quic_send.write_all(&[TAG_FORWARD]).await.is_err() {
+                    return;
+                }
+                if quic::write_msg(&mut quic_send, &so).await.is_err() {
+                    return;
+                }
+                run_tcp_connection_quic(tcp_stream, quic_send, quic_recv).await;
+            });
+        }
+    };
+
+    let mut join_handles = Vec::new();
+    for listener in listeners {
+        join_handles.push(tokio::spawn(run_loop(
+            listener,
+            conn.clone(),
+            spec.clone(),
+            verbose,
+        )));
+    }
+
+    for h in join_handles {
+        let _ = h.await;
     }
 }
 
@@ -826,17 +1050,40 @@ async fn run_tcp_connection_quic(
     t2.abort();
 }
 
-/// Open one QUIC forward stream for a UDP `-L` spec; pipe local datagrams through it.
-async fn run_udp_forward_client_quic(spec: ForwardSpec, conn: quinn::Connection, verbose: u8) {
+/// Open one QUIC forward stream for a UDP `-L` spec and pipe local datagrams through it.
+///
+/// Binds one local UDP socket per address returned by `spec.get_bind_addresses(gateway)`.
+/// `gateway` mirrors the `-g` / `--gateway-ports` flag: when `true`, the socket binds
+/// a dual-stack `[::]` socket (all interfaces); when `false` it binds `127.0.0.1` + `[::1]`
+/// or whatever explicit bind address the spec contains.
+async fn run_udp_forward_client_quic(
+    spec: ForwardSpec,
+    conn: quinn::Connection,
+    gateway: bool,
+    verbose: u8,
+) {
     use tokio::net::UdpSocket;
 
-    let local_socket = match UdpSocket::bind(format!("0.0.0.0:{}", spec.local_port)).await {
-        Ok(s) => Arc::new(s),
-        Err(e) => {
-            eprintln!("[etr] cannot bind UDP port {}: {e}", spec.local_port);
-            return;
+    let bind_addrs = spec.get_bind_addresses(gateway);
+    let mut sockets = Vec::new();
+    for addr in &bind_addrs {
+        let target = format!("{addr}:{}", spec.local_port);
+        match UdpSocket::bind(&target).await {
+            Ok(s) => sockets.push(s),
+            Err(e) => {
+                vlog!(verbose, 1, "[etr] UDP bind to {target} failed: {e}");
+            }
         }
-    };
+    }
+
+    if sockets.is_empty() {
+        eprintln!(
+            "[etr] cannot bind UDP port {} on any of {:?}",
+            spec.local_port, bind_addrs
+        );
+        return;
+    }
+
     vlog!(
         verbose,
         1,
@@ -846,6 +1093,28 @@ async fn run_udp_forward_client_quic(spec: ForwardSpec, conn: quinn::Connection,
         spec.remote_port
     );
 
+    let mut join_handles = Vec::new();
+    for socket in sockets {
+        join_handles.push(tokio::spawn(run_udp_forward_client_socket(
+            socket,
+            spec.clone(),
+            conn.clone(),
+            verbose,
+        )));
+    }
+
+    for h in join_handles {
+        let _ = h.await;
+    }
+}
+
+async fn run_udp_forward_client_socket(
+    local_socket: tokio::net::UdpSocket,
+    spec: ForwardSpec,
+    conn: quinn::Connection,
+    verbose: u8,
+) {
+    let local_socket = Arc::new(local_socket);
     let (mut quic_send, mut quic_recv) = match conn.open_bi().await {
         Ok(s) => s,
         Err(e) => {

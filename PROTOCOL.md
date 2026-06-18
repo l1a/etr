@@ -149,6 +149,8 @@ message SessionOpen {
   bytes                   session_id        = 1;  // 16 bytes
   string                  passkey           = 2;
   map<uint32, uint64>     last_received_seq = 3;  // per-stream watermarks
+  repeated string         reverse_forwards  = 4;  // "-R" specs from the client
+  bool                    gateway_ports     = 5;  // bind reverse listeners to [::] (all interfaces)
 }
 
 message SessionAccept {
@@ -156,11 +158,11 @@ message SessionAccept {
 }
 
 message StreamOpen {
-  uint32     stream_id   = 1;
-  StreamType type        = 2;
-  string     remote_host = 3;  // port-forward target host
-  uint32     remote_port = 4;  // port-forward target port
-  bool       is_udp      = 5;
+  uint32     stream_id      = 1;
+  StreamType type           = 2;
+  string     remote_host    = 3;  // port-forward target host
+  uint32     remote_port    = 4;  // port-forward target port
+  ForwardProto forward_proto = 5; // TCP or UDP
 }
 
 message StreamClose {
@@ -204,9 +206,13 @@ Client                                          Server
   │── QUIC connect (TLS 1.3, pinned cert) ───────►│
   │                                               │
   │── stream tag 0x01 ───────────────────────────►│
-  │── [len][SessionOpen{session_id, passkey,       │
-  │         last_received_seq}] ─────────────────►│
+  │── [len][SessionOpen{                           │
+  │         session_id, passkey,                   │
+  │         last_received_seq,                     │
+  │         reverse_forwards,    // -R specs       │
+  │         gateway_ports}] ─────────────────────►│
   │                                               │  verify passkey
+  │                                               │  bind reverse-forward listeners
   │                                               │  replay PTY history if reconnect
   │◄── [len][SessionAccept{last_received_seq}] ───│
   │                                               │

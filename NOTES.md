@@ -9,11 +9,11 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.3.0 — shipped to crates.io
+## Current state: v0.4.0 — remote port forwarding support
 
 The full round-trip works: `etr <host>` on the client, SSH bootstrap that starts
-`etrs` on the fly, QUIC connection with cert pinning, live PTY session, heartbeat
-keepalive, transparent reconnect after network loss, and `-L` TCP/UDP port forwarding.
+`etrs` on the fly, QUIC connection with cert pinning, PTY session, keepalives,
+reconnecting after drops, `-L` local port forwarding, and `-R` remote port forwarding (both TCP and UDP).
 Published to crates.io; `cargo install etr` installs both binaries.
 
 ---
@@ -235,7 +235,7 @@ just install-release  # copies target/release/{etr,etrs} to ~/.cargo/bin
 
 # Code quality gate — run before every commit
 just check            # cargo fmt --check + cargo clippy -D warnings
-just test             # cargo test (61 tests)
+just test             # cargo test (67 tests)
 ```
 
 ---
@@ -287,11 +287,14 @@ etr -L 5432:db-host:5432 user@jumphost    # local port → remote (TCP)
 etr -L 5353:8.8.8.8:53/udp user@jumphost # UDP forwarding
 ```
 
-**Current state**: `-L local_port:remote_host:remote_port[/tcp|/udp]` is implemented for
+**Current state**: `-L [bind_address:]local_port:remote_host:remote_port[/tcp|/udp]` is implemented for
 both TCP and UDP, running concurrently alongside the PTY session.  TCP opens one QUIC
-stream per connection; UDP uses one shared QUIC stream per `-L` spec with
-last-sender reply routing.  Runs without a PTY session if no terminal is attached.
-`-R` (remote-to-local) is not yet implemented.
+stream per connection; UDP uses one shared QUIC stream per `-L` spec with last-sender reply routing.
+By default, local listeners are bound to both `127.0.0.1` and `[::1]` loopbacks. If `-g`/`--gateway-ports` is specified,
+they are bound to wildcard addresses (`0.0.0.0` and `[::]`). Specific bind addresses can be set in the spec.
+Runs without a PTY session if no terminal is attached.
+`-R [bind_address:]remote_port:local_host:local_port[/tcp|/udp]` is implemented for both TCP and UDP.
+By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks on the target machine, but explicit bind addresses (e.g. `*` or `0.0.0.0`) can be specified to allow external hosts to connect.
 
 ---
 
@@ -304,8 +307,7 @@ last-sender reply routing.  Runs without a PTY session if no terminal is attache
   Sessions appear in `last`; `who`/`w` read from systemd-logind on modern Fedora
   and do not show utmp-only sessions.  Non-Linux builds get no-op stubs.
 - ~~**Benchmarking**~~ **Done**: Criterion benchmark suite implemented in `benches/session_bench.rs` measuring certificate generation, QUIC connection handshake latency, PTY round-trip latency (100b), and throughput (64kb).
-- **Mode 2 — `-R` remote forwarding**: `-L` (local-to-remote) is done; `-R` (remote
-  port → local) is not yet implemented.
+- ~~**Mode 2 — `-R` remote forwarding**~~ **Done**: Both TCP and UDP remote port forwarding are supported using the `-R` CLI flag.
 - **UDP reply routing**: current shared-socket design uses last-sender routing —
   replies from the remote UDP target go to whichever local client sent the most recent
   datagram.  Suitable for single-sender and sequential request/response (DNS, STUN);
@@ -322,15 +324,15 @@ last-sender reply routing.  Runs without a PTY session if no terminal is attache
 
 ---
 
-## Test coverage (61 tests)
+## Test coverage (67 tests)
 
 | Module | What's tested |
 |--------|--------------|
 | `quic` | Cert generation, server/client config, write/read Envelope framing, write/read PTY chunk framing |
-| `protocol` | SessionOpen/Accept encode-decode, StreamOpen/Close, Heartbeat, Disconnect, UdpDatagram |
+| `protocol` | SessionOpen/Accept encode-decode (incl. `gateway_ports` and `reverse_forwards` round-trip), StreamOpen/Close, Heartbeat, Disconnect, UdpDatagram |
 | `session/stream` | Acknowledge edge cases, replay from 0, initial seq values |
 | `session/mod` | Close/ack unknown stream, `last_received_map` semantics, collect_replays, `open_stream` idempotence |
 | `bin/etrs` | CLI defaults, verbose count, custom port, subcommand parsing, hex_decode, custom --log-path override |
-| `bin/etr` | CLI defaults, port parsing, target parsing, no --cipher flag, custom --log-path and --server-log-path overrides |
-| `config` | TOML parse (full section, partial, empty), default values |
-| `forward` | `-L` spec parsing: TCP/UDP/IPv6, explicit proto, bad port, empty host, Display |
+| `bin/etr` | CLI defaults, port parsing, target parsing, no --cipher flag, custom --log-path and --server-log-path overrides, config fallback for log paths |
+| `config` | TOML parse (full section, partial, empty), default values, `gateway_ports` / `forward` / `reverse_forward` config keys |
+| `forward` | `-L`/`-R` spec parsing: TCP/UDP/IPv6, explicit proto, bad port, empty host, Display; bind address parsing (explicit IP, `[::1]`, wildcard `*`); `get_bind_addresses` with and without gateway flag |

@@ -249,6 +249,146 @@ e2e-local: check-tools install
     echo ""
     echo "==> All tests passed."
 
+# Run the local E2E test for reverse port forwarding (both TCP and UDP)
+e2e-reverse-local: check-tools install
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    CLIENT_LOG="${XDG_STATE_HOME:-$HOME/.local/state}/etr/etr.log"
+    TMUX_REVERSE="etr_reverse_test"
+    TCP_LOCAL_PORT=19301
+    TCP_REMOTE_PORT=19302
+    UDP_LOCAL_PORT=19303
+    UDP_REMOTE_PORT=19304
+
+    cleanup() {
+        echo ""
+        echo "--- cleanup ---"
+        kill "${TCP_ECHO_PID:-}" "${UDP_ECHO_PID:-}" 2>/dev/null || true
+        tmux kill-session -t "$TMUX_REVERSE" 2>/dev/null || true
+        pkill -x etrs 2>/dev/null || true
+    }
+    trap cleanup EXIT
+
+    mkdir -p "$(dirname "$CLIENT_LOG")"
+    > "$CLIENT_LOG"
+
+    # Start local echo servers on the client side
+    echo "==> Starting local TCP echo server on port ${TCP_LOCAL_PORT}..."
+    python3 "{{justfile_directory()}}/scripts/stress/tcp_echo.py" "${TCP_LOCAL_PORT}" &
+    TCP_ECHO_PID=$!
+
+    echo "==> Starting local UDP echo server on port ${UDP_LOCAL_PORT}..."
+    python3 "{{justfile_directory()}}/scripts/stress/udp_echo.py" "${UDP_LOCAL_PORT}" &
+    UDP_ECHO_PID=$!
+    sleep 0.5
+
+    # Launch etr with reverse forwarding specs
+    echo "==> Launching etr with -R specs..."
+    tmux new-session -d -s "$TMUX_REVERSE" -x 200 -y 50 -- \
+        "{{INSTALL}}/etr" -v \
+        -R "${TCP_REMOTE_PORT}:localhost:${TCP_LOCAL_PORT}" \
+        -R "${UDP_REMOTE_PORT}:127.0.0.1:${UDP_LOCAL_PORT}/udp" \
+        localhost
+
+    # Wait for connect
+    echo "    waiting for etr to connect..."
+    READY=0
+    for i in $(seq 1 30); do
+        sleep 1
+        grep -q '\[etr\] Connected\.' "$CLIENT_LOG" 2>/dev/null && { READY=1; break; }
+    done
+    if [[ $READY -eq 0 ]]; then
+        echo "ERROR: '[etr] Connected.' not seen in $CLIENT_LOG within 30 s" >&2
+        cat "$CLIENT_LOG" >&2
+        exit 1
+    fi
+
+    # Wait for the listeners to bind on the server (localhost)
+    sleep 1.5
+
+    # Verify TCP reverse forwarding by sending data to the server's remote port
+    echo "==> Testing TCP reverse forwarding..."
+    TCP_OUT=$(python3 -c '
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(3.0)
+    s.connect(("127.0.0.1", '"${TCP_REMOTE_PORT}"'))
+    s.sendall(b"REVERSE_TCP_OK\n")
+    print(s.recv(1024).decode())
+    s.close()
+    ' 2>/dev/null || true)
+
+    if [[ "$TCP_OUT" == *"REVERSE_TCP_OK"* ]]; then
+        echo "    PASS: TCP reverse forwarding functional."
+    else
+        echo "FAIL: TCP reverse forwarding check failed. Output: '${TCP_OUT}'" >&2
+        exit 1
+    fi
+
+    # Verify TCP reverse forwarding over IPv6 loopback
+    echo "==> Testing TCP reverse forwarding over IPv6..."
+    TCP_OUT_IPV6=$(python3 -c '
+    import socket
+    s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    s.settimeout(3.0)
+    s.connect(("::1", '"${TCP_REMOTE_PORT}"'))
+    s.sendall(b"REVERSE_TCP_IPV6_OK\n")
+    print(s.recv(1024).decode())
+    s.close()
+    ' 2>/dev/null || true)
+
+    if [[ "$TCP_OUT_IPV6" == *"REVERSE_TCP_IPV6_OK"* ]]; then
+        echo "    PASS: TCP reverse forwarding over IPv6 functional."
+    else
+        echo "FAIL: TCP reverse forwarding over IPv6 check failed. Output: '${TCP_OUT_IPV6}'" >&2
+        exit 1
+    fi
+
+    # Verify UDP reverse forwarding
+    echo "==> Testing UDP reverse forwarding..."
+    UDP_OUT=$(python3 -c '
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(3.0)
+    s.sendto(b"REVERSE_UDP_OK", ("127.0.0.1", '"${UDP_REMOTE_PORT}"'))
+    try:
+        data, addr = s.recvfrom(1024)
+        print(data.decode())
+    except socket.timeout:
+        print("timeout")
+    ' 2>/dev/null || true)
+
+    if [[ "$UDP_OUT" == *"REVERSE_UDP_OK"* ]]; then
+        echo "    PASS: UDP reverse forwarding functional."
+    else
+        echo "FAIL: UDP reverse forwarding check failed. Output: '${UDP_OUT}'" >&2
+        exit 1
+    fi
+
+    # Verify UDP reverse forwarding over IPv6 loopback
+    echo "==> Testing UDP reverse forwarding over IPv6..."
+    UDP_OUT_IPV6=$(python3 -c '
+    import socket
+    s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+    s.settimeout(3.0)
+    s.sendto(b"REVERSE_UDP_IPV6_OK", ("::1", '"${UDP_REMOTE_PORT}"'))
+    try:
+        data, addr = s.recvfrom(1024)
+        print(data.decode())
+    except socket.timeout:
+        print("timeout")
+    ' 2>/dev/null || true)
+
+    if [[ "$UDP_OUT_IPV6" == *"REVERSE_UDP_IPV6_OK"* ]]; then
+        echo "    PASS: UDP reverse forwarding over IPv6 functional."
+    else
+        echo "FAIL: UDP reverse forwarding over IPv6 check failed. Output: '${UDP_OUT_IPV6}'" >&2
+        exit 1
+    fi
+
+    echo "==> All reverse E2E tests passed."
+
 # Stress-test all three stream types simultaneously while watching etrs memory.
 #
 # Opens: 1 PTY stream + 2 -L forward streams (TCP echo + UDP echo).
