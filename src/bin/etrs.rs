@@ -285,6 +285,9 @@ async fn run_session(
         });
     }
 
+    let active_conn = Arc::new(Mutex::new(None));
+    let active_reverse_listeners = Arc::new(Mutex::new(std::collections::HashSet::new()));
+
     // ── Reconnect loop ───────────────────────────────────────────────────────
     const RECONNECT_WINDOW: Duration = Duration::from_secs(30 * 60);
 
@@ -336,11 +339,14 @@ async fn run_session(
             pty_in_tx.clone(),
             Arc::clone(&master),
             master_fd,
+            Arc::clone(&active_conn),
+            Arc::clone(&active_reverse_listeners),
         )
         .await;
 
         *outbound_pty_tx.lock().unwrap() = None;
         *outbound_ctrl_tx.lock().unwrap() = None;
+        *active_conn.lock().await = None;
 
         if clean {
             vlog!(1, "[etrs] client disconnected cleanly, shutting down");
@@ -366,6 +372,8 @@ async fn handle_connection(
     pty_in_tx: mpsc::Sender<Vec<u8>>,
     master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
     master_fd: Option<std::os::unix::io::RawFd>,
+    active_conn: Arc<Mutex<Option<quinn::Connection>>>,
+    active_reverse_listeners: Arc<Mutex<std::collections::HashSet<String>>>,
 ) -> bool {
     let peer = conn.remote_address();
     vlog!(
@@ -448,6 +456,35 @@ async fn handle_connection(
         .is_err()
     {
         return false;
+    }
+
+    // Update active connection
+    {
+        let mut ac = active_conn.lock().await;
+        *ac = Some(conn.clone());
+    }
+
+    // Spawn reverse port forwarding listeners
+    {
+        let mut started = active_reverse_listeners.lock().await;
+        for spec_str in &session_open.reverse_forwards {
+            if !started.contains(spec_str) {
+                if let Ok(spec) = etr::forward::ForwardSpec::parse(spec_str) {
+                    let active_conn_clone = Arc::clone(&active_conn);
+                    match spec.proto {
+                        ForwardProto::Tcp => {
+                            tokio::spawn(run_tcp_reverse_listener(spec, active_conn_clone));
+                        }
+                        ForwardProto::Udp => {
+                            tokio::spawn(run_udp_reverse_listener(spec, active_conn_clone));
+                        }
+                    }
+                    started.insert(spec_str.clone());
+                } else {
+                    vlog!(1, "[etrs] failed to parse reverse forward spec: {spec_str}");
+                }
+            }
+        }
     }
 
     // ── Per-connection channels ───────────────────────────────────────────
@@ -641,27 +678,13 @@ async fn handle_connection(
 
 // ── Forward helpers (server side) ────────────────────────────────────────────
 
-async fn serve_tcp_forward(
-    so: StreamOpen,
+async fn pipe_tcp_quic(
+    stream: tokio::net::TcpStream,
     mut quic_send: quinn::SendStream,
     mut quic_recv: quinn::RecvStream,
-    _session: Arc<Mutex<SessionState>>,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpStream;
-
-    let addr = format!("{}:{}", so.remote_host, so.remote_port);
-    let tcp = match TcpStream::connect(&addr).await {
-        Ok(s) => s,
-        Err(e) => {
-            vlog!(1, "[etrs] TCP connect to {addr} failed: {e}");
-            let _ = quic_send.finish();
-            return;
-        }
-    };
-    vlog!(2, "[etrs] TCP forward → {addr}");
-
-    let (mut tcp_r, mut tcp_w) = tcp.into_split();
+    let (mut tcp_r, mut tcp_w) = stream.into_split();
 
     let mut t1 = tokio::spawn(async move {
         let mut buf = vec![0u8; 8192];
@@ -700,7 +723,233 @@ async fn serve_tcp_forward(
     }
     t1.abort();
     t2.abort();
+}
+
+async fn serve_tcp_forward(
+    so: StreamOpen,
+    quic_send: quinn::SendStream,
+    quic_recv: quinn::RecvStream,
+    _session: Arc<Mutex<SessionState>>,
+) {
+    use tokio::net::TcpStream;
+
+    let addr = format!("{}:{}", so.remote_host, so.remote_port);
+    let tcp = match TcpStream::connect(&addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            vlog!(1, "[etrs] TCP connect to {addr} failed: {e}");
+            let mut qs = quic_send;
+            let _ = qs.finish();
+            return;
+        }
+    };
+    vlog!(2, "[etrs] TCP forward → {addr}");
+    pipe_tcp_quic(tcp, quic_send, quic_recv).await;
     vlog!(2, "[etrs] TCP forward to {addr} closed");
+}
+
+async fn run_tcp_reverse_listener(
+    spec: etr::forward::ForwardSpec,
+    active_conn: Arc<Mutex<Option<quinn::Connection>>>,
+) {
+    use tokio::net::TcpListener;
+    let listener = match TcpListener::bind(format!("0.0.0.0:{}", spec.local_port)).await {
+        Ok(l) => l,
+        Err(e) => {
+            vlog!(
+                1,
+                "[etrs] reverse TCP bind failed on {}: {e}",
+                spec.local_port
+            );
+            return;
+        }
+    };
+    vlog!(
+        1,
+        "[etrs] reverse TCP forwarding listening on port {}",
+        spec.local_port
+    );
+    loop {
+        let (tcp_stream, peer) = match listener.accept().await {
+            Ok(s) => s,
+            Err(e) => {
+                vlog!(1, "[etrs] reverse TCP accept error: {e}");
+                break;
+            }
+        };
+        vlog!(2, "[etrs] reverse TCP connection from {peer}");
+        let active_conn = Arc::clone(&active_conn);
+        let spec = spec.clone();
+        tokio::spawn(async move {
+            let conn = {
+                let g = active_conn.lock().await;
+                g.clone()
+            };
+            let conn = match conn {
+                Some(c) => c,
+                None => return,
+            };
+            let (mut quic_send, quic_recv) = match conn.open_bi().await {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let env = Envelope {
+                payload: Some(Payload::StreamOpen(StreamOpen {
+                    stream_id: 0,
+                    stream_type: etr::protocol::StreamType::PortForward as i32,
+                    remote_host: spec.remote_host.clone(),
+                    remote_port: spec.remote_port as u32,
+                    forward_proto: ForwardProto::Tcp as i32,
+                })),
+            };
+            if quic_send.write_all(&[TAG_FORWARD]).await.is_err() {
+                return;
+            }
+            if quic::write_msg(&mut quic_send, &env).await.is_err() {
+                return;
+            }
+            pipe_tcp_quic(tcp_stream, quic_send, quic_recv).await;
+        });
+    }
+}
+
+async fn run_udp_reverse_listener(
+    spec: etr::forward::ForwardSpec,
+    active_conn: Arc<Mutex<Option<quinn::Connection>>>,
+) {
+    use tokio::net::UdpSocket;
+    let socket = match UdpSocket::bind(format!("0.0.0.0:{}", spec.local_port)).await {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            vlog!(
+                1,
+                "[etrs] reverse UDP bind failed on {}: {e}",
+                spec.local_port
+            );
+            return;
+        }
+    };
+    vlog!(
+        1,
+        "[etrs] reverse UDP forwarding listening on port {}",
+        spec.local_port
+    );
+
+    let current_quic_tx: Arc<Mutex<Option<quinn::SendStream>>> = Arc::new(Mutex::new(None));
+    let last_conn_id: Arc<std::sync::Mutex<Option<quinn::Connection>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let last_peer: Arc<std::sync::Mutex<Option<std::net::SocketAddr>>> =
+        Arc::new(std::sync::Mutex::new(None));
+
+    let socket_recv = Arc::clone(&socket);
+    let last_peer_recv = Arc::clone(&last_peer);
+    let active_conn_recv = Arc::clone(&active_conn);
+    let current_quic_tx_recv = Arc::clone(&current_quic_tx);
+    let last_conn_id_recv = Arc::clone(&last_conn_id);
+    let spec_recv = spec.clone();
+
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+        while let Ok((n, src)) = socket_recv.recv_from(&mut buf).await {
+            vlog!(3, "[etrs] UDP reverse fwd received {n} bytes from {src}");
+            *last_peer_recv.lock().unwrap() = Some(src);
+
+            let conn = {
+                let g = active_conn_recv.lock().await;
+                g.clone()
+            };
+            let conn = match conn {
+                Some(c) => c,
+                None => {
+                    vlog!(2, "[etrs] UDP reverse fwd: active_conn is None");
+                    continue;
+                }
+            };
+
+            let mut current_tx = current_quic_tx_recv.lock().await;
+            let mut need_new_stream = current_tx.is_none();
+            if !need_new_stream {
+                let last_c = last_conn_id_recv.lock().unwrap();
+                if let Some(ref lc) = *last_c {
+                    if lc.stable_id() != conn.stable_id() {
+                        need_new_stream = true;
+                    }
+                } else {
+                    need_new_stream = true;
+                }
+            }
+
+            if need_new_stream {
+                vlog!(2, "[etrs] UDP reverse fwd: opening new QUIC stream");
+                let (mut tx, rx) = match conn.open_bi().await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        vlog!(1, "[etrs] UDP reverse fwd: open_bi failed: {e}");
+                        continue;
+                    }
+                };
+                let env = Envelope {
+                    payload: Some(Payload::StreamOpen(StreamOpen {
+                        stream_id: 0,
+                        stream_type: etr::protocol::StreamType::PortForward as i32,
+                        remote_host: spec_recv.remote_host.clone(),
+                        remote_port: spec_recv.remote_port as u32,
+                        forward_proto: ForwardProto::Udp as i32,
+                    })),
+                };
+                if tx.write_all(&[TAG_FORWARD]).await.is_ok()
+                    && quic::write_msg(&mut tx, &env).await.is_ok()
+                {
+                    *current_tx = Some(tx);
+                    *last_conn_id_recv.lock().unwrap() = Some(conn.clone());
+                    vlog!(2, "[etrs] UDP reverse fwd: stream opened and header sent");
+
+                    let socket_send = Arc::clone(&socket_recv);
+                    let last_peer_send = Arc::clone(&last_peer_recv);
+                    let mut rx = rx;
+                    tokio::spawn(async move {
+                        vlog!(3, "[etrs] UDP reverse fwd: rx reader task started");
+                        while let Ok(Some(env)) = quic::read_msg(&mut rx).await {
+                            if let Some(Payload::UdpDatagram(dg)) = env.payload {
+                                let target_addr = {
+                                    let g = last_peer_send.lock().unwrap();
+                                    *g
+                                };
+                                if let Some(addr) = target_addr {
+                                    vlog!(
+                                        3,
+                                        "[etrs] UDP reverse fwd rx: sending reply of {} bytes to {addr}",
+                                        dg.data.len()
+                                    );
+                                    let _ = socket_send.send_to(&dg.data, addr).await;
+                                }
+                            }
+                        }
+                        vlog!(3, "[etrs] UDP reverse fwd rx: rx reader task ended");
+                    });
+                } else {
+                    vlog!(1, "[etrs] UDP reverse fwd: failed to write tag/header");
+                    continue;
+                }
+            }
+
+            if let Some(ref mut tx) = *current_tx {
+                let env = Envelope {
+                    payload: Some(Payload::UdpDatagram(UdpDatagram {
+                        peer_addr: src.ip().to_string(),
+                        peer_port: src.port() as u32,
+                        data: buf[..n].to_vec(),
+                    })),
+                };
+                if quic::write_msg(tx, &env).await.is_err() {
+                    vlog!(1, "[etrs] UDP reverse fwd: failed to write msg to stream");
+                    *current_tx = None;
+                } else {
+                    vlog!(3, "[etrs] UDP reverse fwd: forwarded datagram of {n} bytes");
+                }
+            }
+        }
+    });
 }
 
 async fn serve_udp_forward(

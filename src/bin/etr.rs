@@ -74,6 +74,12 @@ struct Cli {
     #[arg(short = 'L', value_name = "SPEC")]
     forward: Vec<String>,
 
+    /// Remote port forwarding (repeatable): remote_port:local_host:local_port[/tcp|/udp]
+    /// Works like ssh -R. Default protocol: tcp.
+    /// Example: -R 8080:localhost:80  -R 5353:127.0.0.1:53/udp
+    #[arg(short = 'R', value_name = "SPEC")]
+    reverse_forward: Vec<String>,
+
     /// Path to the client log file (default: $XDG_STATE_HOME/etr/etr.log)
     #[arg(long, value_name = "PATH")]
     log_path: Option<std::path::PathBuf>,
@@ -179,6 +185,20 @@ async fn main() -> io::Result<()> {
         }
     }
 
+    let mut reverse_forward_specs: Vec<String> = Vec::new();
+    for s in &cli.reverse_forward {
+        match ForwardSpec::parse(s) {
+            Ok(spec) => {
+                vlog!(cli.verbose, 1, "[etr] Reverse forwarding: {spec}");
+                reverse_forward_specs.push(s.clone());
+            }
+            Err(e) => {
+                eprintln!("[etr] error: {e}");
+                return Ok(());
+            }
+        }
+    }
+
     let session_id = generate_session_id();
     let passkey = generate_passkey();
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
@@ -215,6 +235,7 @@ async fn main() -> io::Result<()> {
         session_id,
         session,
         forward_specs,
+        reverse_forward_specs,
         cli.verbose,
     )
     .await
@@ -332,6 +353,7 @@ async fn run_connection_loop(
     session_id: [u8; 16],
     session: Arc<Mutex<SessionState>>,
     forward_specs: Vec<ForwardSpec>,
+    reverse_forward_specs: Vec<String>,
     verbose: u8,
 ) -> io::Result<()> {
     let host = if let Some(idx) = target.find('@') {
@@ -420,6 +442,7 @@ async fn run_connection_loop(
             Arc::clone(&session),
             Arc::clone(&stdin_rx),
             forward_specs.clone(),
+            reverse_forward_specs.clone(),
             verbose,
         )
         .await;
@@ -442,6 +465,7 @@ async fn run_connection_loop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_session(
     conn: quinn::Connection,
     session_id: [u8; 16],
@@ -449,6 +473,7 @@ async fn run_session(
     session: Arc<Mutex<SessionState>>,
     stdin_rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
     forward_specs: Vec<ForwardSpec>,
+    reverse_forward_specs: Vec<String>,
     verbose: u8,
 ) -> io::Result<()> {
     // ── Open control stream ───────────────────────────────────────────────
@@ -468,6 +493,7 @@ async fn run_session(
             session_id: session_id.to_vec(),
             passkey: passkey.clone(),
             last_received_seq: last_received,
+            reverse_forwards: reverse_forward_specs.clone(),
         })),
     };
     quic::write_msg(&mut ctrl_send, &session_open).await?;
@@ -695,6 +721,124 @@ async fn run_session(
         };
         fwd_handles.push(handle);
     }
+
+    // ── Reverse forward stream acceptor task ──────────────────────────────
+    let conn_clone = conn.clone();
+    let verbose_clone = verbose;
+    let reverse_acceptor_handle = tokio::spawn(async move {
+        while let Ok((mut quic_send, mut quic_recv)) = conn_clone.accept_bi().await {
+            let verbose = verbose_clone;
+            tokio::spawn(async move {
+                let tag = match quic::read_tag(&mut quic_recv).await {
+                    Ok(t) => t,
+                    Err(_) => return,
+                };
+                if tag != TAG_FORWARD {
+                    vlog!(
+                        verbose,
+                        1,
+                        "[etr] reverse forward error: expected TAG_FORWARD, got 0x{tag:02x}"
+                    );
+                    return;
+                }
+                let so = match quic::read_msg(&mut quic_recv).await {
+                    Ok(Some(env)) => match env.payload {
+                        Some(Payload::StreamOpen(so)) => so,
+                        _ => return,
+                    },
+                    _ => return,
+                };
+                let proto = ForwardProto::try_from(so.forward_proto).unwrap_or(ForwardProto::Tcp);
+                match proto {
+                    ForwardProto::Tcp => {
+                        let addr = format!("{}:{}", so.remote_host, so.remote_port);
+                        use tokio::net::TcpStream;
+                        vlog!(verbose, 2, "[etr] connecting to local TCP target {addr}");
+                        let tcp = match TcpStream::connect(&addr).await {
+                            Ok(t) => t,
+                            Err(e) => {
+                                vlog!(
+                                    verbose,
+                                    1,
+                                    "[etr] failed to connect to local target {addr}: {e}"
+                                );
+                                let _ = quic_send.finish();
+                                return;
+                            }
+                        };
+                        run_tcp_connection_quic(tcp, quic_send, quic_recv).await;
+                    }
+                    ForwardProto::Udp => {
+                        let addr = format!("{}:{}", so.remote_host, so.remote_port);
+                        vlog!(verbose, 2, "[etr] forwarding UDP reverse stream to {addr}");
+                        use tokio::net::UdpSocket;
+                        let socket = match UdpSocket::bind("0.0.0.0:0").await {
+                            Ok(s) => Arc::new(s),
+                            Err(e) => {
+                                vlog!(verbose, 1, "[etr] failed to bind local UDP socket: {e}");
+                                let _ = quic_send.finish();
+                                return;
+                            }
+                        };
+
+                        let socket2 = Arc::clone(&socket);
+                        let mut quic_send = quic_send;
+                        let verbose_reply = verbose;
+                        let mut reply_task = tokio::spawn(async move {
+                            let mut buf = vec![0u8; 65535];
+                            while let Ok((n, src)) = socket2.recv_from(&mut buf).await {
+                                vlog!(
+                                    verbose_reply,
+                                    3,
+                                    "[etr] UDP reverse fwd: read {n} bytes from local target {src}"
+                                );
+                                let env = Envelope {
+                                    payload: Some(Payload::UdpDatagram(UdpDatagram {
+                                        peer_addr: String::new(),
+                                        peer_port: 0,
+                                        data: buf[..n].to_vec(),
+                                    })),
+                                };
+                                if quic::write_msg(&mut quic_send, &env).await.is_err() {
+                                    vlog!(
+                                        verbose_reply,
+                                        1,
+                                        "[etr] UDP reverse fwd: failed to write reply to QUIC"
+                                    );
+                                    break;
+                                }
+                            }
+                        });
+
+                        let socket_send = Arc::clone(&socket);
+                        let verbose_send = verbose;
+                        let mut send_task = tokio::spawn(async move {
+                            while let Ok(Some(env)) = quic::read_msg(&mut quic_recv).await {
+                                if let Some(Payload::UdpDatagram(dg)) = env.payload {
+                                    vlog!(
+                                        verbose_send,
+                                        3,
+                                        "[etr] UDP reverse fwd: forwarding {} bytes to local target {addr}",
+                                        dg.data.len()
+                                    );
+                                    let _ = socket_send.send_to(&dg.data, &addr).await;
+                                }
+                            }
+                        });
+
+                        tokio::select! {
+                            _ = &mut reply_task => {}
+                            _ = &mut send_task => {}
+                        }
+                        reply_task.abort();
+                        send_task.abort();
+                        vlog!(verbose, 2, "[etr] UDP reverse fwd stream ended");
+                    }
+                }
+            });
+        }
+    });
+    fwd_handles.push(reverse_acceptor_handle);
 
     // ── Wait for any task to complete ─────────────────────────────────────
     let result = tokio::select! {

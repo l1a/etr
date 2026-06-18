@@ -64,6 +64,8 @@ Options:
   -s, --ssh-port <PORT>          SSH port [default: 22]
   -L <[local_port:]host:port[/udp]>
                                  Forward a local port to a remote address (repeatable)
+  -R <[remote_port:]host:port[/udp]>
+                                 Forward a remote port to a local address (repeatable)
   -v, -vv, -vvv                  Verbosity: connection events / QUIC details / stream trace
       --server-path <PATH>       Path to etrs on the remote host [default: etrs]
       --log-path <PATH>          Path to the client log file [default: $XDG_STATE_HOME/etr/etr.log]
@@ -91,18 +93,27 @@ Verbose logs go to `~/.local/state/etr/etr.log` by default during a live session
 
 ## Port forwarding
 
+Local forwarding (`-L`) connects a local port to a remote host:
 ```bash
 # Forward local port 5432 to db-host:5432 via jumphost (TCP, default)
 etr -L 5432:db-host:5432 user@jumphost
 
 # UDP forwarding
 etr -L 5353:8.8.8.8:53/udp user@jumphost
-
-# Multiple forwards in one session
-etr -L 5432:db:5432 -L 6379:cache:6379 user@host
 ```
 
-Port forwards survive the same reconnect cycle as the PTY session. Each TCP connection gets its own QUIC stream; UDP uses a dedicated QUIC stream per `-L` spec.
+Reverse forwarding (`-R`) connects a remote port on the server to a local host:
+```bash
+# Forward remote port 8080 to local localhost:80 (TCP, default)
+etr -R 8080:localhost:80 user@host
+
+# UDP reverse forwarding
+etr -R 5353:127.0.0.1:53/udp user@host
+```
+
+Multiple `-L` and `-R` specifications can be mixed in a single session.
+
+Port forwards survive the same reconnect cycle as the PTY session. Each TCP connection gets its own QUIC stream; UDP uses a dedicated QUIC stream per forward spec.
 
 ## Shell completions
 

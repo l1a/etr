@@ -291,7 +291,7 @@ etr -L 5353:8.8.8.8:53/udp user@jumphost # UDP forwarding
 both TCP and UDP, running concurrently alongside the PTY session.  TCP opens one QUIC
 stream per connection; UDP uses one shared QUIC stream per `-L` spec with
 last-sender reply routing.  Runs without a PTY session if no terminal is attached.
-`-R` (remote-to-local) is not yet implemented.
+`-R` (remote-to-local) is implemented for both TCP and UDP.
 
 ---
 
@@ -304,8 +304,7 @@ last-sender reply routing.  Runs without a PTY session if no terminal is attache
   Sessions appear in `last`; `who`/`w` read from systemd-logind on modern Fedora
   and do not show utmp-only sessions.  Non-Linux builds get no-op stubs.
 - ~~**Benchmarking**~~ **Done**: Criterion benchmark suite implemented in `benches/session_bench.rs` measuring certificate generation, QUIC connection handshake latency, PTY round-trip latency (100b), and throughput (64kb).
-- **Mode 2 — `-R` remote forwarding**: `-L` (local-to-remote) is done; `-R` (remote
-  port → local) is not yet implemented.
+- ~~**Mode 2 — `-R` remote forwarding**~~ **Done**: Both TCP and UDP remote port forwarding are supported using the `-R` CLI flag.
 - **UDP reply routing**: current shared-socket design uses last-sender routing —
   replies from the remote UDP target go to whichever local client sent the most recent
   datagram.  Suitable for single-sender and sequential request/response (DNS, STUN);

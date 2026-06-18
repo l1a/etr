@@ -48,6 +48,9 @@ pub struct SessionOpen {
     /// The server replays any history above this watermark.
     #[prost(map = "uint32, uint64", tag = "3")]
     pub last_received_seq: std::collections::HashMap<u32, u64>,
+    /// Reverse port forwarding specifications (e.g. "remote_port:local_host:local_port[/tcp|/udp]").
+    #[prost(string, repeated, tag = "4")]
+    pub reverse_forwards: Vec<String>,
 }
 
 /// Sent by the server in reply to [`SessionOpen`] once the session is verified.
@@ -164,6 +167,7 @@ mod tests {
                 session_id: vec![1u8; 16],
                 passkey: "secret".to_string(),
                 last_received_seq: [(0u32, 7u64)].into(),
+                reverse_forwards: vec![],
             })),
         };
         let decoded = Envelope::decode(env.encode_to_vec().as_slice()).unwrap();
