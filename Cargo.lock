@@ -419,13 +419,14 @@ dependencies = [
 
 [[package]]
 name = "etr"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "clap",
  "clap_complete",
  "clap_complete_nushell",
  "crossterm",
  "dirs",
+ "libc",
  "nix 0.29.0",
  "portable-pty",
  "prost",
