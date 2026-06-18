@@ -266,15 +266,17 @@ async fn run_session(
                 "[etrs] shell exited for {}",
                 hex_encode(&session_id_copy)
             );
-            if let Some(fd) = logout_fd {
-                login::record_logout(fd);
-            }
+            // Notify the client and signal shutdown BEFORE record_logout so that
+            // the Disconnect reaches the client even if utempter is slow.
             if let Some(tx) = outbound_ctrl_tx.lock().unwrap().clone() {
                 let _ = tx.blocking_send(Envelope {
                     payload: Some(Payload::Disconnect(Disconnect {})),
                 });
             }
             let _ = shell_exit_tx.send(true);
+            if let Some(fd) = logout_fd {
+                login::record_logout(fd);
+            }
         });
     }
 
