@@ -1,0 +1,13 @@
+[package]
+name = "stress_tool"
+version = "0.1.0"
+edition = "2024"
+description = "Stress-test helpers for etr (TCP/UDP echo servers and pumps)"
+publish = false
+
+[[bin]]
+name = "stress_tool"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
