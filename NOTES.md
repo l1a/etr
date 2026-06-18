@@ -9,7 +9,7 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.4.2 — shell completions for etrs
+## Current state: v0.4.3 — e2e test coverage + UDP forward fix
 
 The full round-trip works: `etr <host>` on the client, SSH bootstrap that starts
 `etrs` on the fly, QUIC connection with cert pinning, PTY session, keepalives,
@@ -326,6 +326,19 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
   `/proc/$$/status`; reconnect test stops the etrs daemon (not the etr client)
   because stopping a PTY-attached process on macOS triggers a SIGHUP that kills it.
 - ~~**Shell completions for `etrs`**~~ **Done**: `etrs --completions <shell>` generates completions for bash, zsh, fish, elvish, PowerShell, and nushell via `clap_complete`/`clap_complete_nushell`, mirroring the existing `etr --completions` support.
+- **utmp address field incorrect for IPv4 connections**: `src/login.rs` records the
+  connecting peer address in the utmp `ut_addr_v6` field.  For an IPv4-over-IPv6
+  (dual-stack) QUIC connection the peer address is an IPv4-mapped IPv6 address
+  (`::ffff:127.0.0.1`), which is not what `last` and friends expect in the IPv4 slots.
+  Should be unwrapped to a plain IPv4 address before writing.
+- **UDP forward target resolution should prefer IPv6 when genuinely available**:
+  the current workaround in `etrs::serve_udp_forward` and the `-R` UDP handler in
+  `etr` resolves the target hostname and picks the first IPv4 address, falling back
+  to IPv6.  This was needed because the local echo servers in tests are IPv4-only and
+  macOS returns `::1` before `127.0.0.1` for `"localhost"`.  The correct long-term
+  behaviour is to probe which address family the target is actually reachable on
+  (similar to Happy Eyeballs) and prefer IPv6 when it works, rather than always
+  preferring IPv4.
 
 ---
 

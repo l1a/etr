@@ -251,6 +251,186 @@ e2e-local: check-tools install
     echo ""
     echo "==> All tests passed."
 
+# Run the local E2E test for local port forwarding -L (TCP + UDP, IPv4 + IPv6, reconnect)
+e2e-forward-local: check-tools install
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    CLIENT_LOG="${XDG_STATE_HOME:-$HOME/.local/state}/etr/etr.log"
+    TMUX_FORWARD="etr_forward_test"
+    TCP_ECHO_PORT=19321
+    TCP_FWD_PORT=19322
+    UDP_ECHO_PORT=19323
+    UDP_FWD_PORT=19324
+
+    cleanup() {
+        echo ""
+        echo "--- cleanup ---"
+        kill "${TCP_ECHO_PID:-}" "${UDP_ECHO_PID:-}" 2>/dev/null || true
+        tmux kill-session -t "$TMUX_FORWARD" 2>/dev/null || true
+        pkill -x etrs 2>/dev/null || true
+    }
+    trap cleanup EXIT
+
+    mkdir -p "$(dirname "$CLIENT_LOG")"
+    > "$CLIENT_LOG"
+
+    # Start echo servers (these are the "remote" targets reachable via -L).
+    # Since client and server are both localhost, they run on the same machine.
+    echo "==> Starting TCP echo server on port ${TCP_ECHO_PORT}..."
+    python3 "{{justfile_directory()}}/scripts/stress/tcp_echo.py" "${TCP_ECHO_PORT}" &
+    TCP_ECHO_PID=$!
+
+    echo "==> Starting UDP echo server on port ${UDP_ECHO_PORT}..."
+    python3 "{{justfile_directory()}}/scripts/stress/udp_echo.py" "${UDP_ECHO_PORT}" &
+    UDP_ECHO_PID=$!
+    sleep 0.5
+
+    # Launch etr with -L specs
+    echo "==> Launching etr with -L specs..."
+    tmux new-session -d -s "$TMUX_FORWARD" -x 200 -y 50 -- \
+        "{{INSTALL}}/etr" -v \
+        -L "${TCP_FWD_PORT}:localhost:${TCP_ECHO_PORT}" \
+        -L "${UDP_FWD_PORT}:127.0.0.1:${UDP_ECHO_PORT}/udp" \
+        localhost
+
+    # Wait for connect
+    echo "    waiting for etr to connect..."
+    READY=0
+    for i in $(seq 1 30); do
+        sleep 1
+        grep -q '\[etr\] Connected\.' "$CLIENT_LOG" 2>/dev/null && { READY=1; break; }
+    done
+    if [[ $READY -eq 0 ]]; then
+        echo "ERROR: '[etr] Connected.' not seen in $CLIENT_LOG within 30 s" >&2
+        cat "$CLIENT_LOG" >&2
+        exit 1
+    fi
+    sleep 1.5  # allow -L listeners to bind
+
+    # ── TCP -L (IPv4) ─────────────────────────────────────────────────────────
+    echo "==> Testing TCP -L forwarding (IPv4)..."
+    TCP_OUT=$(python3 -c '
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(3.0)
+    s.connect(("127.0.0.1", '"${TCP_FWD_PORT}"'))
+    s.sendall(b"FORWARD_TCP_OK\n")
+    print(s.recv(1024).decode())
+    s.close()
+    ' 2>/dev/null || true)
+    if [[ "$TCP_OUT" == *"FORWARD_TCP_OK"* ]]; then
+        echo "    PASS: TCP -L forwarding (IPv4) functional."
+    else
+        echo "FAIL: TCP -L forwarding (IPv4) failed. Output: '${TCP_OUT}'" >&2; exit 1
+    fi
+
+    # ── TCP -L (IPv6) ─────────────────────────────────────────────────────────
+    echo "==> Testing TCP -L forwarding (IPv6)..."
+    TCP_OUT_V6=$(python3 -c '
+    import socket
+    s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    s.settimeout(3.0)
+    s.connect(("::1", '"${TCP_FWD_PORT}"'))
+    s.sendall(b"FORWARD_TCP_IPV6_OK\n")
+    print(s.recv(1024).decode())
+    s.close()
+    ' 2>/dev/null || true)
+    if [[ "$TCP_OUT_V6" == *"FORWARD_TCP_IPV6_OK"* ]]; then
+        echo "    PASS: TCP -L forwarding (IPv6) functional."
+    else
+        echo "FAIL: TCP -L forwarding (IPv6) failed. Output: '${TCP_OUT_V6}'" >&2; exit 1
+    fi
+
+    # ── UDP -L (IPv4) ─────────────────────────────────────────────────────────
+    echo "==> Testing UDP -L forwarding (IPv4)..."
+    UDP_OUT=$(python3 -c '
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(3.0)
+    s.sendto(b"FORWARD_UDP_OK", ("127.0.0.1", '"${UDP_FWD_PORT}"'))
+    try:
+        data, _ = s.recvfrom(1024)
+        print(data.decode())
+    except socket.timeout:
+        print("timeout")
+    ' 2>/dev/null || true)
+    if [[ "$UDP_OUT" == *"FORWARD_UDP_OK"* ]]; then
+        echo "    PASS: UDP -L forwarding (IPv4) functional."
+    else
+        echo "FAIL: UDP -L forwarding (IPv4) failed. Output: '${UDP_OUT}'" >&2; exit 1
+    fi
+
+    # ── UDP -L (IPv6) ─────────────────────────────────────────────────────────
+    echo "==> Testing UDP -L forwarding (IPv6)..."
+    UDP_OUT_V6=$(python3 -c '
+    import socket
+    s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+    s.settimeout(3.0)
+    s.sendto(b"FORWARD_UDP_IPV6_OK", ("::1", '"${UDP_FWD_PORT}"'))
+    try:
+        data, _ = s.recvfrom(1024)
+        print(data.decode())
+    except socket.timeout:
+        print("timeout")
+    ' 2>/dev/null || true)
+    if [[ "$UDP_OUT_V6" == *"FORWARD_UDP_IPV6_OK"* ]]; then
+        echo "    PASS: UDP -L forwarding (IPv6) functional."
+    else
+        echo "FAIL: UDP -L forwarding (IPv6) failed. Output: '${UDP_OUT_V6}'" >&2; exit 1
+    fi
+
+    # ── Reconnect test ────────────────────────────────────────────────────────
+    ETRS_PID=$(pgrep -x etrs 2>/dev/null | head -1 || true)
+    if [[ -z "$ETRS_PID" ]]; then
+        echo "SKIP: etrs PID not found; skipping reconnect test" >&2
+    else
+        echo "==> Reconnect test: suspending etrs (pid $ETRS_PID) for 17 s..."
+        kill -STOP "$ETRS_PID"
+        echo "    etrs suspended. etr will hit 15-s heartbeat timeout and reconnect..."
+        sleep 17
+        kill -CONT "$ETRS_PID"
+        echo "    etrs resumed. Waiting for reconnect..."
+        sleep 8
+
+        echo "==> Verifying TCP -L forwarding after reconnect..."
+        TCP_RECON=$(python3 -c '
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(5.0)
+        s.connect(("127.0.0.1", '"${TCP_FWD_PORT}"'))
+        s.sendall(b"FORWARD_TCP_RECONNECT_OK\n")
+        print(s.recv(1024).decode())
+        s.close()
+        ' 2>/dev/null || true)
+        if [[ "$TCP_RECON" == *"FORWARD_TCP_RECONNECT_OK"* ]]; then
+            echo "    PASS: TCP -L forwarding resumed after reconnect."
+        else
+            echo "FAIL: TCP -L forwarding not restored after reconnect. Output: '${TCP_RECON}'" >&2; exit 1
+        fi
+
+        echo "==> Verifying UDP -L forwarding after reconnect..."
+        UDP_RECON=$(python3 -c '
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(5.0)
+        s.sendto(b"FORWARD_UDP_RECONNECT_OK", ("127.0.0.1", '"${UDP_FWD_PORT}"'))
+        try:
+            data, _ = s.recvfrom(1024)
+            print(data.decode())
+        except socket.timeout:
+            print("timeout")
+        ' 2>/dev/null || true)
+        if [[ "$UDP_RECON" == *"FORWARD_UDP_RECONNECT_OK"* ]]; then
+            echo "    PASS: UDP -L forwarding resumed after reconnect."
+        else
+            echo "FAIL: UDP -L forwarding not restored after reconnect. Output: '${UDP_RECON}'" >&2; exit 1
+        fi
+    fi
+
+    echo ""
+    echo "==> All -L forward E2E tests passed."
+
 # Run the local E2E test for reverse port forwarding (both TCP and UDP)
 e2e-reverse-local: check-tools install
     #!/usr/bin/env bash
@@ -389,13 +569,62 @@ e2e-reverse-local: check-tools install
         exit 1
     fi
 
+    # ── Reconnect test ────────────────────────────────────────────────────────
+    ETRS_PID=$(pgrep -x etrs 2>/dev/null | head -1 || true)
+    if [[ -z "$ETRS_PID" ]]; then
+        echo "SKIP: etrs PID not found; skipping reconnect test" >&2
+    else
+        echo "==> Reconnect test: suspending etrs (pid $ETRS_PID) for 17 s..."
+        kill -STOP "$ETRS_PID"
+        echo "    etrs suspended. etr will hit 15-s heartbeat timeout and reconnect..."
+        sleep 17
+        kill -CONT "$ETRS_PID"
+        echo "    etrs resumed. Waiting for reconnect..."
+        sleep 8
+
+        # etrs re-binds the -R listeners on receiving the reconnected SessionOpen.
+        echo "==> Verifying TCP -R forwarding after reconnect..."
+        TCP_RECON=$(python3 -c '
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(5.0)
+        s.connect(("127.0.0.1", '"${TCP_REMOTE_PORT}"'))
+        s.sendall(b"REVERSE_TCP_RECONNECT_OK\n")
+        print(s.recv(1024).decode())
+        s.close()
+        ' 2>/dev/null || true)
+        if [[ "$TCP_RECON" == *"REVERSE_TCP_RECONNECT_OK"* ]]; then
+            echo "    PASS: TCP -R forwarding resumed after reconnect."
+        else
+            echo "FAIL: TCP -R forwarding not restored after reconnect. Output: '${TCP_RECON}'" >&2; exit 1
+        fi
+
+        echo "==> Verifying UDP -R forwarding after reconnect..."
+        UDP_RECON=$(python3 -c '
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(5.0)
+        s.sendto(b"REVERSE_UDP_RECONNECT_OK", ("127.0.0.1", '"${UDP_REMOTE_PORT}"'))
+        try:
+            data, _ = s.recvfrom(1024)
+            print(data.decode())
+        except socket.timeout:
+            print("timeout")
+        ' 2>/dev/null || true)
+        if [[ "$UDP_RECON" == *"REVERSE_UDP_RECONNECT_OK"* ]]; then
+            echo "    PASS: UDP -R forwarding resumed after reconnect."
+        else
+            echo "FAIL: UDP -R forwarding not restored after reconnect. Output: '${UDP_RECON}'" >&2; exit 1
+        fi
+    fi
+
     echo "==> All reverse E2E tests passed."
 
-# Stress-test all three stream types simultaneously while watching etrs memory.
+# Stress-test all five stream types simultaneously while watching etrs memory.
 #
-# Opens: 1 PTY stream + 2 -L forward streams (TCP echo + UDP echo).
-# Pushes data as fast as possible in both directions on all three streams for
-# DURATION seconds, sampling etrs RSS every 2 s.  Fails if etrs grows by more
+# Opens: 1 PTY stream + 2 -L forward streams (TCP + UDP) + 2 -R forward streams
+# (TCP + UDP).  Pushes data as fast as possible in both directions on all streams
+# for DURATION seconds, sampling etrs RSS every 2 s.  Fails if etrs grows by more
 # than 20 MB above its baseline (well above the 4 MB send-history cap + quinn
 # buffers).
 #
@@ -404,45 +633,67 @@ stress-local: check-tools install
     #!/usr/bin/env bash
     set -euo pipefail
 
-    TCP_ECHO_PORT=19292
-    TCP_FWD_PORT=19291
-    UDP_ECHO_PORT=19294
-    UDP_FWD_PORT=19293
+    TCP_ECHO_PORT=19292   # -L: remote TCP echo target
+    TCP_FWD_PORT=19291    # -L: local listener
+    UDP_ECHO_PORT=19294   # -L: remote UDP echo target
+    UDP_FWD_PORT=19293    # -L: local listener
+    TCP_R_ECHO_PORT=19295 # -R: local TCP echo server (client side)
+    TCP_R_FWD_PORT=19296  # -R: remote listener (etrs side)
+    UDP_R_ECHO_PORT=19297 # -R: local UDP echo server (client side)
+    UDP_R_FWD_PORT=19298  # -R: remote listener (etrs side)
     DURATION=30
     STRESS_SESS="etr_stress"
 
     TCP_ECHO_PID="" UDP_ECHO_PID="" TCP_PUMP_PID="" UDP_PUMP_PID=""
+    TCP_R_ECHO_PID="" UDP_R_ECHO_PID="" TCP_R_PUMP_PID="" UDP_R_PUMP_PID=""
     SCRIPTS="{{justfile_directory()}}/scripts/stress"
+    TCP_PUMP_OUT="/tmp/.etr_tcp_pump_$$"
+    UDP_PUMP_OUT="/tmp/.etr_udp_pump_$$"
+    TCP_R_PUMP_OUT="/tmp/.etr_tcp_r_pump_$$"
+    UDP_R_PUMP_OUT="/tmp/.etr_udp_r_pump_$$"
 
     cleanup() {
         echo "--- cleanup ---"
-        kill "$TCP_ECHO_PID" "$UDP_ECHO_PID" "$TCP_PUMP_PID" "$UDP_PUMP_PID" 2>/dev/null || true
+        kill "$TCP_ECHO_PID" "$UDP_ECHO_PID" "$TCP_PUMP_PID" "$UDP_PUMP_PID" \
+             "$TCP_R_ECHO_PID" "$UDP_R_ECHO_PID" "$TCP_R_PUMP_PID" "$UDP_R_PUMP_PID" 2>/dev/null || true
         tmux kill-session -t "$STRESS_SESS" 2>/dev/null || true
         pkill -x etrs 2>/dev/null || true
+        rm -f "$TCP_PUMP_OUT" "$UDP_PUMP_OUT" "$TCP_R_PUMP_OUT" "$UDP_R_PUMP_OUT"
     }
     trap cleanup EXIT
 
     mkdir -p "$(dirname "{{LOG_FILE}}")"
 
     # ── Echo servers ──────────────────────────────────────────────────────────
-    echo "==> TCP echo server on :${TCP_ECHO_PORT}..."
+    echo "==> TCP echo server (-L target) on :${TCP_ECHO_PORT}..."
     python3 "$SCRIPTS/tcp_echo.py" "$TCP_ECHO_PORT" &
     TCP_ECHO_PID=$!
 
-    echo "==> UDP echo server on :${UDP_ECHO_PORT}..."
+    echo "==> UDP echo server (-L target) on :${UDP_ECHO_PORT}..."
     python3 "$SCRIPTS/udp_echo.py" "$UDP_ECHO_PORT" &
     UDP_ECHO_PID=$!
+
+    echo "==> TCP echo server (-R target) on :${TCP_R_ECHO_PORT}..."
+    python3 "$SCRIPTS/tcp_echo.py" "$TCP_R_ECHO_PORT" &
+    TCP_R_ECHO_PID=$!
+
+    echo "==> UDP echo server (-R target) on :${UDP_R_ECHO_PORT}..."
+    python3 "$SCRIPTS/udp_echo.py" "$UDP_R_ECHO_PORT" &
+    UDP_R_ECHO_PID=$!
     sleep 0.3
 
-    # ── Connect etr: 1 PTY + 2 -L streams ────────────────────────────────────
+    # ── Connect etr: 1 PTY + 2 -L + 2 -R streams ────────────────────────────
     # Run etr DIRECTLY as the tmux session command (no intermediate shell).
-    # This avoids .zshrc startup delays and ensures the -L flags are received
+    # This avoids .zshrc startup delays and ensures the flags are received
     # by the correct etr process, not by a nested remote shell.
-    echo "==> etr -L ${TCP_FWD_PORT}:localhost:${TCP_ECHO_PORT} -L ${UDP_FWD_PORT}:localhost:${UDP_ECHO_PORT}/udp localhost"
+    echo "==> etr -L ${TCP_FWD_PORT}:localhost:${TCP_ECHO_PORT} -L ${UDP_FWD_PORT}:localhost:${UDP_ECHO_PORT}/udp"
+    echo "       -R ${TCP_R_FWD_PORT}:localhost:${TCP_R_ECHO_PORT} -R ${UDP_R_FWD_PORT}:localhost:${UDP_R_ECHO_PORT}/udp localhost"
     tmux new-session -d -s "$STRESS_SESS" -x 220 -y 50 -- \
         "{{INSTALL}}/etr" -v \
         -L "${TCP_FWD_PORT}:localhost:${TCP_ECHO_PORT}" \
         -L "${UDP_FWD_PORT}:localhost:${UDP_ECHO_PORT}/udp" \
+        -R "${TCP_R_FWD_PORT}:localhost:${TCP_R_ECHO_PORT}" \
+        -R "${UDP_R_FWD_PORT}:localhost:${UDP_R_ECHO_PORT}/udp" \
         localhost
 
     # Wait for "[etr] Forwarding:" in the log file — set immediately when the
@@ -502,14 +753,24 @@ stress-local: check-tools install
         "dd if=/dev/urandom bs=65536 2>/dev/null | base64 > /dev/null & dd if=/dev/urandom bs=65536 of=/dev/null 2>/dev/null &" Enter
     sleep 0.5
 
-    # ── TCP and UDP pumps ─────────────────────────────────────────────────────
-    echo "==> TCP pump on :${TCP_FWD_PORT}..."
-    python3 "$SCRIPTS/tcp_pump.py" "$TCP_FWD_PORT" &
+    # ── -L pumps ──────────────────────────────────────────────────────────────
+    echo "==> TCP -L pump on :${TCP_FWD_PORT}..."
+    python3 "$SCRIPTS/tcp_pump.py" "$TCP_FWD_PORT" > "$TCP_PUMP_OUT" &
     TCP_PUMP_PID=$!
 
-    echo "==> UDP pump on :${UDP_FWD_PORT}..."
-    python3 "$SCRIPTS/udp_pump.py" "$UDP_FWD_PORT" &
+    echo "==> UDP -L pump on :${UDP_FWD_PORT}..."
+    python3 "$SCRIPTS/udp_pump.py" "$UDP_FWD_PORT" > "$UDP_PUMP_OUT" &
     UDP_PUMP_PID=$!
+
+    # ── -R pumps (connect to etrs-side listeners; brief wait for bind) ────────
+    sleep 1.5
+    echo "==> TCP -R pump on :${TCP_R_FWD_PORT}..."
+    python3 "$SCRIPTS/tcp_pump.py" "$TCP_R_FWD_PORT" > "$TCP_R_PUMP_OUT" &
+    TCP_R_PUMP_PID=$!
+
+    echo "==> UDP -R pump on :${UDP_R_FWD_PORT}..."
+    python3 "$SCRIPTS/udp_pump.py" "$UDP_R_FWD_PORT" > "$UDP_R_PUMP_OUT" &
+    UDP_R_PUMP_PID=$!
 
     # ── Sample RSS every 2 s ──────────────────────────────────────────────────
     echo ""
@@ -544,6 +805,41 @@ stress-local: check-tools install
         exit 1
     fi
     echo "    etr responsive after stress."
+
+    # ── Throughput report ─────────────────────────────────────────────────────
+    # SIGTERM triggers each pump's stats handler; wait ensures the output file
+    # is fully written before we read it.
+    kill -TERM "$TCP_PUMP_PID" "$UDP_PUMP_PID" "$TCP_R_PUMP_PID" "$UDP_R_PUMP_PID" 2>/dev/null || true
+    wait "$TCP_PUMP_PID" "$UDP_PUMP_PID" "$TCP_R_PUMP_PID" "$UDP_R_PUMP_PID" 2>/dev/null || true
+    TCP_PUMP_PID="" UDP_PUMP_PID="" TCP_R_PUMP_PID="" UDP_R_PUMP_PID=""  # prevent double-kill in cleanup
+
+    TCP_LINE=$(cat "$TCP_PUMP_OUT" 2>/dev/null || echo "")
+    UDP_LINE=$(cat "$UDP_PUMP_OUT" 2>/dev/null || echo "")
+    TCP_R_LINE=$(cat "$TCP_R_PUMP_OUT" 2>/dev/null || echo "")
+    UDP_R_LINE=$(cat "$UDP_R_PUMP_OUT" 2>/dev/null || echo "")
+
+    echo ""
+    echo "==> Throughput (Mb/s = megabits per second):"
+    throughput_report() {
+        local line="$1" label="$2"
+        if [[ -z "$line" ]]; then echo "  ${label}: no stats available"; return; fi
+        echo "$line" | awk -v label="$label" '{
+            for (i=1; i<=NF; i++) {
+                if ($i ~ /^sent=/)    sent    = substr($i, 6) + 0
+                if ($i ~ /^recv=/)    recv    = substr($i, 6) + 0
+                if ($i ~ /^elapsed=/) elapsed = substr($i, 9) + 0
+            }
+            if (elapsed <= 0) elapsed = 0.001
+            tx = sent * 8 / elapsed / 1000000
+            rx = recv * 8 / elapsed / 1000000
+            printf "  %-8s tx=%.1f Mb/s  rx=%.1f Mb/s  (%d MiB sent, %d MiB recv in %.1fs)\n", \
+                label ":", tx, rx, sent/1048576, recv/1048576, elapsed
+        }'
+    }
+    throughput_report "$TCP_LINE"   "TCP -L"
+    throughput_report "$UDP_LINE"   "UDP -L"
+    throughput_report "$TCP_R_LINE" "TCP -R"
+    throughput_report "$UDP_R_LINE" "UDP -R"
 
     # ── Verdict ───────────────────────────────────────────────────────────────
     RSS_FINAL=$(ps -o rss= -p "$ETRS_PID" 2>/dev/null | tr -d ' ' || echo 0)
