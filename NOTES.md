@@ -319,8 +319,14 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
   persisted anywhere, so a new machine cannot reconnect to an existing session.
 - **PQC key exchange**: ML-KEM was retired with the QUIC migration.  Can be re-added
   via `rustls-post-quantum` (X25519MLKEM768 hybrid) once it stabilises.
-- **Windows / macOS**: the PTY layer uses `portable-pty` (cross-platform) but has
-  only been tested on Linux.
+- **Windows**: the PTY layer uses `portable-pty` (cross-platform) but has only been
+  tested on Linux and macOS.
+- **macOS**: fully tested and working.  PTY session, reconnect, and port forwarding
+  all pass.  Test harness fixes applied: `ps -o ppid=` replaces Linux-only
+  `/proc/$$/status`; reconnect test stops the etrs daemon (not the etr client)
+  because stopping a PTY-attached process on macOS triggers a SIGHUP that kills it.
+- **Shell completions for `etrs`**: `etrs` has no generated shell completions (bash/zsh/fish).
+  `clap` can generate them via `clap_complete`; should be added alongside the existing `etr` completion work if any, or as a new step.
 
 ---
 
