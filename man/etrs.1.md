@@ -95,10 +95,7 @@ session start. Connections that fail this check are rejected.
 
 # BUGS
 
-- **utmp**/**wtmp** registration is not yet implemented, so the session
-  does not appear in **who**(1) or **w**(1) output.
 - The reconnect window (30 minutes) is not configurable.
-- The log path is not configurable via CLI flag.
 
 # AUTHORS
 
