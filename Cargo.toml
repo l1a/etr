@@ -43,3 +43,9 @@ criterion = { version = "0.5", features = ["async_tokio"] }
 [[bench]]
 name = "session_bench"
 harness = false
+
+# Build profile for profiling: optimised like release but with full debug symbols
+# so samply / cargo-flamegraph produce useful annotated stacks.
+[profile.profiling]
+inherits = "release"
+debug = true

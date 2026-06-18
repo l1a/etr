@@ -9,7 +9,7 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.4.4 — throughput tuning (TCP relay buffer + QUIC windows)
+## Current state: v0.4.4 — throughput tuning + profiling
 
 The full round-trip works: `etr <host>` on the client, SSH bootstrap that starts
 `etrs` on the fly, QUIC connection with cert pinning, PTY session, keepalives,
@@ -331,13 +331,20 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
   (dual-stack) QUIC connection the peer address is an IPv4-mapped IPv6 address
   (`::ffff:127.0.0.1`), which is not what `last` and friends expect in the IPv4 slots.
   Should be unwrapped to a plain IPv4 address before writing.
-- **Throughput**: TCP relay buffer raised from 8 KB → 256 KB (both `pipe_tcp_quic` in
-  `etrs` and `run_tcp_connection_quic` in `etr`); QUIC flow-control windows raised to 4 MB
-  per stream / 32 MB per connection (both sides); `TCP_NODELAY` set on all forwarded TCP
-  connections.  Baseline was ~270 Mb/s TCP / ~9 Mb/s UDP.  Post-change numbers pending
-  `just stress-local` re-run.  Remaining UDP gap (protobuf per-datagram overhead,
-  per-datagram allocation) still needs profiling (`cargo flamegraph`) before further
-  optimisation.
+- **Throughput**: TCP relay buffer raised 8 KB → 256 KB; QUIC flow-control windows
+  raised to 4 MB per stream / 32 MB per connection; `TCP_NODELAY` on all forwarded TCP
+  connections.  Stress-local (echo test) measures ~320 Mb/s TCP, but this is an
+  echo-path number — iperf3 one-direction through the tunnel measures **~2.1 Gbits/s**
+  with an optimized build.  Debug-build overhead accounts for an additional ~2.6× gap
+  (stress-local uses a debug build).  The goal of "within an order of magnitude of
+  iperf3" (~12 Gbits/s) is still ~5–6× away.
+  Profiling (`samply` attached to etrs) shows AES-GCM decryption is NOT the bottleneck
+  (<1% of samples); the dominant overhead is Quinn's per-packet state machine (stream
+  delivery, ACK tracking, timer heap).  `read_chunk` (zero-copy from Quinn buffers) was
+  tested but regressed throughput from 2.1 → 1.8 Gbits/s because it produces one tiny
+  `write_all` per Quinn frame instead of coalescing them into our 256 KB read buffer —
+  more syscalls, not fewer copies, determines throughput here.
+  UDP (~9 Mb/s) is still limited by per-datagram protobuf encoding overhead.
 - **UDP forward target resolution should prefer IPv6 when genuinely available**:
   the current workaround in `etrs::serve_udp_forward` and the `-R` UDP handler in
   `etr` resolves the target hostname and picks the first IPv4 address, falling back

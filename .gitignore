@@ -1,3 +1,5 @@
 /target
 /.claude
 /man/build
+tools/stress/target/
+etrs_fwd.json.gz
