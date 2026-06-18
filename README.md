@@ -146,7 +146,8 @@ server_log_path = "/tmp/server.log"   # path to the server log file on remote ho
 
 ## Limitations
 
-- Linux only (PTY layer tested on Linux; macOS/Windows untested)
+- Linux and macOS supported (Windows untested)
+- macOS binaries (`macos-aarch64`) are published on each release
 - Sessions are not persistent across client reboots — the session ID and passkey are in-memory only
 - Post-quantum key exchange (ML-KEM) is not yet implemented; standard TLS 1.3 uses X25519 ECDH
 

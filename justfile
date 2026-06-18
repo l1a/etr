@@ -119,7 +119,7 @@ check-tools:
     if [[ ${#missing[@]} -gt 0 ]]; then
         echo "ERROR: missing required tools: ${missing[*]}" >&2
         echo "  cargo — install from https://rustup.rs" >&2
-        echo "  tmux  — install via your package manager (e.g. dnf install tmux)" >&2
+        echo "  tmux  — install via your package manager (e.g. brew install tmux / dnf install tmux)" >&2
         echo "  ssh   — install openssh-clients" >&2
         exit 1
     fi
@@ -137,13 +137,18 @@ check-tools:
 # etr SSHes to localhost, starts etrs on the fly (no pre-running daemon),
 # etrs forks and orphans its child, which handles the session.
 #
-# Reconnect is tested by SIGSTOP-ing the etr client: the tokio event loop
-# freezes (no heartbeats sent/received).  After 17 s etrs times out; when
-# SIGCONT wakes etr, tokio immediately sees the elapsed 15-s heartbeat
-# deadline and reconnects.  No need to locate the etrs process at all.
+# Reconnect is tested by SIGSTOP-ing the etrs daemon.  etrs has no controlling
+# terminal, so SIGSTOP is safe (no SIGHUP risk).  etr keeps running, notices
+# the missing heartbeat after 15 s, and starts reconnecting.  QUIC Initial
+# packets accumulate in the OS UDP socket buffer while etrs is stopped; when
+# etrs resumes (SIGCONT) it processes them and the session is restored.
+#
+# (Stopping etr instead would not work on macOS: etr is the tmux pane command
+# and is attached to a PTY; when stopped, the PTY hangup delivers SIGHUP+SIGCONT
+# which kills the process before we can resume it.)
 #
 # etr is launched as the tmux session command (not via send-keys) to avoid
-# the .zshrc startup race and so that #{pane_pid} == etr's PID directly.
+# the .zshrc startup race.
 e2e-local: check-tools install
     #!/usr/bin/env bash
     set -euo pipefail
@@ -217,20 +222,17 @@ e2e-local: check-tools install
     fi
 
     # ── 4. Reconnect test ────────────────────────────────────────────────────
-    # etr is the direct tmux session command, so #{pane_pid} == etr's PID.
-    # No need to search with pgrep.
-    ETR_PID=$(tmux display-message -t "{{TMUX_SESS}}" -p '#{pane_pid}' 2>/dev/null || true)
-    ETR_COMM=$(ps -o comm= -p "${ETR_PID:-0}" 2>/dev/null | tr -d ' ' || true)
-    if [[ "$ETR_COMM" != "etr" ]]; then
-        echo "SKIP: #{pane_pid}=${ETR_PID:-} is '${ETR_COMM}', not 'etr'; skipping reconnect test" >&2
+    ETRS_PID=$(pgrep -x etrs 2>/dev/null | head -1 || true)
+    if [[ -z "$ETRS_PID" ]]; then
+        echo "SKIP: etrs PID not found; skipping reconnect test" >&2
     else
-        echo "==> Reconnect test: suspending etr client (pid $ETR_PID) for 17 s..."
-        kill -STOP "$ETR_PID"
-        echo "    etr suspended (SIGSTOP). etrs will hit 15-s idle timeout..."
+        echo "==> Reconnect test: suspending etrs (pid $ETRS_PID) for 17 s..."
+        kill -STOP "$ETRS_PID"
+        echo "    etrs suspended. etr will hit 15-s heartbeat timeout and reconnect..."
         sleep 17
-        kill -CONT "$ETR_PID"
-        echo "    etr resumed (SIGCONT). Waiting for reconnect..."
-        sleep 6
+        kill -CONT "$ETRS_PID"
+        echo "    etrs resumed. Waiting for reconnect..."
+        sleep 8
 
         tmux send-keys -t "{{TMUX_SESS}}" "echo RECONNECT_OK && uptime" Enter
         sleep 2
@@ -469,12 +471,12 @@ stress-local: check-tools install
 
     # ── Locate etrs via the remote shell's parent PID ────────────────────────
     # etrs is the direct parent of the remote shell (portable-pty fork+exec).
-    # We read /proc/$$/status inside the remote shell ($$ = shell PID, not
-    # the grep subprocess), so PPid gives the shell's parent = etrs.
+    # Use `ps -o ppid= -p $$` inside the remote shell to get the parent PID —
+    # this is POSIX and works on both Linux and macOS (unlike /proc/$$/status).
     # Use \$\$ so bash doesn't expand $$ before the command reaches the shell.
     PPID_FILE="/tmp/.etr_stress_ppid_$$"
     tmux send-keys -t "$STRESS_SESS" \
-        "awk '/^PPid:/{print \$2}' /proc/\$\$/status > ${PPID_FILE} && echo PPID_OK" Enter
+        "ps -o ppid= -p \$\$ | tr -d '[:space:]' > ${PPID_FILE} && echo PPID_OK" Enter
     # Wait for PPID_OK in pane to confirm the command completed
     for i in $(seq 1 10); do
         sleep 1

@@ -10,8 +10,17 @@ permissions:
 
 jobs:
   build:
-    name: Build Linux binary
-    runs-on: ubuntu-latest
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: release-linux
+            suffix: linux-x86_64
+          - os: macos-latest
+            artifact: release-macos
+            suffix: macos-aarch64
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -28,13 +37,13 @@ jobs:
       - name: Package release assets
         run: |
           mkdir -p dist
-          cp target/release/etr  dist/etr-linux-x86_64
-          cp target/release/etrs dist/etrs-linux-x86_64
+          cp target/release/etr  dist/etr-${{ matrix.suffix }}
+          cp target/release/etrs dist/etrs-${{ matrix.suffix }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: release-linux
+          name: ${{ matrix.artifact }}
           path: dist/*
 
   release:
@@ -42,11 +51,11 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - name: Download artifacts
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          name: release-linux
           path: dist
+          merge-multiple: true
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
