@@ -987,6 +987,7 @@ async fn run_tcp_acceptor_quic(
                     break;
                 }
             };
+            let _ = tcp_stream.set_nodelay(true);
             vlog!(verbose, 2, "[etr] TCP connect from {peer}");
 
             let conn2 = conn.clone();
@@ -1041,7 +1042,7 @@ async fn run_tcp_connection_quic(
     let (mut tcp_r, mut tcp_w) = stream.into_split();
 
     let mut t1 = tokio::spawn(async move {
-        let mut buf = vec![0u8; 8192];
+        let mut buf = vec![0u8; 256 * 1024];
         loop {
             match tcp_r.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
@@ -1056,7 +1057,7 @@ async fn run_tcp_connection_quic(
     });
 
     let mut t2 = tokio::spawn(async move {
-        let mut buf = vec![0u8; 8192];
+        let mut buf = vec![0u8; 256 * 1024];
         loop {
             match quic_recv.read(&mut buf).await {
                 Ok(None) | Err(_) => break,
