@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-use clap::{ArgAction, Parser};
+use clap::{ArgAction, CommandFactory, Parser, ValueEnum};
+use clap_complete::Shell;
+use clap_complete_nushell::Nushell;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::{self, Read, Write};
 use std::os::unix::io::{FromRawFd, IntoRawFd};
@@ -48,11 +50,50 @@ struct Cli {
     /// Path to the server log file (default: $XDG_STATE_HOME/etr/etrs.log)
     #[arg(long, value_name = "PATH")]
     log_path: Option<std::path::PathBuf>,
+
+    /// Generate shell completions for the specified shell
+    #[arg(long, value_enum, value_name = "SHELL")]
+    completions: Option<ShellChoice>,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+enum ShellChoice {
+    Bash,
+    Elvish,
+    Fish,
+    PowerShell,
+    Zsh,
+    Nushell,
 }
 
 fn main() -> io::Result<()> {
     let cli = Cli::parse();
     let _ = VERBOSITY.set(cli.verbose);
+
+    if let Some(shell) = cli.completions {
+        let mut cmd = Cli::command();
+        match shell {
+            ShellChoice::Bash => {
+                clap_complete::generate(Shell::Bash, &mut cmd, "etrs", &mut io::stdout())
+            }
+            ShellChoice::Elvish => {
+                clap_complete::generate(Shell::Elvish, &mut cmd, "etrs", &mut io::stdout())
+            }
+            ShellChoice::Fish => {
+                clap_complete::generate(Shell::Fish, &mut cmd, "etrs", &mut io::stdout())
+            }
+            ShellChoice::PowerShell => {
+                clap_complete::generate(Shell::PowerShell, &mut cmd, "etrs", &mut io::stdout())
+            }
+            ShellChoice::Zsh => {
+                clap_complete::generate(Shell::Zsh, &mut cmd, "etrs", &mut io::stdout())
+            }
+            ShellChoice::Nushell => {
+                clap_complete::generate(Nushell, &mut cmd, "etrs", &mut io::stdout())
+            }
+        }
+        return Ok(());
+    }
 
     // Read session bootstrap line from SSH stdin: SESSION_ID_HEX/PASSKEY/TERM
     let mut input = String::new();
@@ -1131,7 +1172,6 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::CommandFactory;
 
     #[test]
     fn test_cli_defaults() {
@@ -1175,5 +1215,20 @@ mod tests {
             cli.log_path,
             Some(std::path::PathBuf::from("/tmp/server.log"))
         );
+    }
+
+    #[test]
+    fn test_completions_parsed() {
+        for shell in ["bash", "zsh", "fish", "elvish", "power-shell", "nushell"] {
+            let cli = Cli::try_parse_from(["etrs", "--completions", shell]).unwrap();
+            assert!(cli.completions.is_some(), "expected Some for shell={shell}");
+        }
+    }
+
+    #[test]
+    fn test_completions_help_present() {
+        let mut cmd = Cli::command();
+        let help = cmd.render_help().to_string();
+        assert!(help.contains("--completions"));
     }
 }

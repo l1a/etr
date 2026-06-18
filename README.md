@@ -125,11 +125,24 @@ Port forwards survive the same reconnect cycle as the PTY session. Each TCP conn
 
 ## Shell completions
 
+Both `etr` and `etrs` support `--completions <shell>` (bash, zsh, fish, elvish, power-shell, nushell).
+
 ```bash
+# zsh
 etr --completions zsh > ~/.zfunc/_etr
+etrs --completions zsh > ~/.zfunc/_etrs
+
+# bash
 etr --completions bash > /etc/bash_completion.d/etr
+etrs --completions bash > /etc/bash_completion.d/etrs
+
+# fish
 etr --completions fish > ~/.config/fish/completions/etr.fish
+etrs --completions fish > ~/.config/fish/completions/etrs.fish
+
+# nushell
 etr --completions nushell | save completions-etr.nu
+etrs --completions nushell | save completions-etrs.nu
 ```
 
 ## Configuration
