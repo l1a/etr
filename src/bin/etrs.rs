@@ -1091,9 +1091,38 @@ async fn serve_udp_forward(
 ) {
     use tokio::net::UdpSocket;
 
-    let remote_addr = format!("{}:{}", so.remote_host, so.remote_port);
-    let remote_addr_log = remote_addr.clone();
-    let socket = match UdpSocket::bind("0.0.0.0:0").await {
+    // Resolve the remote host to a concrete SocketAddr so that:
+    // (a) the UDP socket is bound to the matching IP family, and
+    // (b) send_to uses the already-resolved address instead of re-resolving
+    //     (which on macOS returns ::1 first, causing IPv4-socket sends to fail).
+    let remote_addr_str = format!("{}:{}", so.remote_host, so.remote_port);
+    // Prefer IPv4 when the hostname resolves to both families (e.g. "localhost"
+    // on macOS returns ::1 first).  Fall back to whatever the resolver gives us.
+    let remote_addr: std::net::SocketAddr = match tokio::net::lookup_host(&remote_addr_str)
+        .await
+        .ok()
+        .and_then(|it| {
+            let addrs: Vec<std::net::SocketAddr> = it.collect();
+            addrs
+                .iter()
+                .find(|a| a.is_ipv4())
+                .copied()
+                .or_else(|| addrs.into_iter().next())
+        }) {
+        Some(a) => a,
+        None => {
+            vlog!(1, "[etrs] UDP forward: cannot resolve {remote_addr_str}");
+            let _ = quic_send.finish();
+            return;
+        }
+    };
+    let remote_addr_log = remote_addr.to_string();
+    let bind_addr = if remote_addr.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    let socket = match UdpSocket::bind(bind_addr).await {
         Ok(s) => Arc::new(s),
         Err(e) => {
             vlog!(1, "[etrs] UDP bind failed: {e}");

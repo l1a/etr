@@ -807,10 +807,39 @@ async fn run_session(
                         run_tcp_connection_quic(tcp, quic_send, quic_recv).await;
                     }
                     ForwardProto::Udp => {
-                        let addr = format!("{}:{}", so.remote_host, so.remote_port);
+                        let addr_str = format!("{}:{}", so.remote_host, so.remote_port);
+                        // Resolve once, preferring IPv4 (macOS returns ::1 first for
+                        // "localhost").  Bind the socket to the matching family so
+                        // send_to doesn't silently drop cross-family packets.
+                        let addr: std::net::SocketAddr = match tokio::net::lookup_host(&addr_str)
+                            .await
+                            .ok()
+                            .and_then(|it| {
+                                let v: Vec<_> = it.collect();
+                                v.iter()
+                                    .find(|a| a.is_ipv4())
+                                    .copied()
+                                    .or_else(|| v.into_iter().next())
+                            }) {
+                            Some(a) => a,
+                            None => {
+                                vlog!(
+                                    verbose,
+                                    1,
+                                    "[etr] UDP reverse fwd: cannot resolve {addr_str}"
+                                );
+                                let _ = quic_send.finish();
+                                return;
+                            }
+                        };
                         vlog!(verbose, 2, "[etr] forwarding UDP reverse stream to {addr}");
                         use tokio::net::UdpSocket;
-                        let socket = match UdpSocket::bind("0.0.0.0:0").await {
+                        let bind_addr = if addr.is_ipv6() {
+                            "[::]:0"
+                        } else {
+                            "0.0.0.0:0"
+                        };
+                        let socket = match UdpSocket::bind(bind_addr).await {
                             Ok(s) => Arc::new(s),
                             Err(e) => {
                                 vlog!(verbose, 1, "[etr] failed to bind local UDP socket: {e}");
