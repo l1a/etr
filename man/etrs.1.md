@@ -54,6 +54,9 @@ window expires), the child exits.
     Output is written to **\$XDG_STATE_HOME/etr/etrs.log** (default:
     **~/.local/state/etr/etrs.log**) after the child forks and detaches.
 
+**\-\-log-path** *PATH*
+:   Path to the server log file. Defaults to **\$XDG_STATE_HOME/etr/etrs.log**.
+
 **-h**, **\-\-help**
 :   Print help and exit.
 

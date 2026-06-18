@@ -68,6 +68,12 @@ SSH channel and pinned for subsequent QUIC connections.
 :   Path to the **etrs** binary on the remote host. Defaults to **etrs**
     (relies on **PATH**), or the value of **server_path** in the config file.
 
+**\-\-log-path** *PATH*
+:   Path to the client log file. Defaults to **\$XDG_STATE_HOME/etr/etr.log**.
+
+**\-\-server-log-path** *PATH*
+:   Path to the server log file on the remote host. Defaults to **\$XDG_STATE_HOME/etr/etrs.log**.
+
 **\-\-completions** *SHELL*
 :   Print shell completion script for the given shell and exit. Supported
     shells: **bash**, **zsh**, **fish**, **elvish**, **powershell**, **nushell**.

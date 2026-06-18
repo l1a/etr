@@ -44,6 +44,10 @@ struct Cli {
     /// Verbosity: -v session events, -vv QUIC details, -vvv stream trace
     #[arg(short = 'v', action = ArgAction::Count)]
     verbose: u8,
+
+    /// Path to the server log file (default: $XDG_STATE_HOME/etr/etrs.log)
+    #[arg(long, value_name = "PATH")]
+    log_path: Option<std::path::PathBuf>,
 }
 
 fn main() -> io::Result<()> {
@@ -108,6 +112,8 @@ fn main() -> io::Result<()> {
         .parse()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e}")))?;
 
+    let log_path = cli.log_path.clone().unwrap_or_else(session_log_path);
+
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
@@ -123,12 +129,12 @@ fn main() -> io::Result<()> {
             writer.write_all(&port_bytes)?;
             drop(writer); // closes pipe_w
 
-            detach_stdio()?;
+            detach_stdio(&log_path)?;
             run_session(endpoint, session_id, passkey, term).await
         })
 }
 
-fn detach_stdio() -> io::Result<()> {
+fn detach_stdio(log_path: &std::path::Path) -> io::Result<()> {
     use nix::unistd::dup2;
     use std::os::unix::io::IntoRawFd;
 
@@ -136,7 +142,6 @@ fn detach_stdio() -> io::Result<()> {
         .map(|f| f.into_raw_fd())
         .unwrap_or(-1);
 
-    let log_path = session_log_path();
     if let Some(p) = log_path.parent() {
         std::fs::create_dir_all(p).ok();
     }
@@ -822,5 +827,14 @@ mod tests {
         assert_eq!(hex_decode("deadbeef"), Some(vec![0xde, 0xad, 0xbe, 0xef]));
         assert_eq!(hex_decode("odd"), None);
         assert_eq!(hex_decode("zz"), None);
+    }
+
+    #[test]
+    fn test_cli_log_path() {
+        let cli = Cli::try_parse_from(["etrs", "--log-path", "/tmp/server.log"]).unwrap();
+        assert_eq!(
+            cli.log_path,
+            Some(std::path::PathBuf::from("/tmp/server.log"))
+        );
     }
 }

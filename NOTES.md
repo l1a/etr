@@ -214,8 +214,8 @@ server_path = "/usr/local/bin/etrs"
 | QUIC data port | OS-assigned (random high port) | `etrs -p PORT` |
 | SSH port | 22 | `-s PORT` or config `ssh_port` |
 | etrs binary path | `etrs` (PATH) | `--server-path` or config `server_path` |
-| Server log | `~/.local/state/etr/etrs.log` | (not yet configurable) |
-| Client log | `~/.local/state/etr/etr.log` | (not yet configurable) |
+| Server log | `~/.local/state/etr/etrs.log` | `etrs --log-path PATH` or `etr --server-log-path PATH` |
+| Client log | `~/.local/state/etr/etr.log` | `etr --log-path PATH` |
 | Server bind address | `[::]` (dual-stack) | `etrs -b ADDR` |
 
 IPv6 is fully supported.
@@ -235,7 +235,7 @@ just install-release  # copies target/release/{etr,etrs} to ~/.cargo/bin
 
 # Code quality gate — run before every commit
 just check            # cargo fmt --check + cargo clippy -D warnings
-just test             # cargo test (57 tests)
+just test             # cargo test (60 tests)
 ```
 
 ---
@@ -319,13 +319,12 @@ last-sender reply routing.  Runs without a PTY session if no terminal is attache
   persisted anywhere, so a new machine cannot reconnect to an existing session.
 - **PQC key exchange**: ML-KEM was retired with the QUIC migration.  Can be re-added
   via `rustls-post-quantum` (X25519MLKEM768 hybrid) once it stabilises.
-- **Client/server log path**: not yet configurable via CLI flag.
 - **Windows / macOS**: the PTY layer uses `portable-pty` (cross-platform) but has
   only been tested on Linux.
 
 ---
 
-## Test coverage (57 tests)
+## Test coverage (60 tests)
 
 | Module | What's tested |
 |--------|--------------|
@@ -333,7 +332,7 @@ last-sender reply routing.  Runs without a PTY session if no terminal is attache
 | `protocol` | SessionOpen/Accept encode-decode, StreamOpen/Close, Heartbeat, Disconnect, UdpDatagram |
 | `session/stream` | Acknowledge edge cases, replay from 0, initial seq values |
 | `session/mod` | Close/ack unknown stream, `last_received_map` semantics, collect_replays, `open_stream` idempotence |
-| `bin/etrs` | CLI defaults, verbose count, custom port, subcommand parsing, hex_decode |
-| `bin/etr` | CLI defaults, port parsing, target parsing, no --cipher flag |
+| `bin/etrs` | CLI defaults, verbose count, custom port, subcommand parsing, hex_decode, custom --log-path override |
+| `bin/etr` | CLI defaults, port parsing, target parsing, no --cipher flag, custom --log-path and --server-log-path overrides |
 | `config` | TOML parse (full section, partial, empty), default values |
 | `forward` | `-L` spec parsing: TCP/UDP/IPv6, explicit proto, bad port, empty host, Display |
