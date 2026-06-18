@@ -325,8 +325,7 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
   all pass.  Test harness fixes applied: `ps -o ppid=` replaces Linux-only
   `/proc/$$/status`; reconnect test stops the etrs daemon (not the etr client)
   because stopping a PTY-attached process on macOS triggers a SIGHUP that kills it.
-- **Shell completions for `etrs`**: `etrs` has no generated shell completions (bash/zsh/fish).
-  `clap` can generate them via `clap_complete`; should be added alongside the existing `etr` completion work if any, or as a new step.
+- ~~**Shell completions for `etrs`**~~ **Done**: `etrs --completions <shell>` generates completions for bash, zsh, fish, elvish, PowerShell, and nushell via `clap_complete`/`clap_complete_nushell`, mirroring the existing `etr --completions` support.
 
 ---
 
