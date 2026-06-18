@@ -912,6 +912,13 @@ async fn run_udp_reverse_listener(
     }
 }
 
+/// Drive a single UDP reverse-forward socket: receive datagrams from external senders,
+/// multiplex them onto a shared QUIC stream toward the client, and route reply datagrams
+/// from the client back to the last-seen sender (last-sender routing).
+///
+/// One instance of this function runs per bound socket (i.e. per address returned by
+/// `spec.get_bind_addresses`).  `active_conn` is shared across all sockets for the same
+/// spec so that reconnect does not interrupt the listen loop.
 async fn run_udp_reverse_listener_socket(
     socket: tokio::net::UdpSocket,
     spec: etr::forward::ForwardSpec,

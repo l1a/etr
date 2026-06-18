@@ -164,6 +164,9 @@ mod tests {
     use super::*;
     use prost::Message;
 
+    /// Verify that a [`SessionOpen`] with all fields set (including `reverse_forwards` and
+    /// `gateway_ports`) survives a protobuf encode → decode round trip inside an [`Envelope`].
+    /// This catches field-tag collisions and ensures the new bool field is not silently dropped.
     #[test]
     fn test_session_open_round_trip() {
         let env = Envelope {

@@ -903,7 +903,12 @@ async fn run_session(
 
 // ── Forward helpers (client side) ────────────────────────────────────────────
 
-/// Accept local TCP connections and open a QUIC forward stream per connection.
+/// Accept local TCP connections on the addresses resolved by `spec.get_bind_addresses(gateway)`
+/// and open one QUIC forward stream per connection toward the spec's remote host/port.
+///
+/// `gateway` mirrors the `-g` / `--gateway-ports` flag: when `true`, the listener binds
+/// a dual-stack `[::]` socket (all interfaces); when `false` it binds `127.0.0.1` + `[::1]`
+/// or whatever explicit bind address the spec contains.
 async fn run_tcp_acceptor_quic(
     spec: ForwardSpec,
     conn: quinn::Connection,
@@ -1045,7 +1050,12 @@ async fn run_tcp_connection_quic(
     t2.abort();
 }
 
-/// Open one QUIC forward stream for a UDP `-L` spec; pipe local datagrams through it.
+/// Open one QUIC forward stream for a UDP `-L` spec and pipe local datagrams through it.
+///
+/// Binds one local UDP socket per address returned by `spec.get_bind_addresses(gateway)`.
+/// `gateway` mirrors the `-g` / `--gateway-ports` flag: when `true`, the socket binds
+/// a dual-stack `[::]` socket (all interfaces); when `false` it binds `127.0.0.1` + `[::1]`
+/// or whatever explicit bind address the spec contains.
 async fn run_udp_forward_client_quic(
     spec: ForwardSpec,
     conn: quinn::Connection,

@@ -79,7 +79,9 @@ SSH channel and pinned for subsequent QUIC connections.
     on the server binds to both **127.0.0.1** and **[::1]** loopback interfaces.
 
     If *bind_address* is specified as **\***, **0.0.0.0**, or **::**, the remote listener binds
-    to all interfaces on the server. Alternatively, it can bind to a specific interface IP.
+    a single dual-stack **[::]** socket on the server. Alternatively, it can bind to a specific
+    interface IP.  The **-g** / **\-\-gateway-ports** flag also causes remote listeners to bind
+    to all interfaces on the server.
 
     This option may be repeated to open multiple reverse forwards concurrently alongside the PTY
     session.
@@ -91,10 +93,10 @@ SSH channel and pinned for subsequent QUIC connections.
         -R 5353:127.0.0.1:53/udp
 
 **-g**, **\-\-gateway-ports**
-:   Allow remote hosts to connect to local forwarded ports. Similar to **ssh -g**.
-    Binds local forwarded ports to a single dual-stack **[::]** socket, which
-    accepts both IPv4 and IPv6 connections on all interfaces.
-
+:   Allow remote hosts to connect to forwarded ports. Similar to **ssh -g**.
+    Binds both local (**-L**) and remote (**-R**) forwarded ports to a single dual-stack
+    **[::]** socket, which accepts both IPv4 and IPv6 connections on all interfaces,
+    instead of binding to loopback only.
 
 **\-\-server-path** *PATH*
 :   Path to the **etrs** binary on the remote host. Defaults to **etrs**

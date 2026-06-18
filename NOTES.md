@@ -235,7 +235,7 @@ just install-release  # copies target/release/{etr,etrs} to ~/.cargo/bin
 
 # Code quality gate — run before every commit
 just check            # cargo fmt --check + cargo clippy -D warnings
-just test             # cargo test (61 tests)
+just test             # cargo test (67 tests)
 ```
 
 ---
@@ -324,15 +324,15 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
 
 ---
 
-## Test coverage (61 tests)
+## Test coverage (67 tests)
 
 | Module | What's tested |
 |--------|--------------|
 | `quic` | Cert generation, server/client config, write/read Envelope framing, write/read PTY chunk framing |
-| `protocol` | SessionOpen/Accept encode-decode, StreamOpen/Close, Heartbeat, Disconnect, UdpDatagram |
+| `protocol` | SessionOpen/Accept encode-decode (incl. `gateway_ports` and `reverse_forwards` round-trip), StreamOpen/Close, Heartbeat, Disconnect, UdpDatagram |
 | `session/stream` | Acknowledge edge cases, replay from 0, initial seq values |
 | `session/mod` | Close/ack unknown stream, `last_received_map` semantics, collect_replays, `open_stream` idempotence |
 | `bin/etrs` | CLI defaults, verbose count, custom port, subcommand parsing, hex_decode, custom --log-path override |
-| `bin/etr` | CLI defaults, port parsing, target parsing, no --cipher flag, custom --log-path and --server-log-path overrides |
-| `config` | TOML parse (full section, partial, empty), default values |
-| `forward` | `-L` spec parsing: TCP/UDP/IPv6, explicit proto, bad port, empty host, Display |
+| `bin/etr` | CLI defaults, port parsing, target parsing, no --cipher flag, custom --log-path and --server-log-path overrides, config fallback for log paths |
+| `config` | TOML parse (full section, partial, empty), default values, `gateway_ports` / `forward` / `reverse_forward` config keys |
+| `forward` | `-L`/`-R` spec parsing: TCP/UDP/IPv6, explicit proto, bad port, empty host, Display; bind address parsing (explicit IP, `[::1]`, wildcard `*`); `get_bind_addresses` with and without gateway flag |
