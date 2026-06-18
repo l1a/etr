@@ -29,7 +29,7 @@ macro_rules! vlog {
 #[derive(Parser)]
 #[command(
     name = "etrs",
-    version = "0.2.0",
+    version = env!("CARGO_PKG_VERSION"),
     about = "Eternal Terminal Server — started per-session by etr via SSH"
 )]
 struct Cli {

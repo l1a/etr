@@ -49,7 +49,7 @@ fn client_log_path() -> std::path::PathBuf {
 #[derive(Parser, Debug)]
 #[command(
     name = "etr",
-    version = "0.2.0",
+    version = env!("CARGO_PKG_VERSION"),
     about = "Eternal Terminal Client in Rust"
 )]
 struct Cli {
