@@ -32,6 +32,10 @@ clippy:
 test:
     cargo test
 
+# Run performance benchmarks
+bench:
+    cargo bench
+
 # Run security audit on dependencies (installs cargo-audit if absent)
 audit:
     #!/usr/bin/env bash

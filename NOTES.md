@@ -303,9 +303,7 @@ last-sender reply routing.  Runs without a PTY session if no terminal is attache
   `/usr/libexec/utempter/utempter` so `etrs` needs no special privileges.
   Sessions appear in `last`; `who`/`w` read from systemd-logind on modern Fedora
   and do not show utmp-only sessions.  Non-Linux builds get no-op stubs.
-- **Benchmarking**: no performance benchmarks exist.  Key areas to measure: QUIC
-  connection latency, PTY round-trip latency, throughput under reconnect, and
-  port-forward throughput.  Consider `criterion` for micro-benchmarks.
+- ~~**Benchmarking**~~ **Done**: Criterion benchmark suite implemented in `benches/session_bench.rs` measuring certificate generation, QUIC connection handshake latency, PTY round-trip latency (100b), and throughput (64kb).
 - **Mode 2 — `-R` remote forwarding**: `-L` (local-to-remote) is done; `-R` (remote
   port → local) is not yet implemented.
 - **UDP reply routing**: current shared-socket design uses last-sender routing —
