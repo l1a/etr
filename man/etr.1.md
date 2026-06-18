@@ -58,7 +58,8 @@ SSH channel and pinned for subsequent QUIC connections.
     binds to both **127.0.0.1** and **[::1]** loopback interfaces.
 
     If *bind_address* is specified as **\***, **0.0.0.0**, or **::**, the listener binds
-    to all local interfaces. Alternatively, it can bind to a specific interface IP.
+    a single dual-stack **[::]** socket, which accepts both IPv4 and IPv6 connections.
+    Alternatively, it can bind to a specific interface IP.
     The **-g** / **\-\-gateway-ports** flag can also be used to bind all forwards to all interfaces.
 
     This option may be repeated to open multiple forwards concurrently alongside the PTY
@@ -91,8 +92,8 @@ SSH channel and pinned for subsequent QUIC connections.
 
 **-g**, **\-\-gateway-ports**
 :   Allow remote hosts to connect to local forwarded ports. Similar to **ssh -g**.
-    Automatically binds local forwarded ports to all local interfaces (**0.0.0.0** and **::**)
-    instead of loopback only.
+    Binds local forwarded ports to a single dual-stack **[::]** socket, which
+    accepts both IPv4 and IPv6 connections on all interfaces.
 
 
 **\-\-server-path** *PATH*

@@ -102,16 +102,36 @@ impl ForwardSpec {
     }
 
     /// Resolve the concrete bind addresses based on the parsed bind_address and gateway flag.
+    ///
+    /// Returns the list of socket address strings to bind.  Each entry is passed verbatim to
+    /// `TcpListener::bind` / `UdpSocket::bind` as `"<addr>:<port>"`, so IPv6 addresses must
+    /// already be in bracket form (e.g. `"[::1]"`).
+    ///
+    /// # Strategy
+    ///
+    /// * **Wildcard / gateway mode** — returns a **single** `"[::]"` entry.  On dual-stack Linux
+    ///   (the common case, `net.ipv6.bindv6only = 0`), a `[::]` socket already accepts both
+    ///   IPv4-mapped connections (shown as `::ffff:a.b.c.d`) and native IPv6 connections, so no
+    ///   separate `0.0.0.0` socket is needed.  Binding `0.0.0.0` *first* and then `[::]` on the
+    ///   same port causes the second bind to fail with `EADDRINUSE` on dual-stack kernels.
+    ///
+    /// * **Loopback (default)** — returns two entries: `"127.0.0.1"` and `"[::1]"`.  These are
+    ///   genuinely distinct addresses, so two sockets are required.
+    ///
+    /// * **Explicit bind address** — returned as-is in a one-element vec.
     pub fn get_bind_addresses(&self, gateway: bool) -> Vec<String> {
         if let Some(ref addr) = self.bind_address {
             if addr == "*" || addr == "0.0.0.0" || addr == "::" || addr.is_empty() {
-                vec!["0.0.0.0".to_string(), "[::]".to_string()]
+                // Wildcard explicit bind: single dual-stack [::] socket.
+                vec!["[::]".to_string()]
             } else {
                 vec![addr.clone()]
             }
         } else if gateway {
-            vec!["0.0.0.0".to_string(), "[::]".to_string()]
+            // -g / --gateway-ports: single dual-stack [::] socket covers both IPv4 and IPv6.
+            vec!["[::]".to_string()]
         } else {
+            // Default: loopback only on both IPv4 and IPv6.
             vec!["127.0.0.1".to_string(), "[::1]".to_string()]
         }
     }
@@ -202,13 +222,22 @@ mod tests {
 
     #[test]
     fn test_get_bind_addresses() {
+        // Default (no gateway): two loopback sockets.
         let s = ForwardSpec::parse("8080:localhost:80").unwrap();
         assert_eq!(s.get_bind_addresses(false), vec!["127.0.0.1", "[::1]"]);
-        assert_eq!(s.get_bind_addresses(true), vec!["0.0.0.0", "[::]"]);
 
+        // Gateway flag: single dual-stack [::] socket.
+        assert_eq!(s.get_bind_addresses(true), vec!["[::]"]);
+
+        // Wildcard explicit bind address: single dual-stack [::] socket.
         let s = ForwardSpec::parse("*:8080:localhost:80").unwrap();
-        assert_eq!(s.get_bind_addresses(false), vec!["0.0.0.0", "[::]"]);
+        assert_eq!(s.get_bind_addresses(false), vec!["[::]"]);
 
+        // 0.0.0.0 explicit bind: single dual-stack [::] socket.
+        let s = ForwardSpec::parse("0.0.0.0:8080:localhost:80").unwrap();
+        assert_eq!(s.get_bind_addresses(false), vec!["[::]"]);
+
+        // Specific IP explicit bind: returned as-is.
         let s = ForwardSpec::parse("192.168.1.50:8080:localhost:80").unwrap();
         assert_eq!(s.get_bind_addresses(false), vec!["192.168.1.50"]);
     }
