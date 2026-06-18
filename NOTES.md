@@ -9,7 +9,7 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.4.1 — macOS support
+## Current state: v0.4.2 — shell completions for etrs
 
 The full round-trip works: `etr <host>` on the client, SSH bootstrap that starts
 `etrs` on the fly, QUIC connection with cert pinning, PTY session, keepalives,
