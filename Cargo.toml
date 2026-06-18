@@ -1,6 +1,6 @@
 [package]
 name = "etr"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 description = "A Rust implementation of Eternal Terminal (et)"
 license = "GPL-3.0-only"
@@ -36,3 +36,10 @@ dirs = "5"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "session_bench"
+harness = false

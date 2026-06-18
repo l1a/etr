@@ -43,6 +43,13 @@ git clone https://github.com/l1a/etr
 cd etr
 cargo build --release
 # binaries at target/release/etr and target/release/etrs
+
+# Run tests
+just test             # runs unit/integration tests
+just e2e-local        # runs end-to-end tests (requires tmux and local ssh)
+
+# Run benchmarks
+just bench            # runs performance benchmarks via Criterion
 ```
 
 ## Usage
