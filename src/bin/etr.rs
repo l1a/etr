@@ -816,18 +816,29 @@ async fn run_session(
                             .ok()
                             .and_then(|it| {
                                 let v: Vec<_> = it.collect();
-                                v.iter().find(|a| a.is_ipv4()).copied().or_else(|| v.into_iter().next())
+                                v.iter()
+                                    .find(|a| a.is_ipv4())
+                                    .copied()
+                                    .or_else(|| v.into_iter().next())
                             }) {
                             Some(a) => a,
                             None => {
-                                vlog!(verbose, 1, "[etr] UDP reverse fwd: cannot resolve {addr_str}");
+                                vlog!(
+                                    verbose,
+                                    1,
+                                    "[etr] UDP reverse fwd: cannot resolve {addr_str}"
+                                );
                                 let _ = quic_send.finish();
                                 return;
                             }
                         };
                         vlog!(verbose, 2, "[etr] forwarding UDP reverse stream to {addr}");
                         use tokio::net::UdpSocket;
-                        let bind_addr = if addr.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+                        let bind_addr = if addr.is_ipv6() {
+                            "[::]:0"
+                        } else {
+                            "0.0.0.0:0"
+                        };
                         let socket = match UdpSocket::bind(bind_addr).await {
                             Ok(s) => Arc::new(s),
                             Err(e) => {

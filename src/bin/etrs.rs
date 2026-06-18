@@ -1103,9 +1103,12 @@ async fn serve_udp_forward(
         .ok()
         .and_then(|it| {
             let addrs: Vec<std::net::SocketAddr> = it.collect();
-            addrs.iter().find(|a| a.is_ipv4()).copied().or_else(|| addrs.into_iter().next())
-        })
-    {
+            addrs
+                .iter()
+                .find(|a| a.is_ipv4())
+                .copied()
+                .or_else(|| addrs.into_iter().next())
+        }) {
         Some(a) => a,
         None => {
             vlog!(1, "[etrs] UDP forward: cannot resolve {remote_addr_str}");
@@ -1114,7 +1117,11 @@ async fn serve_udp_forward(
         }
     };
     let remote_addr_log = remote_addr.to_string();
-    let bind_addr = if remote_addr.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+    let bind_addr = if remote_addr.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
     let socket = match UdpSocket::bind(bind_addr).await {
         Ok(s) => Arc::new(s),
         Err(e) => {
