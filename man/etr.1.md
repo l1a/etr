@@ -97,6 +97,12 @@ ssh_port = 22
 
 # Path to etrs on remote hosts (default: "etrs", relies on PATH)
 server_path = "/usr/local/bin/etrs"
+
+# Default path to the client log file
+log_path = "/tmp/client.log"
+
+# Default path to the server log file on the remote host
+server_log_path = "/tmp/server.log"
 ```
 
 # FILES

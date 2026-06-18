@@ -214,8 +214,8 @@ server_path = "/usr/local/bin/etrs"
 | QUIC data port | OS-assigned (random high port) | `etrs -p PORT` |
 | SSH port | 22 | `-s PORT` or config `ssh_port` |
 | etrs binary path | `etrs` (PATH) | `--server-path` or config `server_path` |
-| Server log | `~/.local/state/etr/etrs.log` | `etrs --log-path PATH` or `etr --server-log-path PATH` |
-| Client log | `~/.local/state/etr/etr.log` | `etr --log-path PATH` |
+| Server log | `~/.local/state/etr/etrs.log` | `etrs --log-path PATH`, `etr --server-log-path PATH`, or config `server_log_path` |
+| Client log | `~/.local/state/etr/etr.log` | `etr --log-path PATH` or config `log_path` |
 | Server bind address | `[::]` (dual-stack) | `etrs -b ADDR` |
 
 IPv6 is fully supported.
@@ -235,7 +235,7 @@ just install-release  # copies target/release/{etr,etrs} to ~/.cargo/bin
 
 # Code quality gate — run before every commit
 just check            # cargo fmt --check + cargo clippy -D warnings
-just test             # cargo test (60 tests)
+just test             # cargo test (61 tests)
 ```
 
 ---
@@ -324,7 +324,7 @@ last-sender reply routing.  Runs without a PTY session if no terminal is attache
 
 ---
 
-## Test coverage (60 tests)
+## Test coverage (61 tests)
 
 | Module | What's tested |
 |--------|--------------|

@@ -100,6 +100,7 @@ enum ShellChoice {
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let cli = Cli::parse();
+    let cfg = Config::load();
 
     if let Some(shell) = cli.completions {
         let mut cmd = Cli::command();
@@ -127,7 +128,11 @@ async fn main() -> io::Result<()> {
     }
 
     if cli.verbose > 0 && io::stdin().is_terminal() {
-        let log_path = cli.log_path.clone().unwrap_or_else(client_log_path);
+        let log_path = cli
+            .log_path
+            .clone()
+            .or_else(|| cfg.client.log_path.as_ref().map(std::path::PathBuf::from))
+            .unwrap_or_else(client_log_path);
         if let Some(parent) = log_path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
@@ -152,7 +157,6 @@ async fn main() -> io::Result<()> {
         }
     };
 
-    let cfg = Config::load();
     let ssh_port = cli
         .ssh_port
         .unwrap_or_else(|| cfg.client.ssh_port.unwrap_or(22));
@@ -193,7 +197,9 @@ async fn main() -> io::Result<()> {
         &passkey,
         &term,
         &server_path,
-        cli.server_log_path.as_deref(),
+        cli.server_log_path
+            .as_deref()
+            .or(cfg.client.server_log_path.as_deref()),
         cli.verbose,
     )?;
 
@@ -969,5 +975,26 @@ mod tests {
         let cli =
             Cli::try_parse_from(["etr", "--server-log-path", "/tmp/server.log", "host"]).unwrap();
         assert_eq!(cli.server_log_path.as_deref(), Some("/tmp/server.log"));
+    }
+
+    #[test]
+    fn test_log_paths_fallback_to_config() {
+        let toml = "[client]\nlog_path = \"/config/client.log\"\nserver_log_path = \"/config/server.log\"\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let cli = Cli::try_parse_from(["etr", "host"]).unwrap();
+
+        let log_path = cli
+            .log_path
+            .clone()
+            .or_else(|| cfg.client.log_path.as_ref().map(std::path::PathBuf::from))
+            .unwrap_or_else(client_log_path);
+
+        let server_log_path = cli
+            .server_log_path
+            .as_deref()
+            .or(cfg.client.server_log_path.as_deref());
+
+        assert_eq!(log_path, std::path::PathBuf::from("/config/client.log"));
+        assert_eq!(server_log_path, Some("/config/server.log"));
     }
 }

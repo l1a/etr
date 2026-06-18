@@ -32,6 +32,12 @@ pub struct ClientConfig {
 
     /// Default path to etrs on the remote host.
     pub server_path: Option<String>,
+
+    /// Default path to the client log file.
+    pub log_path: Option<String>,
+
+    /// Default path to the server log file on the remote host.
+    pub server_log_path: Option<String>,
 }
 
 impl Config {
@@ -103,12 +109,17 @@ mod tests {
 
     #[test]
     fn test_parse_full_client_section() {
-        let toml = "[client]\nssh_port = 2222\nserver_path = \"/usr/local/bin/etrs\"\n";
+        let toml = "[client]\nssh_port = 2222\nserver_path = \"/usr/local/bin/etrs\"\nlog_path = \"/tmp/client.log\"\nserver_log_path = \"/tmp/server.log\"\n";
         let cfg: Config = toml::from_str(toml).unwrap();
         assert_eq!(cfg.client.ssh_port, Some(2222));
         assert_eq!(
             cfg.client.server_path.as_deref(),
             Some("/usr/local/bin/etrs")
+        );
+        assert_eq!(cfg.client.log_path.as_deref(), Some("/tmp/client.log"));
+        assert_eq!(
+            cfg.client.server_log_path.as_deref(),
+            Some("/tmp/server.log")
         );
     }
 
