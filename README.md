@@ -59,10 +59,12 @@ Options:
                                  Forward a local port to a remote address (repeatable)
   -v, -vv, -vvv                  Verbosity: connection events / QUIC details / stream trace
       --server-path <PATH>       Path to etrs on the remote host [default: etrs]
+      --log-path <PATH>          Path to the client log file [default: $XDG_STATE_HOME/etr/etr.log]
+      --server-log-path <PATH>   Path to the server log file on the remote host [default: $XDG_STATE_HOME/etr/etrs.log]
       --completions <SHELL>      Print shell completions [bash, zsh, fish, nushell, ...]
 ```
 
-Verbose logs go to `~/.local/state/etr/etr.log` during a live session (to avoid corrupting the terminal display). Watch with `tail -f ~/.local/state/etr/etr.log`.
+Verbose logs go to `~/.local/state/etr/etr.log` by default during a live session (to avoid corrupting the terminal display), or to the path specified via `--log-path` / config `log_path`. Watch with `tail -f ~/.local/state/etr/etr.log`.
 
 ## Transport and security
 
@@ -110,8 +112,10 @@ Optional TOML config at `~/.config/etr/config.toml`:
 
 ```toml
 [client]
-ssh_port = 22                    # default SSH port
-server_path = "/usr/local/bin/etrs"  # path to etrs on remote hosts
+ssh_port = 22                        # default SSH port
+server_path = "/usr/local/bin/etrs"      # path to etrs on remote hosts
+log_path = "/tmp/client.log"         # path to the client log file
+server_log_path = "/tmp/server.log"   # path to the server log file on remote host
 ```
 
 ## Limitations

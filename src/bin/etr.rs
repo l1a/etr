@@ -49,7 +49,7 @@ fn client_log_path() -> std::path::PathBuf {
 #[derive(Parser, Debug)]
 #[command(
     name = "etr",
-    version = "0.2.0",
+    version = env!("CARGO_PKG_VERSION"),
     about = "Eternal Terminal Client in Rust"
 )]
 struct Cli {
@@ -74,6 +74,14 @@ struct Cli {
     #[arg(short = 'L', value_name = "SPEC")]
     forward: Vec<String>,
 
+    /// Path to the client log file (default: $XDG_STATE_HOME/etr/etr.log)
+    #[arg(long, value_name = "PATH")]
+    log_path: Option<std::path::PathBuf>,
+
+    /// Path to the server log file on the remote host (default: $XDG_STATE_HOME/etr/etrs.log)
+    #[arg(long, value_name = "PATH")]
+    server_log_path: Option<String>,
+
     /// Generate shell completions for the specified shell
     #[arg(long, value_enum, value_name = "SHELL")]
     completions: Option<ShellChoice>,
@@ -92,6 +100,7 @@ enum ShellChoice {
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let cli = Cli::parse();
+    let cfg = Config::load();
 
     if let Some(shell) = cli.completions {
         let mut cmd = Cli::command();
@@ -119,7 +128,11 @@ async fn main() -> io::Result<()> {
     }
 
     if cli.verbose > 0 && io::stdin().is_terminal() {
-        let log_path = client_log_path();
+        let log_path = cli
+            .log_path
+            .clone()
+            .or_else(|| cfg.client.log_path.as_ref().map(std::path::PathBuf::from))
+            .unwrap_or_else(client_log_path);
         if let Some(parent) = log_path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
@@ -144,7 +157,6 @@ async fn main() -> io::Result<()> {
         }
     };
 
-    let cfg = Config::load();
     let ssh_port = cli
         .ssh_port
         .unwrap_or_else(|| cfg.client.ssh_port.unwrap_or(22));
@@ -185,6 +197,9 @@ async fn main() -> io::Result<()> {
         &passkey,
         &term,
         &server_path,
+        cli.server_log_path
+            .as_deref()
+            .or(cfg.client.server_log_path.as_deref()),
         cli.verbose,
     )?;
 
@@ -240,6 +255,7 @@ fn generate_passkey() -> String {
 
 /// SSH to the target, start `etrs`, send session credentials, and read back
 /// the QUIC port and server cert DER from etrs stdout.
+#[allow(clippy::too_many_arguments)]
 fn bootstrap_ssh(
     target: &str,
     ssh_port: u16,
@@ -247,6 +263,7 @@ fn bootstrap_ssh(
     passkey: &str,
     term: &str,
     server_path: &str,
+    server_log_path: Option<&str>,
     verbose: u8,
 ) -> io::Result<(u16, Vec<u8>)> {
     let session_id_hex = hex_encode(session_id);
@@ -257,6 +274,9 @@ fn bootstrap_ssh(
     let mut cmd = Command::new("ssh");
     cmd.arg("-p").arg(ssh_port.to_string()).arg(target);
     cmd.arg(server_path);
+    if let Some(log_path) = server_log_path {
+        cmd.arg("--log-path").arg(log_path);
+    }
     if !v_flag.is_empty() {
         cmd.arg(&v_flag);
     }
@@ -939,5 +959,42 @@ mod tests {
         // --cipher is removed; the parser should have no such argument.
         let result = Cli::try_parse_from(["etr", "--cipher", "x25519-aes", "host"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_log_path_override() {
+        let cli = Cli::try_parse_from(["etr", "--log-path", "/tmp/client.log", "host"]).unwrap();
+        assert_eq!(
+            cli.log_path,
+            Some(std::path::PathBuf::from("/tmp/client.log"))
+        );
+    }
+
+    #[test]
+    fn test_server_log_path_override() {
+        let cli =
+            Cli::try_parse_from(["etr", "--server-log-path", "/tmp/server.log", "host"]).unwrap();
+        assert_eq!(cli.server_log_path.as_deref(), Some("/tmp/server.log"));
+    }
+
+    #[test]
+    fn test_log_paths_fallback_to_config() {
+        let toml = "[client]\nlog_path = \"/config/client.log\"\nserver_log_path = \"/config/server.log\"\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let cli = Cli::try_parse_from(["etr", "host"]).unwrap();
+
+        let log_path = cli
+            .log_path
+            .clone()
+            .or_else(|| cfg.client.log_path.as_ref().map(std::path::PathBuf::from))
+            .unwrap_or_else(client_log_path);
+
+        let server_log_path = cli
+            .server_log_path
+            .as_deref()
+            .or(cfg.client.server_log_path.as_deref());
+
+        assert_eq!(log_path, std::path::PathBuf::from("/config/client.log"));
+        assert_eq!(server_log_path, Some("/config/server.log"));
     }
 }
