@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 
+use etr::login;
 use etr::protocol::{
     Disconnect, Envelope, ForwardProto, Payload, SessionAccept, StreamOpen, UdpDatagram,
 };
@@ -198,6 +199,8 @@ async fn run_session(
     cmd.env("TERM", &term);
     let mut child = pair.slave.spawn_command(cmd).map_err(io::Error::other)?;
 
+    let tty_path = pair.master.tty_name();
+    let child_pid = child.process_id().map(|p| p as i32).unwrap_or(0);
     let mut pty_reader = pair.master.try_clone_reader().map_err(io::Error::other)?;
     let mut pty_writer = pair.master.take_writer().map_err(io::Error::other)?;
     let master = Arc::new(Mutex::new(pair.master));
@@ -256,6 +259,7 @@ async fn run_session(
     {
         let outbound_ctrl_tx = Arc::clone(&outbound_ctrl_tx);
         let session_id_copy = session_id;
+        let tty_path_exit = tty_path.clone();
         tokio::task::spawn_blocking(move || {
             let _ = child.wait();
             vlog!(
@@ -263,6 +267,9 @@ async fn run_session(
                 "[etrs] shell exited for {}",
                 hex_encode(&session_id_copy)
             );
+            if let Some(ref p) = tty_path_exit {
+                login::record_logout(child_pid, p);
+            }
             if let Some(tx) = outbound_ctrl_tx.lock().unwrap().clone() {
                 let _ = tx.blocking_send(Envelope {
                     payload: Some(Payload::Disconnect(Disconnect {})),
@@ -322,6 +329,8 @@ async fn run_session(
             Arc::clone(&outbound_ctrl_tx),
             pty_in_tx.clone(),
             Arc::clone(&master),
+            tty_path.as_deref(),
+            child_pid,
         )
         .await;
 
@@ -351,6 +360,8 @@ async fn handle_connection(
     outbound_ctrl_tx: CtrlTx,
     pty_in_tx: mpsc::Sender<Vec<u8>>,
     master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
+    tty_path: Option<&std::path::Path>,
+    child_pid: i32,
 ) -> bool {
     let peer = conn.remote_address();
     vlog!(
@@ -359,6 +370,9 @@ async fn handle_connection(
         peer,
         hex_encode(&session_id)
     );
+    if let Some(p) = tty_path {
+        login::record_login(child_pid, p, &peer.ip().to_string());
+    }
 
     // ── Control stream: first stream the client opens ─────────────────────
     let (mut ctrl_send, mut ctrl_recv) = match conn.accept_bi().await {

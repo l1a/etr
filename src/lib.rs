@@ -13,6 +13,7 @@
 //! - [`forward`]: `-L` forwarding spec parser.
 pub mod config;
 pub mod forward;
+pub mod login;
 pub mod protocol;
 pub mod quic;
 pub mod session;
