@@ -51,6 +51,10 @@ pub struct SessionOpen {
     /// Reverse port forwarding specifications (e.g. "remote_port:local_host:local_port[/tcp|/udp]").
     #[prost(string, repeated, tag = "4")]
     pub reverse_forwards: Vec<String>,
+    /// If true, reverse-forward listeners on the server bind to all interfaces ([::] dual-stack)
+    /// instead of loopback only.  Corresponds to the client's -g / --gateway-ports flag.
+    #[prost(bool, tag = "5")]
+    pub gateway_ports: bool,
 }
 
 /// Sent by the server in reply to [`SessionOpen`] once the session is verified.
@@ -167,11 +171,19 @@ mod tests {
                 session_id: vec![1u8; 16],
                 passkey: "secret".to_string(),
                 last_received_seq: [(0u32, 7u64)].into(),
-                reverse_forwards: vec![],
+                reverse_forwards: vec!["9090:localhost:90".to_string()],
+                gateway_ports: true,
             })),
         };
         let decoded = Envelope::decode(env.encode_to_vec().as_slice()).unwrap();
         assert_eq!(decoded, env);
+        // Verify gateway_ports survives the round trip.
+        if let Some(Payload::SessionOpen(so)) = decoded.payload {
+            assert!(so.gateway_ports);
+            assert_eq!(so.reverse_forwards, vec!["9090:localhost:90"]);
+        } else {
+            panic!("expected SessionOpen payload");
+        }
     }
 
     #[test]

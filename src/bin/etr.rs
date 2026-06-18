@@ -523,8 +523,10 @@ async fn run_session(
             passkey: passkey.clone(),
             last_received_seq: last_received,
             reverse_forwards: reverse_forward_specs.clone(),
+            gateway_ports,
         })),
     };
+
     quic::write_msg(&mut ctrl_send, &session_open).await?;
 
     // Read SessionAccept.

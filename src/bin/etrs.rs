@@ -467,16 +467,25 @@ async fn handle_connection(
     // Spawn reverse port forwarding listeners
     {
         let mut started = active_reverse_listeners.lock().await;
+        let gateway = session_open.gateway_ports;
         for spec_str in &session_open.reverse_forwards {
             if !started.contains(spec_str) {
                 if let Ok(spec) = etr::forward::ForwardSpec::parse(spec_str) {
                     let active_conn_clone = Arc::clone(&active_conn);
                     match spec.proto {
                         ForwardProto::Tcp => {
-                            tokio::spawn(run_tcp_reverse_listener(spec, active_conn_clone));
+                            tokio::spawn(run_tcp_reverse_listener(
+                                spec,
+                                active_conn_clone,
+                                gateway,
+                            ));
                         }
                         ForwardProto::Udp => {
-                            tokio::spawn(run_udp_reverse_listener(spec, active_conn_clone));
+                            tokio::spawn(run_udp_reverse_listener(
+                                spec,
+                                active_conn_clone,
+                                gateway,
+                            ));
                         }
                     }
                     started.insert(spec_str.clone());
@@ -748,13 +757,19 @@ async fn serve_tcp_forward(
     vlog!(2, "[etrs] TCP forward to {addr} closed");
 }
 
+/// Accept connections on a remote TCP port and forward each one back to the client via QUIC.
+///
+/// `gateway` mirrors the client's `-g` / `--gateway-ports` flag: when `true`, the listener
+/// binds a dual-stack `[::]` socket (all interfaces); when `false` it binds the loopback
+/// pair `127.0.0.1` + `[::1]`, or whatever the spec's explicit bind address specifies.
 async fn run_tcp_reverse_listener(
     spec: etr::forward::ForwardSpec,
     active_conn: Arc<Mutex<Option<quinn::Connection>>>,
+    gateway: bool,
 ) {
     use tokio::net::TcpListener;
 
-    let bind_addrs = spec.get_bind_addresses(false);
+    let bind_addrs = spec.get_bind_addresses(gateway);
     let mut listeners = Vec::new();
     for addr in &bind_addrs {
         let target = format!("{addr}:{}", spec.local_port);
@@ -843,13 +858,19 @@ async fn run_tcp_reverse_listener(
     }
 }
 
+/// Accept datagrams on a remote UDP port and forward each one back to the client via QUIC.
+///
+/// `gateway` mirrors the client's `-g` / `--gateway-ports` flag: when `true`, the listener
+/// binds a dual-stack `[::]` socket (all interfaces); when `false` it binds the loopback
+/// pair `127.0.0.1` + `[::1]`, or whatever the spec's explicit bind address specifies.
 async fn run_udp_reverse_listener(
     spec: etr::forward::ForwardSpec,
     active_conn: Arc<Mutex<Option<quinn::Connection>>>,
+    gateway: bool,
 ) {
     use tokio::net::UdpSocket;
 
-    let bind_addrs = spec.get_bind_addresses(false);
+    let bind_addrs = spec.get_bind_addresses(gateway);
     let mut sockets = Vec::new();
     for addr in &bind_addrs {
         let target = format!("{addr}:{}", spec.local_port);
