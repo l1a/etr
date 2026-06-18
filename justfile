@@ -67,8 +67,8 @@ install: build
     cp "{{ETR_BIN}}"  "{{INSTALL}}/etr"
     echo "Installed etrs and etr (debug) to {{INSTALL}}"
 
-# Install release binaries to ~/.cargo/bin (no sudo)
-install-release: build-release
+# Install release binaries to ~/.cargo/bin and man pages to XDG man dir
+install-release: build-release install-man
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p "{{INSTALL}}"
