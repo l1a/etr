@@ -331,6 +331,12 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
   (dual-stack) QUIC connection the peer address is an IPv4-mapped IPv6 address
   (`::ffff:127.0.0.1`), which is not what `last` and friends expect in the IPv4 slots.
   Should be unwrapped to a plain IPv4 address before writing.
+- **Throughput is far below iperf3 localhost baseline**: `just stress-local` measures ~270 Mb/s
+  for TCP forwarding (-L and -R) and ~9 Mb/s for UDP.  `iperf3 -c 127.0.0.1` on the same
+  machine delivers ~122 Gbits/s (~450× faster for TCP; ~13 000× faster for UDP).  Target
+  is within an order of magnitude of the iperf3 baseline.  Likely causes: QUIC framing
+  overhead per write, no batching/vectored I/O, per-datagram allocation on the UDP path,
+  and Tokio task-boundary copies.  Needs profiling (`cargo flamegraph`) before optimising.
 - **UDP forward target resolution should prefer IPv6 when genuinely available**:
   the current workaround in `etrs::serve_udp_forward` and the `-R` UDP handler in
   `etr` resolves the target hostname and picks the first IPv4 address, falling back
