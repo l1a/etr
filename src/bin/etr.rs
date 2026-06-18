@@ -869,13 +869,22 @@ async fn run_session(
 async fn run_tcp_acceptor_quic(spec: ForwardSpec, conn: quinn::Connection, verbose: u8) {
     use tokio::net::TcpListener;
 
-    let listener = match TcpListener::bind(format!("127.0.0.1:{}", spec.local_port)).await {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("[etr] cannot bind TCP port {}: {e}", spec.local_port);
-            return;
-        }
-    };
+    let bind_addr4 = format!("127.0.0.1:{}", spec.local_port);
+    let bind_addr6 = format!("[::1]:{}", spec.local_port);
+
+    let l4 = TcpListener::bind(&bind_addr4).await;
+    let l6 = TcpListener::bind(&bind_addr6).await;
+
+    if l4.is_err() && l6.is_err() {
+        eprintln!(
+            "[etr] cannot bind TCP port {} on 127.0.0.1 or [::1]: l4_err={:?}, l6_err={:?}",
+            spec.local_port,
+            l4.err(),
+            l6.err()
+        );
+        return;
+    }
+
     vlog!(
         verbose,
         1,
@@ -885,40 +894,62 @@ async fn run_tcp_acceptor_quic(spec: ForwardSpec, conn: quinn::Connection, verbo
         spec.remote_port
     );
 
-    loop {
-        let (tcp_stream, peer) = match listener.accept().await {
-            Ok(s) => s,
-            Err(e) => {
-                vlog!(verbose, 1, "[etr] TCP accept error: {e}");
-                break;
-            }
-        };
-        vlog!(verbose, 2, "[etr] TCP connect from {peer}");
-
-        let conn2 = conn.clone();
-        let spec2 = spec.clone();
-        tokio::spawn(async move {
-            let (mut quic_send, quic_recv) = match conn2.open_bi().await {
+    let run_loop = |listener: TcpListener,
+                    conn: quinn::Connection,
+                    spec: ForwardSpec,
+                    verbose: u8| async move {
+        loop {
+            let (tcp_stream, peer) = match listener.accept().await {
                 Ok(s) => s,
-                Err(_) => return,
+                Err(e) => {
+                    vlog!(verbose, 1, "[etr] TCP accept error: {e}");
+                    break;
+                }
             };
-            let so = Envelope {
-                payload: Some(Payload::StreamOpen(StreamOpen {
-                    stream_id: 0,
-                    stream_type: etr::protocol::StreamType::PortForward as i32,
-                    remote_host: spec2.remote_host.clone(),
-                    remote_port: spec2.remote_port as u32,
-                    forward_proto: ForwardProto::Tcp as i32,
-                })),
-            };
-            if quic_send.write_all(&[TAG_FORWARD]).await.is_err() {
-                return;
-            }
-            if quic::write_msg(&mut quic_send, &so).await.is_err() {
-                return;
-            }
-            run_tcp_connection_quic(tcp_stream, quic_send, quic_recv).await;
-        });
+            vlog!(verbose, 2, "[etr] TCP connect from {peer}");
+
+            let conn2 = conn.clone();
+            let spec2 = spec.clone();
+            tokio::spawn(async move {
+                let (mut quic_send, quic_recv) = match conn2.open_bi().await {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let so = Envelope {
+                    payload: Some(Payload::StreamOpen(StreamOpen {
+                        stream_id: 0,
+                        stream_type: etr::protocol::StreamType::PortForward as i32,
+                        remote_host: spec2.remote_host.clone(),
+                        remote_port: spec2.remote_port as u32,
+                        forward_proto: ForwardProto::Tcp as i32,
+                    })),
+                };
+                if quic_send.write_all(&[TAG_FORWARD]).await.is_err() {
+                    return;
+                }
+                if quic::write_msg(&mut quic_send, &so).await.is_err() {
+                    return;
+                }
+                run_tcp_connection_quic(tcp_stream, quic_send, quic_recv).await;
+            });
+        }
+    };
+
+    let mut join_handles = Vec::new();
+    if let Ok(listener) = l4 {
+        join_handles.push(tokio::spawn(run_loop(
+            listener,
+            conn.clone(),
+            spec.clone(),
+            verbose,
+        )));
+    }
+    if let Ok(listener) = l6 {
+        join_handles.push(tokio::spawn(run_loop(listener, conn, spec, verbose)));
+    }
+
+    for h in join_handles {
+        let _ = h.await;
     }
 }
 
@@ -972,15 +1003,23 @@ async fn run_tcp_connection_quic(
 
 /// Open one QUIC forward stream for a UDP `-L` spec; pipe local datagrams through it.
 async fn run_udp_forward_client_quic(spec: ForwardSpec, conn: quinn::Connection, verbose: u8) {
-    use tokio::net::UdpSocket;
+    let bind_addr4 = format!("127.0.0.1:{}", spec.local_port);
+    let bind_addr6 = format!("[::1]:{}", spec.local_port);
 
-    let local_socket = match UdpSocket::bind(format!("0.0.0.0:{}", spec.local_port)).await {
-        Ok(s) => Arc::new(s),
-        Err(e) => {
-            eprintln!("[etr] cannot bind UDP port {}: {e}", spec.local_port);
-            return;
-        }
-    };
+    use tokio::net::UdpSocket;
+    let s4 = UdpSocket::bind(&bind_addr4).await;
+    let s6 = UdpSocket::bind(&bind_addr6).await;
+
+    if s4.is_err() && s6.is_err() {
+        eprintln!(
+            "[etr] cannot bind UDP port {} on 127.0.0.1 or [::1]: s4_err={:?}, s6_err={:?}",
+            spec.local_port,
+            s4.err(),
+            s6.err()
+        );
+        return;
+    }
+
     vlog!(
         verbose,
         1,
@@ -990,6 +1029,33 @@ async fn run_udp_forward_client_quic(spec: ForwardSpec, conn: quinn::Connection,
         spec.remote_port
     );
 
+    let mut join_handles = Vec::new();
+    if let Ok(socket) = s4 {
+        join_handles.push(tokio::spawn(run_udp_forward_client_socket(
+            socket,
+            spec.clone(),
+            conn.clone(),
+            verbose,
+        )));
+    }
+    if let Ok(socket) = s6 {
+        join_handles.push(tokio::spawn(run_udp_forward_client_socket(
+            socket, spec, conn, verbose,
+        )));
+    }
+
+    for h in join_handles {
+        let _ = h.await;
+    }
+}
+
+async fn run_udp_forward_client_socket(
+    local_socket: tokio::net::UdpSocket,
+    spec: ForwardSpec,
+    conn: quinn::Connection,
+    verbose: u8,
+) {
+    let local_socket = Arc::new(local_socket);
     let (mut quic_send, mut quic_recv) = match conn.open_bi().await {
         Ok(s) => s,
         Err(e) => {

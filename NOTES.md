@@ -290,8 +290,10 @@ etr -L 5353:8.8.8.8:53/udp user@jumphost # UDP forwarding
 **Current state**: `-L local_port:remote_host:remote_port[/tcp|/udp]` is implemented for
 both TCP and UDP, running concurrently alongside the PTY session.  TCP opens one QUIC
 stream per connection; UDP uses one shared QUIC stream per `-L` spec with
-last-sender reply routing.  Runs without a PTY session if no terminal is attached.
-`-R` (remote-to-local) is implemented for both TCP and UDP.
+last-sender reply routing.  Listeners are bound to both `127.0.0.1` and `[::1]` loopbacks.
+Runs without a PTY session if no terminal is attached.
+`-R` (remote-to-local) is implemented for both TCP and UDP, binding remote listeners on both
+`127.0.0.1` and `[::1]` loopbacks on the target machine.
 
 ---
 
