@@ -2,7 +2,6 @@
 title: ETR
 section: 1
 header: User Commands
-footer: etr 0.3.0
 date: June 2026
 ---
 

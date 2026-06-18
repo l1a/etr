@@ -86,10 +86,11 @@ man:
         echo "ERROR: pandoc is required to build man pages" >&2
         exit 1
     fi
+    VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
     mkdir -p man/build
-    pandoc -s -t man man/etr.1.md  -o man/build/etr.1
-    pandoc -s -t man man/etrs.1.md -o man/build/etrs.1
-    echo "Built man/build/etr.1 and man/build/etrs.1"
+    pandoc -s -t man --metadata=footer:"etr $VERSION" man/etr.1.md  -o man/build/etr.1
+    pandoc -s -t man --metadata=footer:"etr $VERSION" man/etrs.1.md -o man/build/etrs.1
+    echo "Built man/build/etr.1 and man/build/etrs.1 (version $VERSION)"
 
 # Install man pages to XDG local man directory (~/.local/share/man/man1)
 install-man: man
