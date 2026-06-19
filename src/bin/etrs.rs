@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 
+use etr::config::Config;
 use etr::login;
 use etr::protocol::{
     Disconnect, Envelope, ForwardProto, Payload, SessionAccept, StreamOpen, UdpDatagram,
@@ -51,6 +52,12 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     log_path: Option<std::path::PathBuf>,
 
+    /// How long (seconds) to keep a session alive while the client is
+    /// disconnected. Override via ETR_SERVER_NETWORK_TMOUT or config file
+    /// [server] reconnect_timeout. Default: 1800 (30 min).
+    #[arg(long, value_name = "SECS")]
+    reconnect_timeout: Option<u64>,
+
     /// Generate shell completions for the specified shell
     #[arg(long, value_enum, value_name = "SHELL")]
     completions: Option<ShellChoice>,
@@ -69,6 +76,19 @@ enum ShellChoice {
 fn main() -> io::Result<()> {
     let cli = Cli::parse();
     let _ = VERBOSITY.set(cli.verbose);
+    let cfg = Config::load();
+
+    // Priority: CLI flag > ETR_SERVER_NETWORK_TMOUT env var > config file > default.
+    let reconnect_timeout = Duration::from_secs(
+        cli.reconnect_timeout
+            .or_else(|| {
+                std::env::var("ETR_SERVER_NETWORK_TMOUT")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+            })
+            .or(cfg.server.reconnect_timeout)
+            .unwrap_or(1800),
+    );
 
     if let Some(shell) = cli.completions {
         let mut cmd = Cli::command();
@@ -171,7 +191,7 @@ fn main() -> io::Result<()> {
             drop(writer); // closes pipe_w
 
             detach_stdio(&log_path)?;
-            run_session(endpoint, session_id, passkey, term).await
+            run_session(endpoint, session_id, passkey, term, reconnect_timeout).await
         })
 }
 
@@ -215,12 +235,13 @@ fn session_log_path() -> std::path::PathBuf {
 }
 
 /// Run the session reconnect loop until the client cleanly disconnects or
-/// the 30-minute reconnect window expires.
+/// the reconnect window expires.
 async fn run_session(
     endpoint: quinn::Endpoint,
     session_id: [u8; 16],
     passkey: String,
     term: String,
+    reconnect_timeout: Duration,
 ) -> io::Result<()> {
     vlog!(
         1,
@@ -240,9 +261,15 @@ async fn run_session(
         })
         .map_err(io::Error::other)?;
 
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-    let mut cmd = CommandBuilder::new(&shell);
+    // Use new_default_prog() so portable-pty sets argv[0] to "-zsh" (the
+    // traditional login-shell sentinel), which is more reliable than the -l
+    // flag when the shell is spawned via execve from a Rust process.
+    let mut cmd = CommandBuilder::new_default_prog();
     cmd.env("TERM", &term);
+    // Signal to shell startup scripts that this is an etr session, analogous
+    // to SSH_CONNECTION / SSH_TTY set by OpenSSH.
+    cmd.env("ETR_CONNECTION", "1");
+    cmd.env("ETR_VERSION", env!("CARGO_PKG_VERSION"));
     let mut child = pair.slave.spawn_command(cmd).map_err(io::Error::other)?;
 
     let master_fd = pair.master.as_raw_fd();
@@ -330,7 +357,7 @@ async fn run_session(
     let active_reverse_listeners = Arc::new(Mutex::new(std::collections::HashSet::new()));
 
     // ── Reconnect loop ───────────────────────────────────────────────────────
-    const RECONNECT_WINDOW: Duration = Duration::from_secs(30 * 60);
+    let reconnect_window = reconnect_timeout;
 
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(io::Error::other)?;
@@ -359,7 +386,7 @@ async fn run_session(
                 }
                 break;
             }
-            res = tokio::time::timeout(RECONNECT_WINDOW, endpoint.accept()) => {
+            res = tokio::time::timeout(reconnect_window, endpoint.accept()) => {
                 match res {
                     Ok(Some(inc)) => inc,
                     Ok(None) => {
@@ -1272,5 +1299,36 @@ mod tests {
         let mut cmd = Cli::command();
         let help = cmd.render_help().to_string();
         assert!(help.contains("--completions"));
+    }
+
+    #[test]
+    fn test_reconnect_timeout_flag() {
+        let cli = Cli::try_parse_from(["etrs", "--reconnect-timeout", "3600"]).unwrap();
+        assert_eq!(cli.reconnect_timeout, Some(3600));
+    }
+
+    #[test]
+    fn test_reconnect_timeout_default_is_none() {
+        let cli = Cli::try_parse_from(["etrs"]).unwrap();
+        assert!(cli.reconnect_timeout.is_none());
+    }
+
+    #[test]
+    fn test_reconnect_timeout_env_var() {
+        // SAFETY: single-threaded test; no other threads read this var.
+        unsafe { std::env::set_var("ETR_SERVER_NETWORK_TMOUT", "7200") };
+        let timeout: u64 = std::env::var("ETR_SERVER_NETWORK_TMOUT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1800);
+        assert_eq!(timeout, 7200);
+        unsafe { std::env::remove_var("ETR_SERVER_NETWORK_TMOUT") };
+    }
+
+    #[test]
+    fn test_reconnect_timeout_help_present() {
+        let mut cmd = Cli::command();
+        let help = cmd.render_help().to_string();
+        assert!(help.contains("--reconnect-timeout"));
     }
 }
