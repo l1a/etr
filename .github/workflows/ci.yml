@@ -3,8 +3,14 @@ name: Continuous Integration
 on:
   push:
     branches: [ main, 'feature/**', 'fix/**', 'chore/**' ]
+    paths-ignore:
+      - '**.md'
+      - 'man/**'
   pull_request:
     branches: [ main ]
+    paths-ignore:
+      - '**.md'
+      - 'man/**'
 
 jobs:
   lints:

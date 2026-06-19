@@ -51,6 +51,24 @@ audit:
 check: fmt-check clippy
     @echo "All checks passed."
 
+# Publish to crates.io (dry-run first; aborts if dry-run fails)
+publish:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    echo "==> Verifying working tree is clean..."
+    if ! git diff --quiet || ! git diff --cached --quiet; then
+        echo "ERROR: working tree has uncommitted changes. Commit or discard them first." >&2
+        exit 1
+    fi
+    echo "==> Running cargo publish --dry-run..."
+    if ! cargo publish --dry-run; then
+        echo "ERROR: dry-run failed — not publishing." >&2
+        exit 1
+    fi
+    echo "==> Dry-run passed. Publishing to crates.io..."
+    cargo publish
+    echo "==> Published $(grep '^version' Cargo.toml | head -1 | sed 's/.*\"\(.*\)\"/\1/') to crates.io."
+
 # ── Build ─────────────────────────────────────────────────────────────────────
 
 # Build debug binaries
