@@ -808,30 +808,19 @@ async fn run_session(
                     }
                     ForwardProto::Udp => {
                         let addr_str = format!("{}:{}", so.remote_host, so.remote_port);
-                        // Resolve once, preferring IPv4 (macOS returns ::1 first for
-                        // "localhost").  Bind the socket to the matching family so
-                        // send_to doesn't silently drop cross-family packets.
-                        let addr: std::net::SocketAddr = match tokio::net::lookup_host(&addr_str)
-                            .await
-                            .ok()
-                            .and_then(|it| {
-                                let v: Vec<_> = it.collect();
-                                v.iter()
-                                    .find(|a| a.is_ipv4())
-                                    .copied()
-                                    .or_else(|| v.into_iter().next())
-                            }) {
-                            Some(a) => a,
-                            None => {
-                                vlog!(
-                                    verbose,
-                                    1,
-                                    "[etr] UDP reverse fwd: cannot resolve {addr_str}"
-                                );
-                                let _ = quic_send.finish();
-                                return;
-                            }
-                        };
+                        let addr: std::net::SocketAddr =
+                            match etr::forward::resolve_udp_target(&addr_str).await {
+                                Some(a) => a,
+                                None => {
+                                    vlog!(
+                                        verbose,
+                                        1,
+                                        "[etr] UDP reverse fwd: cannot resolve {addr_str}"
+                                    );
+                                    let _ = quic_send.finish();
+                                    return;
+                                }
+                            };
                         vlog!(verbose, 2, "[etr] forwarding UDP reverse stream to {addr}");
                         use tokio::net::UdpSocket;
                         let bind_addr = if addr.is_ipv6() {

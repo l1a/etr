@@ -89,13 +89,30 @@ fn echo_tcp_conn(stream: TcpStream) {
 }
 
 /// Receive UDP datagrams and echo each one back to the sender.
+///
+/// Binds both `0.0.0.0:port` (IPv4) and `[::1]:port` (IPv6 loopback) so that
+/// forwarding targets resolved to either family both reach the echo server.
 fn udp_echo(port: u16) {
-    let socket = UdpSocket::bind(format!("0.0.0.0:{port}")).expect("udp_echo: bind");
+    let sock4 = UdpSocket::bind(format!("0.0.0.0:{port}")).expect("udp_echo: bind v4");
+    let sock6 = UdpSocket::bind(format!("[::1]:{port}")).expect("udp_echo: bind v6");
+
+    thread::spawn(move || {
+        let mut buf = vec![0u8; 65535];
+        loop {
+            match sock6.recv_from(&mut buf) {
+                Ok((n, addr)) => {
+                    let _ = sock6.send_to(&buf[..n], addr);
+                }
+                Err(_) => {}
+            }
+        }
+    });
+
     let mut buf = vec![0u8; 65535];
     loop {
-        match socket.recv_from(&mut buf) {
+        match sock4.recv_from(&mut buf) {
             Ok((n, addr)) => {
-                let _ = socket.send_to(&buf[..n], addr);
+                let _ = sock4.send_to(&buf[..n], addr);
             }
             Err(_) => {}
         }

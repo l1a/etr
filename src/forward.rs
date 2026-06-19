@@ -159,6 +159,39 @@ impl std::fmt::Display for ForwardSpec {
     }
 }
 
+/// Resolve a `"host:port"` string to a `SocketAddr` for UDP forwarding,
+/// preferring IPv6 when the kernel has a route to it.
+///
+/// We prefer IPv6 to be consistent with modern Happy-Eyeballs behaviour.
+/// For each candidate address (IPv6 first, then IPv4) we probe routing by
+/// binding an ephemeral UDP socket and calling `connect()` on it — this
+/// checks the routing table without sending any packets.  The first address
+/// whose routing probe succeeds is returned.
+pub async fn resolve_udp_target(addr_str: &str) -> Option<std::net::SocketAddr> {
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(addr_str).await.ok()?.collect();
+
+    // IPv6 candidates first, then IPv4.
+    let ordered = addrs
+        .iter()
+        .filter(|a| a.is_ipv6())
+        .copied()
+        .chain(addrs.iter().filter(|a| a.is_ipv4()).copied());
+
+    for addr in ordered {
+        let bind_str = if addr.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
+        if let Ok(sock) = std::net::UdpSocket::bind(bind_str)
+            && sock.connect(addr).is_ok()
+        {
+            return Some(addr);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -342,14 +342,7 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
   `write_all` per Quinn frame instead of coalescing them into our 256 KB read buffer —
   more syscalls, not fewer copies, determines throughput here.
   UDP (~9 Mb/s) is still limited by per-datagram protobuf encoding overhead.
-- **UDP forward target resolution should prefer IPv6 when genuinely available**:
-  the current workaround in `etrs::serve_udp_forward` and the `-R` UDP handler in
-  `etr` resolves the target hostname and picks the first IPv4 address, falling back
-  to IPv6.  This was needed because the local echo servers in tests are IPv4-only and
-  macOS returns `::1` before `127.0.0.1` for `"localhost"`.  The correct long-term
-  behaviour is to probe which address family the target is actually reachable on
-  (similar to Happy Eyeballs) and prefer IPv6 when it works, rather than always
-  preferring IPv4.
+- ~~**UDP forward target resolution should prefer IPv6 when genuinely available**~~ **Done**: `etr::forward::resolve_udp_target` (new helper in `src/forward.rs`) resolves the target, tries IPv6 candidates first, and probes routing via a no-packet UDP `connect()` call.  The first address whose routing probe succeeds is used.  Falls back to IPv4 if no IPv6 route exists.  The stress-tool UDP echo server now also binds `[::1]:port` alongside `0.0.0.0:port` so both families reach it in tests.
 
 ---
 
