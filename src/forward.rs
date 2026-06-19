@@ -159,6 +159,39 @@ impl std::fmt::Display for ForwardSpec {
     }
 }
 
+/// Resolve a `"host:port"` string to a `SocketAddr` for UDP forwarding,
+/// preferring IPv6 when the kernel has a route to it.
+///
+/// We prefer IPv6 to be consistent with modern Happy-Eyeballs behaviour.
+/// For each candidate address (IPv6 first, then IPv4) we probe routing by
+/// binding an ephemeral UDP socket and calling `connect()` on it — this
+/// checks the routing table without sending any packets.  The first address
+/// whose routing probe succeeds is returned.
+pub async fn resolve_udp_target(addr_str: &str) -> Option<std::net::SocketAddr> {
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(addr_str).await.ok()?.collect();
+
+    // IPv6 candidates first, then IPv4.
+    let ordered = addrs
+        .iter()
+        .filter(|a| a.is_ipv6())
+        .copied()
+        .chain(addrs.iter().filter(|a| a.is_ipv4()).copied());
+
+    for addr in ordered {
+        let bind_str = if addr.is_ipv6() {
+            "[::]:0"
+        } else {
+            "0.0.0.0:0"
+        };
+        if let Ok(sock) = std::net::UdpSocket::bind(bind_str)
+            && sock.connect(addr).is_ok()
+        {
+            return Some(addr);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,5 +303,52 @@ mod tests {
         assert_eq!(s.to_string(), "53:dns.internal:53/udp");
         let s = ForwardSpec::parse("127.0.0.1:8080:localhost:80").unwrap();
         assert_eq!(s.to_string(), "127.0.0.1:8080:localhost:80/tcp");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_udp_target_localhost() {
+        // localhost always resolves to a loopback address; the routing probe must
+        // succeed and return either ::1 (IPv6 preferred) or 127.0.0.1 (IPv4 fallback).
+        let addr = super::resolve_udp_target("localhost:53")
+            .await
+            .expect("localhost must resolve");
+        assert_eq!(addr.port(), 53);
+        assert!(addr.ip().is_loopback(), "expected loopback, got {addr}");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_udp_target_prefers_ipv6() {
+        // On any system with an IPv6 loopback (virtually universal), ::1 should be
+        // chosen over 127.0.0.1 because IPv6 is tried first.
+        let addr = super::resolve_udp_target("localhost:53").await;
+        if let Some(a) = addr {
+            // If the system has IPv6 routing, the result must be IPv6.
+            // If not (IPv6 disabled), IPv4 fallback is acceptable.
+            let has_ipv6_routing = std::net::UdpSocket::bind("[::]:0")
+                .and_then(|s| s.connect("::1:1"))
+                .is_ok();
+            if has_ipv6_routing {
+                assert!(
+                    a.is_ipv6(),
+                    "expected IPv6 result on IPv6-capable system, got {a}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_udp_target_explicit_ipv4() {
+        // An explicit IPv4 address skips the IPv6 probe and resolves directly.
+        let addr = super::resolve_udp_target("127.0.0.1:1234")
+            .await
+            .expect("explicit IPv4 loopback must resolve");
+        assert!(addr.is_ipv4());
+        assert_eq!(addr.port(), 1234);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_udp_target_unresolvable() {
+        let addr = super::resolve_udp_target("this.hostname.does.not.exist.invalid:53").await;
+        assert!(addr.is_none(), "unresolvable host must return None");
     }
 }

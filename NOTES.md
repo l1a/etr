@@ -9,7 +9,7 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.4.4 — throughput tuning + profiling
+## Current state: v0.4.5 — utmp fixes + UDP Happy Eyeballs
 
 The full round-trip works: `etr <host>` on the client, SSH bootstrap that starts
 `etrs` on the fly, QUIC connection with cert pinning, PTY session, keepalives,
@@ -235,7 +235,7 @@ just install-release  # copies target/release/{etr,etrs} to ~/.cargo/bin
 
 # Code quality gate — run before every commit
 just check            # cargo fmt --check + cargo clippy -D warnings
-just test             # cargo test (67 tests)
+just test             # cargo test (71 tests)
 ```
 
 ---
@@ -342,18 +342,11 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
   `write_all` per Quinn frame instead of coalescing them into our 256 KB read buffer —
   more syscalls, not fewer copies, determines throughput here.
   UDP (~9 Mb/s) is still limited by per-datagram protobuf encoding overhead.
-- **UDP forward target resolution should prefer IPv6 when genuinely available**:
-  the current workaround in `etrs::serve_udp_forward` and the `-R` UDP handler in
-  `etr` resolves the target hostname and picks the first IPv4 address, falling back
-  to IPv6.  This was needed because the local echo servers in tests are IPv4-only and
-  macOS returns `::1` before `127.0.0.1` for `"localhost"`.  The correct long-term
-  behaviour is to probe which address family the target is actually reachable on
-  (similar to Happy Eyeballs) and prefer IPv6 when it works, rather than always
-  preferring IPv4.
+- ~~**UDP forward target resolution should prefer IPv6 when genuinely available**~~ **Done**: `etr::forward::resolve_udp_target` (new helper in `src/forward.rs`) resolves the target, tries IPv6 candidates first, and probes routing via a no-packet UDP `connect()` call.  The first address whose routing probe succeeds is used.  Falls back to IPv4 if no IPv6 route exists.  The stress-tool UDP echo server now also binds `[::1]:port` alongside `0.0.0.0:port` so both families reach it in tests.
 
 ---
 
-## Test coverage (67 tests)
+## Test coverage (71 tests)
 
 | Module | What's tested |
 |--------|--------------|
@@ -364,4 +357,4 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
 | `bin/etrs` | CLI defaults, verbose count, custom port, subcommand parsing, hex_decode, custom --log-path override |
 | `bin/etr` | CLI defaults, port parsing, target parsing, no --cipher flag, custom --log-path and --server-log-path overrides, config fallback for log paths |
 | `config` | TOML parse (full section, partial, empty), default values, `gateway_ports` / `forward` / `reverse_forward` config keys |
-| `forward` | `-L`/`-R` spec parsing: TCP/UDP/IPv6, explicit proto, bad port, empty host, Display; bind address parsing (explicit IP, `[::1]`, wildcard `*`); `get_bind_addresses` with and without gateway flag |
+| `forward` | `-L`/`-R` spec parsing: TCP/UDP/IPv6, explicit proto, bad port, empty host, Display; bind address parsing (explicit IP, `[::1]`, wildcard `*`); `get_bind_addresses` with and without gateway flag; `resolve_udp_target`: localhost prefers IPv6, explicit IPv4, unresolvable host |
