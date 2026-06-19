@@ -21,6 +21,10 @@ use etr::session::SessionState;
 static LOG_FILE: std::sync::OnceLock<std::sync::Mutex<std::fs::File>> = std::sync::OnceLock::new();
 static IN_RAW_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Escape character for the client: Ctrl-^ (0x1E).  Type it at the start of
+/// a line, followed by '.', to force-disconnect when the server is unreachable.
+const ESCAPE_CHAR: u8 = 0x1E;
+
 macro_rules! vlog {
     ($verbose:expr, $level:expr, $($arg:tt)*) => {
         if $verbose >= $level {
@@ -414,24 +418,66 @@ async fn run_connection_loop(
     let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>(1000);
     let stdin_rx = Arc::new(Mutex::new(stdin_rx));
 
+    // Ctrl-^ . triggers this to exit the reconnect loop.
+    let (escape_tx, escape_rx) = tokio::sync::watch::channel(false);
+
     let _stdin_reader = tokio::task::spawn_blocking(move || {
         use std::io::Read;
         let mut buf = [0u8; 1024];
+        // Track position so Ctrl-^ is only recognised at the start of a line.
+        let mut at_line_start = true;
+        let mut escape_pending = false;
         while let Ok(n) = std::io::stdin().read(&mut buf) {
             if n == 0 {
                 break;
             }
-            if stdin_tx.blocking_send(buf[..n].to_vec()).is_err() {
+            let mut out = Vec::with_capacity(n);
+            for &b in &buf[..n] {
+                if escape_pending {
+                    escape_pending = false;
+                    match b {
+                        b'.' => {
+                            // Ctrl-^ . — signal force-disconnect and stop reading.
+                            let _ = escape_tx.send(true);
+                            return;
+                        }
+                        b if b == ESCAPE_CHAR => {
+                            // Ctrl-^ Ctrl-^ — send a literal Ctrl-^.
+                            out.push(ESCAPE_CHAR);
+                            at_line_start = false;
+                        }
+                        _ => {
+                            // Unknown sequence — forward both bytes verbatim.
+                            out.push(ESCAPE_CHAR);
+                            out.push(b);
+                            at_line_start = matches!(b, b'\r' | b'\n');
+                        }
+                    }
+                } else if b == ESCAPE_CHAR && at_line_start {
+                    escape_pending = true;
+                } else {
+                    out.push(b);
+                    at_line_start = matches!(b, b'\r' | b'\n');
+                }
+            }
+            if !out.is_empty() && stdin_tx.blocking_send(out).is_err() {
                 break;
             }
         }
     });
 
     let mut first = true;
+    let mut escape_rx = escape_rx;
     loop {
         if !first {
             vlog!(verbose, 1, "\r\n[etr] Reconnecting to {server_addr}...");
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                Ok(_) = escape_rx.wait_for(|&v| v) => {
+                    eprintln!("[etr] Disconnected (Ctrl-^ .).");
+                    return Ok(());
+                }
+            }
         }
         first = false;
 
@@ -462,18 +508,25 @@ async fn run_connection_loop(
 
         enable_raw_mode().unwrap();
         IN_RAW_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
-        let result = run_session(
-            conn,
-            session_id,
-            passkey.clone(),
-            Arc::clone(&session),
-            Arc::clone(&stdin_rx),
-            forward_specs.clone(),
-            reverse_forward_specs.clone(),
-            gateway_ports,
-            verbose,
-        )
-        .await;
+        let result = tokio::select! {
+            r = run_session(
+                conn,
+                session_id,
+                passkey.clone(),
+                Arc::clone(&session),
+                Arc::clone(&stdin_rx),
+                forward_specs.clone(),
+                reverse_forward_specs.clone(),
+                gateway_ports,
+                verbose,
+            ) => r,
+            Ok(_) = escape_rx.wait_for(|&v| v) => {
+                IN_RAW_MODE.store(false, std::sync::atomic::Ordering::Relaxed);
+                let _ = disable_raw_mode();
+                eprintln!("\r\n[etr] Disconnected (Ctrl-^ .).");
+                std::process::exit(0);
+            }
+        };
         IN_RAW_MODE.store(false, std::sync::atomic::Ordering::Relaxed);
         let _ = disable_raw_mode();
 
@@ -548,7 +601,11 @@ async fn run_session(
         }
     };
 
-    vlog!(verbose, 1, "\r\n[etr] Connected. Session active.");
+    vlog!(
+        verbose,
+        1,
+        "\r\n[etr] Connected. Session active.  (Escape: Ctrl-^ then . to disconnect)"
+    );
 
     // Trim send history using server's ack map.
     {
@@ -1263,6 +1320,12 @@ mod tests {
         let cli =
             Cli::try_parse_from(["etr", "--server-log-path", "/tmp/server.log", "host"]).unwrap();
         assert_eq!(cli.server_log_path.as_deref(), Some("/tmp/server.log"));
+    }
+
+    #[test]
+    fn test_escape_char_value() {
+        // Ctrl-^ is 0x1E; verify the constant matches mosh's escape convention.
+        assert_eq!(ESCAPE_CHAR, 0x1E);
     }
 
     #[test]

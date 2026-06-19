@@ -5,7 +5,8 @@
 //! (default: `~/.config/etr/config.toml`).  All fields are optional;
 //! missing fields fall back to compiled-in defaults.
 //!
-//! CLI flags take precedence over config file values.
+//! CLI flags take precedence over config file values; env vars sit between
+//! CLI and config file in priority.
 //!
 //! # Example config file
 //!
@@ -16,6 +17,11 @@
 //!
 //! # Path to etrs on remote hosts
 //! server_path = "etrs"
+//!
+//! [server]
+//! # How long (seconds) etrs keeps a session alive while the client is gone.
+//! # Override with --reconnect-timeout or ETR_SERVER_NETWORK_TMOUT env var.
+//! reconnect_timeout = 1800
 //! ```
 use serde::Deserialize;
 
@@ -23,6 +29,8 @@ use serde::Deserialize;
 pub struct Config {
     #[serde(default)]
     pub client: ClientConfig,
+    #[serde(default)]
+    pub server: ServerConfig,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -47,6 +55,14 @@ pub struct ClientConfig {
 
     /// Default remote port forwards.
     pub reverse_forward: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ServerConfig {
+    /// How long (seconds) the server keeps a session alive while the client is
+    /// disconnected.  CLI `--reconnect-timeout` and the `ETR_SERVER_NETWORK_TMOUT`
+    /// env var override this; the compiled-in default is 1800 s (30 min).
+    pub reconnect_timeout: Option<u64>,
 }
 
 impl Config {
@@ -144,6 +160,19 @@ mod tests {
     fn test_load_nonexistent_file_returns_default() {
         let cfg: Config = toml::from_str("").unwrap();
         assert!(cfg.client.ssh_port.is_none());
+    }
+
+    #[test]
+    fn test_parse_server_section() {
+        let toml = "[server]\nreconnect_timeout = 3600\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.server.reconnect_timeout, Some(3600));
+    }
+
+    #[test]
+    fn test_server_section_default() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.server.reconnect_timeout.is_none());
     }
 
     #[test]

@@ -9,12 +9,20 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.4.5 — utmp fixes + UDP Happy Eyeballs
+## Current state: v0.4.6 — login shell, ETR_CONNECTION, escape sequence, reconnect timeout
 
 The full round-trip works: `etr <host>` on the client, SSH bootstrap that starts
 `etrs` on the fly, QUIC connection with cert pinning, PTY session, keepalives,
 reconnecting after drops, `-L` local port forwarding, and `-R` remote port forwarding (both TCP and UDP).
 Tested on Linux and macOS (aarch64).  Published to crates.io; `cargo install etr` installs both binaries.
+
+New in v0.4.6:
+- `etrs` now spawns the shell as a proper login shell (argv[0]=`-zsh`) via
+  `CommandBuilder::new_default_prog()`, so `.zprofile`/`.zlogin` are sourced, matching SSH.
+- `ETR_CONNECTION=1` and `ETR_VERSION` are set in the remote shell environment.
+- `etr` supports a `Ctrl-^ .` escape sequence to force-disconnect when the server is unresponsive.
+- Server reconnect timeout is configurable via `--reconnect-timeout`, `ETR_SERVER_NETWORK_TMOUT`
+  env var, or `[server] reconnect_timeout` in the config file (default: 1800 s).
 
 ---
 
@@ -308,6 +316,12 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
   and do not show utmp-only sessions.  Non-Linux builds get no-op stubs.
 - ~~**Benchmarking**~~ **Done**: Criterion benchmark suite implemented in `benches/session_bench.rs` measuring certificate generation, QUIC connection handshake latency, PTY round-trip latency (100b), and throughput (64kb).
 - ~~**Mode 2 — `-R` remote forwarding**~~ **Done**: Both TCP and UDP remote port forwarding are supported using the `-R` CLI flag.
+- **Client-side environment variable forwarding**: `etr` has no equivalent of
+  `ssh SendEnv` / `AcceptEnv`.  The client should be able to pass a set of
+  `KEY=VALUE` pairs (via `-e KEY=VALUE` flags or a config `[forward_env]` list)
+  that `etrs` injects into the shell environment alongside `ETR_CONNECTION` and
+  `ETR_VERSION`.  Useful for propagating `COLORTERM`, locale variables, or
+  per-session overrides without editing the remote shell config.
 - **UDP reply routing**: current shared-socket design uses last-sender routing —
   replies from the remote UDP target go to whichever local client sent the most recent
   datagram.  Suitable for single-sender and sequential request/response (DNS, STUN);
