@@ -316,6 +316,12 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
   and do not show utmp-only sessions.  Non-Linux builds get no-op stubs.
 - ~~**Benchmarking**~~ **Done**: Criterion benchmark suite implemented in `benches/session_bench.rs` measuring certificate generation, QUIC connection handshake latency, PTY round-trip latency (100b), and throughput (64kb).
 - ~~**Mode 2 — `-R` remote forwarding**~~ **Done**: Both TCP and UDP remote port forwarding are supported using the `-R` CLI flag.
+- **Client-side environment variable forwarding**: `etr` has no equivalent of
+  `ssh SendEnv` / `AcceptEnv`.  The client should be able to pass a set of
+  `KEY=VALUE` pairs (via `-e KEY=VALUE` flags or a config `[forward_env]` list)
+  that `etrs` injects into the shell environment alongside `ETR_CONNECTION` and
+  `ETR_VERSION`.  Useful for propagating `COLORTERM`, locale variables, or
+  per-session overrides without editing the remote shell config.
 - **UDP reply routing**: current shared-socket design uses last-sender routing —
   replies from the remote UDP target go to whichever local client sent the most recent
   datagram.  Suitable for single-sender and sequential request/response (DNS, STUN);
