@@ -737,7 +737,7 @@ async fn pipe_tcp_quic(
     let (mut tcp_r, mut tcp_w) = stream.into_split();
 
     let mut t1 = tokio::spawn(async move {
-        let mut buf = vec![0u8; 8192];
+        let mut buf = vec![0u8; 256 * 1024];
         loop {
             match tcp_r.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
@@ -752,7 +752,7 @@ async fn pipe_tcp_quic(
     });
 
     let mut t2 = tokio::spawn(async move {
-        let mut buf = vec![0u8; 8192];
+        let mut buf = vec![0u8; 256 * 1024];
         loop {
             match quic_recv.read(&mut buf).await {
                 Ok(None) | Err(_) => break,
@@ -793,6 +793,7 @@ async fn serve_tcp_forward(
             return;
         }
     };
+    let _ = tcp.set_nodelay(true);
     vlog!(2, "[etrs] TCP forward → {addr}");
     pipe_tcp_quic(tcp, quic_send, quic_recv).await;
     vlog!(2, "[etrs] TCP forward to {addr} closed");

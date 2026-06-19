@@ -29,11 +29,33 @@ pub fn generate_self_signed_cert() -> (CertificateDer<'static>, Vec<u8>) {
     (cert_der, key_der)
 }
 
+/// QUIC flow-control windows tuned for high-throughput forwarding streams.
+///
+/// Stream receive window: 4 MB per stream — allows the sender to keep the
+/// pipeline full even with RTT latency, and lets a single read_chunk() drain
+/// up to 4 MB before back-pressure kicks in.
+/// Connection window: 32 MB — accommodates many concurrent forwarded streams
+/// without the connection-level window becoming the bottleneck.
+/// Send window: 32 MB — symmetric with the receive window.
+fn high_throughput_transport() -> Arc<quinn::TransportConfig> {
+    let mut t = quinn::TransportConfig::default();
+    t.stream_receive_window(
+        quinn::VarInt::from_u32(4 * 1024 * 1024), // 4 MB per stream
+    );
+    t.receive_window(
+        quinn::VarInt::from_u32(32 * 1024 * 1024), // 32 MB connection
+    );
+    t.send_window(32 * 1024 * 1024); // 32 MB send budget
+    Arc::new(t)
+}
+
 /// Build a [`quinn::ServerConfig`] from the given cert + PKCS#8 key.
 pub fn server_config(cert: CertificateDer<'static>, key_der: Vec<u8>) -> io::Result<ServerConfig> {
     let key = PrivateKeyDer::Pkcs8(key_der.into());
-    ServerConfig::with_single_cert(vec![cert], key)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    let mut cfg = ServerConfig::with_single_cert(vec![cert], key)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    cfg.transport_config(high_throughput_transport());
+    Ok(cfg)
 }
 
 /// Build a [`quinn::ClientConfig`] that trusts exactly the supplied DER cert.
@@ -45,8 +67,10 @@ pub fn client_config(cert: CertificateDer<'static>) -> io::Result<ClientConfig> 
     roots
         .add(cert)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    ClientConfig::with_root_certificates(Arc::new(roots))
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    let mut cfg = ClientConfig::with_root_certificates(Arc::new(roots))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    cfg.transport_config(high_throughput_transport());
+    Ok(cfg)
 }
 
 /// A one-line description of the TLS configuration in use for QUIC connections.
