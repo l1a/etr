@@ -424,7 +424,11 @@ async fn handle_connection(
         hex_encode(&session_id)
     );
     if let Some(fd) = master_fd {
-        let addr = format!("{} via etr [{}]", peer.ip(), std::process::id());
+        let addr = format!(
+            "{} via etr [{}]",
+            peer.ip().to_canonical(),
+            std::process::id()
+        );
         tokio::task::spawn_blocking(move || login::record_login(fd, &addr))
             .await
             .ok();
