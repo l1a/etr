@@ -332,12 +332,31 @@ async fn run_session(
     // ── Reconnect loop ───────────────────────────────────────────────────────
     const RECONNECT_WINDOW: Duration = Duration::from_secs(30 * 60);
 
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(io::Error::other)?;
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .map_err(io::Error::other)?;
+
     loop {
         let mut shell_rx = shell_exit_rx.clone();
         let incoming = tokio::select! {
             biased;
             _ = shell_rx.wait_for(|&v| v) => {
                 vlog!(1, "[etrs] shell exited, shutting down");
+                break;
+            }
+            _ = sigterm.recv() => {
+                vlog!(1, "[etrs] SIGTERM received, shutting down");
+                if let Some(fd) = master_fd {
+                    tokio::task::spawn_blocking(move || login::record_logout(fd)).await.ok();
+                }
+                break;
+            }
+            _ = sighup.recv() => {
+                vlog!(1, "[etrs] SIGHUP received, shutting down");
+                if let Some(fd) = master_fd {
+                    tokio::task::spawn_blocking(move || login::record_logout(fd)).await.ok();
+                }
                 break;
             }
             res = tokio::time::timeout(RECONNECT_WINDOW, endpoint.accept()) => {
@@ -424,7 +443,11 @@ async fn handle_connection(
         hex_encode(&session_id)
     );
     if let Some(fd) = master_fd {
-        let addr = format!("{} via etr [{}]", peer.ip(), std::process::id());
+        let addr = format!(
+            "{} via etr [{}]",
+            peer.ip().to_canonical(),
+            std::process::id()
+        );
         tokio::task::spawn_blocking(move || login::record_login(fd, &addr))
             .await
             .ok();

@@ -326,11 +326,8 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
   `/proc/$$/status`; reconnect test stops the etrs daemon (not the etr client)
   because stopping a PTY-attached process on macOS triggers a SIGHUP that kills it.
 - ~~**Shell completions for `etrs`**~~ **Done**: `etrs --completions <shell>` generates completions for bash, zsh, fish, elvish, PowerShell, and nushell via `clap_complete`/`clap_complete_nushell`, mirroring the existing `etr --completions` support.
-- **utmp address field incorrect for IPv4 connections**: `src/login.rs` records the
-  connecting peer address in the utmp `ut_addr_v6` field.  For an IPv4-over-IPv6
-  (dual-stack) QUIC connection the peer address is an IPv4-mapped IPv6 address
-  (`::ffff:127.0.0.1`), which is not what `last` and friends expect in the IPv4 slots.
-  Should be unwrapped to a plain IPv4 address before writing.
+- ~~**utmp address field incorrect for IPv4 connections**~~ **Done**: `peer.ip().to_canonical()` in `src/bin/etrs.rs` unwraps IPv4-mapped IPv6 addresses (`::ffff:127.0.0.1` → `127.0.0.1`) before passing to `utempter_add_record`, so `last` and friends see a plain IPv4 dotted-quad.
+- ~~**Stale utmp entry on unclean exit**~~ **Done**: `etrs` now listens for SIGTERM and SIGHUP in the reconnect loop and calls `record_logout` before exiting, so `who`/`last` entries are cleaned up even when the session is killed rather than ended by the shell exiting.
 - **Throughput**: TCP relay buffer raised 8 KB → 256 KB; QUIC flow-control windows
   raised to 4 MB per stream / 32 MB per connection; `TCP_NODELAY` on all forwarded TCP
   connections.  Stress-local (echo test) measures ~320 Mb/s TCP, but this is an
