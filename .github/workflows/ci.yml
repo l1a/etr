@@ -12,6 +12,9 @@ on:
       - '**.md'
       - 'man/**'
 
+permissions:
+  contents: read
+
 jobs:
   lints:
     name: Formatting and Clippy Lints
@@ -56,6 +59,9 @@ jobs:
   audit:
     name: Security Audit
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4

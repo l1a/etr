@@ -21,7 +21,7 @@ def echo(conn):
 port = int(sys.argv[1])
 srv = socket.socket()
 srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-srv.bind(("", port))
+srv.bind(("127.0.0.1", port))
 srv.listen(20)
 while True:
     conn, _ = srv.accept()
