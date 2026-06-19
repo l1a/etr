@@ -102,11 +102,22 @@ all items are satisfied or explicitly marked N/A with a reason.
 - [ ] "Current state" header version and description updated to match the new version.
 - [ ] Test count in the test-coverage table updated if tests were added or removed.
 
-### 4.10 Version bump
+### 4.10 Version bump & release hygiene
 - [ ] Bump the version in `Cargo.toml` following semver:
       patch (`0.x.N+1`) for bug fixes, minor (`0.x+1.0`) for new features.
 - [ ] `Cargo.lock` updated (`cargo build` or `cargo check` does this automatically).
 - [ ] `just man` re-run after the bump so the man page version header is current.
+- [ ] Before tagging, verify `git status` is completely clean (no modified tracked
+      files, no staged changes). The tag must only be created from a clean `main`.
+- [ ] Clean up any residual test/profiling artifacts in the working tree before
+      tagging: profile captures (`.json.gz`, `*.profdata`), temporary log files,
+      any other gitignored scratch files produced during development. Run
+      `git clean -ndx --exclude=target` to preview what would be removed, then
+      `git clean -fdx --exclude=target` to remove it. This is safe even with
+      multiple branches in progress — gitignored files are not part of any
+      branch's tracked state, so cleaning them never affects other branches or PRs.
+- [ ] `cargo publish` must **never** use `--allow-dirty`. If publish requires that
+      flag, stop: something tracked was left uncommitted. Commit or discard it first.
 
 ### 4.11 Wiki
 Update the GitHub wiki (clone `https://github.com/l1a/etr.wiki.git`, edit, push):
