@@ -239,7 +239,7 @@ async fn main() -> io::Result<()> {
         target
     );
 
-    let (server_port, server_cert) = bootstrap_ssh(
+    let (server_port, server_cert) = match bootstrap_ssh(
         &target,
         ssh_port,
         &session_id,
@@ -250,7 +250,13 @@ async fn main() -> io::Result<()> {
             .as_deref()
             .or(cfg.client.server_log_path.as_deref()),
         cli.verbose,
-    )?;
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[etr] {e}");
+            std::process::exit(1);
+        }
+    };
 
     vlog!(cli.verbose, 2, "[etr] etrs bound to port {server_port}");
 
@@ -270,7 +276,7 @@ async fn main() -> io::Result<()> {
     )
     .await
     {
-        eprintln!("Session terminated: {:?}", e);
+        eprintln!("[etr] {e}");
     }
 
     Ok(())
@@ -470,7 +476,8 @@ async fn run_connection_loop(
     let mut escape_rx = escape_rx;
     loop {
         if !first {
-            vlog!(verbose, 1, "\r\n[etr] Reconnecting to {server_addr}...");
+            eprintln!("[etr] Reconnecting to {server_addr}...");
+            vlog!(verbose, 2, "[etr] Reconnect delay 2s");
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(2)) => {}
                 Ok(_) = escape_rx.wait_for(|&v| v) => {
@@ -540,6 +547,7 @@ async fn run_connection_loop(
                 std::process::exit(0);
             }
             Err(e) => {
+                eprintln!("[etr] Connection lost.");
                 vlog!(verbose, 1, "[etr] Session dropped: {e:?}");
             }
         }
@@ -670,7 +678,7 @@ async fn run_session(
                 Err(_) => {
                     return Err(io::Error::new(
                         io::ErrorKind::BrokenPipe,
-                        "PTY stream closed",
+                        "server connection dropped",
                     ));
                 }
             }
