@@ -474,16 +474,32 @@ async fn run_connection_loop(
 
     let mut first = true;
     let mut escape_rx = escape_rx;
-    loop {
+    // Track whether the terminal is currently in raw mode so reconnect messages
+    // can use \r\n (raw) vs \n (cooked) and so we don't over-call disable_raw_mode.
+    let mut in_raw = false;
+
+    'reconnect: loop {
         if !first {
-            eprintln!(
-                "[etr] Reconnecting to {server_addr}...  (Enter then Ctrl-^ . to force-quit)"
-            );
+            // Stay in raw mode if we were already in it so Ctrl-^ . is
+            // recognised immediately (no trailing Enter required).
+            if in_raw {
+                eprint!(
+                    "[etr] Reconnecting to {server_addr}...  (Enter Ctrl-^ . to force-quit)\r\n"
+                );
+            } else {
+                eprintln!("[etr] Reconnecting to {server_addr}...  (Enter Ctrl-^ . to force-quit)");
+            }
             vlog!(verbose, 2, "[etr] Reconnect delay 2s");
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(2)) => {}
                 Ok(_) = escape_rx.wait_for(|&v| v) => {
-                    eprintln!("[etr] Disconnected (Ctrl-^ .).");
+                    if in_raw {
+                        IN_RAW_MODE.store(false, std::sync::atomic::Ordering::Relaxed);
+                        let _ = disable_raw_mode();
+                        eprint!("\r\n[etr] Disconnected (Ctrl-^ .).\r\n");
+                    } else {
+                        eprintln!("[etr] Disconnected (Ctrl-^ .).");
+                    }
                     return Ok(());
                 }
             }
@@ -497,22 +513,35 @@ async fn run_connection_loop(
             hex_encode(&session_id)
         );
 
-        let conn = match endpoint.connect(server_addr, "etr") {
+        let connecting = match endpoint.connect(server_addr, "etr") {
             Ok(c) => c,
             Err(e) => {
                 vlog!(verbose, 1, "[etr] Connect error: {e}");
-                continue;
+                continue 'reconnect;
             }
         };
-        let conn = match tokio::time::timeout(Duration::from_secs(15), conn).await {
-            Ok(Ok(c)) => c,
-            Ok(Err(e)) => {
-                vlog!(verbose, 1, "[etr] QUIC handshake failed: {e}");
-                continue;
-            }
-            Err(_) => {
-                vlog!(verbose, 1, "[etr] QUIC connect timed out");
-                continue;
+        // Also poll escape here so Ctrl-^ . is responsive during the connect wait.
+        let conn = tokio::select! {
+            r = tokio::time::timeout(Duration::from_secs(15), connecting) => match r {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => {
+                    vlog!(verbose, 1, "[etr] QUIC handshake failed: {e}");
+                    continue 'reconnect;
+                }
+                Err(_) => {
+                    vlog!(verbose, 1, "[etr] QUIC connect timed out");
+                    continue 'reconnect;
+                }
+            },
+            Ok(_) = escape_rx.wait_for(|&v| v) => {
+                if in_raw {
+                    IN_RAW_MODE.store(false, std::sync::atomic::Ordering::Relaxed);
+                    let _ = disable_raw_mode();
+                    eprint!("\r\n[etr] Disconnected (Ctrl-^ .).\r\n");
+                } else {
+                    eprintln!("[etr] Disconnected (Ctrl-^ .).");
+                }
+                return Ok(());
             }
         };
 
@@ -521,6 +550,7 @@ async fn run_connection_loop(
 
         enable_raw_mode().unwrap();
         IN_RAW_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
+        in_raw = true;
         let result = tokio::select! {
             r = run_session(
                 conn,
@@ -536,24 +566,30 @@ async fn run_connection_loop(
             Ok(_) = escape_rx.wait_for(|&v| v) => {
                 IN_RAW_MODE.store(false, std::sync::atomic::Ordering::Relaxed);
                 let _ = disable_raw_mode();
-                eprintln!("\r\n[etr] Disconnected (Ctrl-^ .).");
+                eprint!("\r\n[etr] Disconnected (Ctrl-^ .).\r\n");
                 std::process::exit(0);
             }
         };
-        IN_RAW_MODE.store(false, std::sync::atomic::Ordering::Relaxed);
-        let _ = disable_raw_mode();
 
         match result {
             Ok(_) => {
+                IN_RAW_MODE.store(false, std::sync::atomic::Ordering::Relaxed);
+                let _ = disable_raw_mode();
                 vlog!(verbose, 1, "[etr] Connection closed cleanly.");
                 std::process::exit(0);
             }
             Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
+                IN_RAW_MODE.store(false, std::sync::atomic::Ordering::Relaxed);
+                let _ = disable_raw_mode();
                 vlog!(verbose, 1, "[etr] Connection closed cleanly.");
                 std::process::exit(0);
             }
             Err(e) => {
-                eprintln!("[etr] Connection lost.");
+                // Keep raw mode ON during reconnect so Ctrl-^ . fires immediately.
+                eprint!("\r\n[etr] Connection lost.\r\n");
+                if let Some(f) = LOG_FILE.get() {
+                    let _ = writeln!(f.lock().unwrap(), "[etr] Connection lost.");
+                }
                 vlog!(verbose, 1, "[etr] Session dropped: {e:?}");
             }
         }
