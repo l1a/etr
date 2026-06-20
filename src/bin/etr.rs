@@ -504,10 +504,14 @@ async fn run_connection_loop(
                 continue;
             }
         };
-        let conn = match conn.await {
-            Ok(c) => c,
-            Err(e) => {
+        let conn = match tokio::time::timeout(Duration::from_secs(15), conn).await {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => {
                 vlog!(verbose, 1, "[etr] QUIC handshake failed: {e}");
+                continue;
+            }
+            Err(_) => {
+                vlog!(verbose, 1, "[etr] QUIC connect timed out");
                 continue;
             }
         };
