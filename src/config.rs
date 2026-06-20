@@ -55,6 +55,10 @@ pub struct ClientConfig {
 
     /// Default remote port forwards.
     pub reverse_forward: Option<Vec<String>>,
+
+    /// Extra environment variables to set in the remote shell.
+    /// Each entry is either "KEY=VALUE" or just "KEY" (forwarded from the local environment).
+    pub env: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, Default)]

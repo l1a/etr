@@ -132,6 +132,21 @@ fn main() -> io::Result<()> {
     let passkey = parts[1].to_string();
     let term = parts[2].to_string();
 
+    // Read any extra KEY=VALUE lines the client wrote after the first line.
+    // Old clients close stdin immediately, yielding EOF here (zero iterations).
+    let mut extra_env: Vec<String> = Vec::new();
+    {
+        use std::io::BufRead;
+        let stdin = io::stdin();
+        for line in stdin.lock().lines() {
+            match line {
+                Ok(l) if l.is_empty() => break,
+                Ok(l) => extra_env.push(l),
+                Err(_) => break,
+            }
+        }
+    }
+
     // Generate ephemeral self-signed QUIC certificate.
     let (cert, key) = quic::generate_self_signed_cert();
     let cert_hex = hex_encode(cert.as_ref());
@@ -191,7 +206,15 @@ fn main() -> io::Result<()> {
             drop(writer); // closes pipe_w
 
             detach_stdio(&log_path)?;
-            run_session(endpoint, session_id, passkey, term, reconnect_timeout).await
+            run_session(
+                endpoint,
+                session_id,
+                passkey,
+                term,
+                reconnect_timeout,
+                extra_env,
+            )
+            .await
         })
 }
 
@@ -242,6 +265,7 @@ async fn run_session(
     passkey: String,
     term: String,
     reconnect_timeout: Duration,
+    extra_env: Vec<String>,
 ) -> io::Result<()> {
     vlog!(
         1,
@@ -270,6 +294,12 @@ async fn run_session(
     // to SSH_CONNECTION / SSH_TTY set by OpenSSH.
     cmd.env("ETR_CONNECTION", "1");
     cmd.env("ETR_VERSION", env!("CARGO_PKG_VERSION"));
+    // Apply any extra env vars requested by the client (--env / config [client] env).
+    for kv in &extra_env {
+        if let Some((k, v)) = kv.split_once('=') {
+            cmd.env(k, v);
+        }
+    }
     let mut child = pair.slave.spawn_command(cmd).map_err(io::Error::other)?;
 
     let master_fd = pair.master.as_raw_fd();
