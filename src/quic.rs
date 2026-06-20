@@ -33,11 +33,20 @@ pub fn generate_self_signed_cert() -> (CertificateDer<'static>, Vec<u8>) {
 ///
 /// Stream receive window: 4 MB per stream — allows the sender to keep the
 /// pipeline full even with RTT latency, and lets a single read_chunk() drain
-/// up to 4 MB before back-pressure kicks in.
+/// up to 4 MB before back-pressure picks in.
 /// Connection window: 32 MB — accommodates many concurrent forwarded streams
 /// without the connection-level window becoming the bottleneck.
 /// Send window: 32 MB — symmetric with the receive window.
+///
+/// Idle timeout: 30 s.  Application heartbeats every 5 s keep the timer alive
+/// during normal operation; if the peer disappears (crash, reboot, network
+/// partition) the connection is declared dead within 30 s so the client can
+/// reconnect or print a meaningful error.
+///
+/// Keep-alive interval: 10 s.  Sends QUIC PING frames so that NAT mappings
+/// and firewalls stay open even when no application data is in flight.
 fn high_throughput_transport() -> Arc<quinn::TransportConfig> {
+    use std::time::Duration;
     let mut t = quinn::TransportConfig::default();
     t.stream_receive_window(
         quinn::VarInt::from_u32(4 * 1024 * 1024), // 4 MB per stream
@@ -46,6 +55,10 @@ fn high_throughput_transport() -> Arc<quinn::TransportConfig> {
         quinn::VarInt::from_u32(32 * 1024 * 1024), // 32 MB connection
     );
     t.send_window(32 * 1024 * 1024); // 32 MB send budget
+    // 30 000 ms = 30 s.  Heartbeats every 5 s reset the timer during normal
+    // use; the timeout fires only when the peer truly stops responding.
+    t.max_idle_timeout(Some(quinn::VarInt::from_u32(30_000).into()));
+    t.keep_alive_interval(Some(Duration::from_secs(10)));
     Arc::new(t)
 }
 

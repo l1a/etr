@@ -476,7 +476,9 @@ async fn run_connection_loop(
     let mut escape_rx = escape_rx;
     loop {
         if !first {
-            eprintln!("[etr] Reconnecting to {server_addr}...");
+            eprintln!(
+                "[etr] Reconnecting to {server_addr}...  (Enter then Ctrl-^ . to force-quit)"
+            );
             vlog!(verbose, 2, "[etr] Reconnect delay 2s");
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(2)) => {}
