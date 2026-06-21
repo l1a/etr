@@ -732,6 +732,72 @@ e2e-reverse-local: check-tools install
 
     echo "==> All reverse E2E tests passed."
 
+# Regression test: concurrent UDP senders through -L (v0.4.9 per-sender routing fix)
+#
+# Before v0.4.9 the server used a single "last_peer" socket so replies from the
+# remote UDP target always went to whichever sender sent last (last-sender-wins).
+# This test sends interleaved datagrams from two independent sockets and asserts
+# each socket receives its own reply — not the other sender's.
+e2e-udp-concurrent: check-tools install
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    CLIENT_LOG="${XDG_STATE_HOME:-$HOME/.local/state}/etr/etr.log"
+    TMUX_CONC="etr_udp_concurrent"
+    UDP_ECHO_PORT=19341
+    UDP_FWD_PORT=19342
+
+    cleanup() {
+        echo ""
+        echo "--- cleanup ---"
+        kill "${UDP_ECHO_PID:-}" 2>/dev/null || true
+        tmux kill-session -t "$TMUX_CONC" 2>/dev/null || true
+        pkill -x etrs 2>/dev/null || true
+    }
+    trap cleanup EXIT
+
+    mkdir -p "$(dirname "$CLIENT_LOG")"
+    > "$CLIENT_LOG"
+
+    echo "==> Starting UDP echo server on port ${UDP_ECHO_PORT}..."
+    python3 "{{justfile_directory()}}/scripts/stress/udp_echo.py" "${UDP_ECHO_PORT}" &
+    UDP_ECHO_PID=$!
+    sleep 0.3
+
+    echo "==> Launching etr with -L UDP spec..."
+    tmux new-session -d -s "$TMUX_CONC" -x 200 -y 50 -- \
+        "{{INSTALL}}/etr" -v \
+        -L "${UDP_FWD_PORT}:127.0.0.1:${UDP_ECHO_PORT}/udp" \
+        localhost
+
+    echo "    waiting for etr to connect..."
+    READY=0
+    for i in $(seq 1 30); do
+        sleep 1
+        grep -q '\[etr\] Connected\.' "$CLIENT_LOG" 2>/dev/null && { READY=1; break; }
+    done
+    if [[ $READY -eq 0 ]]; then
+        echo "ERROR: '[etr] Connected.' not seen within 30 s" >&2
+        cat "$CLIENT_LOG" >&2
+        exit 1
+    fi
+    sleep 1.0  # allow -L listener to bind
+
+    # ── Two senders, interleaved, each must get back its own payload ──────────
+    echo "==> Testing concurrent UDP senders (regression for v0.4.9 routing fix)..."
+    RESULT=$(python3 "{{justfile_directory()}}/scripts/stress/udp_concurrent_senders.py" "${UDP_FWD_PORT}" 2>&1 || true)
+    if [[ "$RESULT" == "PASS" ]]; then
+        echo "    PASS: each concurrent sender received its own reply."
+    else
+        echo "FAIL: concurrent UDP sender routing incorrect." >&2
+        echo "--- result ---" >&2
+        echo "$RESULT" >&2
+        exit 1
+    fi
+
+    echo ""
+    echo "==> Concurrent UDP sender regression test passed."
+
 # Stress-test all five stream types simultaneously while watching etrs memory.
 #
 # Opens: 1 PTY stream + 2 -L forward streams (TCP + UDP) + 2 -R forward streams
