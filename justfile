@@ -274,6 +274,95 @@ e2e-local: check-tools install
     echo ""
     echo "==> All tests passed."
 
+# Run the local E2E test for --env variable forwarding to the remote shell
+e2e-env-local: check-tools install
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    CLIENT_LOG="${XDG_STATE_HOME:-$HOME/.local/state}/etr/etr.log"
+    TMUX_SESS_ENV="etr_env_test"
+
+    cleanup() {
+        echo ""
+        echo "--- cleanup ---"
+        tmux kill-session -t "$TMUX_SESS_ENV" 2>/dev/null && echo "killed tmux session $TMUX_SESS_ENV" || true
+        pkill -x etrs 2>/dev/null && echo "stopped etrs" || true
+    }
+    trap cleanup EXIT
+
+    mkdir -p "$(dirname "$CLIENT_LOG")"
+    > "$CLIENT_LOG"
+
+    # ── 1. Launch etr with --env KEY=VALUE and --env KEY (bare forward) ───────
+    echo "==> Launching etr with --env ETR_TEST_SET=hello_env --env ETR_TEST_FWD..."
+    export ETR_TEST_FWD="forwarded_value_$$"
+    tmux new-session -d -s "$TMUX_SESS_ENV" -x 200 -y 50 -- \
+        "{{INSTALL}}/etr" -v \
+            --env "ETR_TEST_SET=hello_env" \
+            --env "ETR_TEST_FWD" \
+            localhost
+
+    # ── 2. Wait for "[etr] Connected." ────────────────────────────────────────
+    echo "    waiting for etr to connect..."
+    READY=0
+    for i in $(seq 1 30); do
+        sleep 1
+        grep -q '\[etr\] Connected\.' "$CLIENT_LOG" 2>/dev/null && { READY=1; break; }
+    done
+    if [[ $READY -eq 0 ]]; then
+        echo "ERROR: '[etr] Connected.' not seen within 30 s" >&2
+        cat "$CLIENT_LOG" >&2
+        exit 1
+    fi
+
+    # Send a sentinel to confirm the PTY stream is live.
+    SENTINEL="ETR_ENV_READY_$$"
+    tmux send-keys -t "$TMUX_SESS_ENV" "echo ${SENTINEL}" Enter
+    READY=0
+    for i in $(seq 1 20); do
+        sleep 1
+        tmux capture-pane -t "$TMUX_SESS_ENV" -p -S - 2>/dev/null \
+            | grep -q "${SENTINEL}" && { READY=1; break; }
+    done
+    if [[ $READY -eq 0 ]]; then
+        echo "ERROR: shell sentinel not seen within 20 s" >&2
+        tmux capture-pane -t "$TMUX_SESS_ENV" -p -S - >&2
+        exit 1
+    fi
+    echo "    session up."
+
+    # ── 3. Check KEY=VALUE variable ────────────────────────────────────────────
+    echo "==> Checking ETR_TEST_SET=hello_env ..."
+    tmux send-keys -t "$TMUX_SESS_ENV" 'echo "ETR_TEST_SET=[$ETR_TEST_SET]"' Enter
+    sleep 2
+    OUTPUT=$(tmux capture-pane -t "$TMUX_SESS_ENV" -p -S -)
+    if echo "$OUTPUT" | grep -q "ETR_TEST_SET=\[hello_env\]"; then
+        echo "    PASS: ETR_TEST_SET correctly set to 'hello_env'."
+    else
+        echo "FAIL: ETR_TEST_SET not found or wrong value." >&2
+        echo "--- pane output ---" >&2
+        echo "$OUTPUT" >&2
+        exit 1
+    fi
+
+    # ── 4. Check bare KEY forwarding ──────────────────────────────────────────
+    echo "==> Checking ETR_TEST_FWD (bare forward, value: $ETR_TEST_FWD) ..."
+    tmux send-keys -t "$TMUX_SESS_ENV" 'echo "ETR_TEST_FWD=[$ETR_TEST_FWD]"' Enter
+    sleep 2
+    OUTPUT2=$(tmux capture-pane -t "$TMUX_SESS_ENV" -p -S -)
+    EXPECTED_FWD="ETR_TEST_FWD=\[${ETR_TEST_FWD}\]"
+    if echo "$OUTPUT2" | grep -q "$EXPECTED_FWD"; then
+        echo "    PASS: ETR_TEST_FWD correctly forwarded."
+    else
+        echo "FAIL: ETR_TEST_FWD not found or wrong value (expected '$ETR_TEST_FWD')." >&2
+        echo "--- pane output ---" >&2
+        echo "$OUTPUT2" >&2
+        exit 1
+    fi
+
+    echo ""
+    echo "==> All --env tests passed."
+
 # Run the local E2E test for local port forwarding -L (TCP + UDP, IPv4 + IPv6, reconnect)
 e2e-forward-local: check-tools install
     #!/usr/bin/env bash
