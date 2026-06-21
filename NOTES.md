@@ -9,7 +9,12 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.4.11 — community health files
+## Current state: v0.4.12 — issue templates
+
+New in v0.4.12:
+- Added `.github/ISSUE_TEMPLATE/bug_report.md` and `feature_request.md`, completing GitHub community standards.
+
+## Previous: v0.4.11 — community health files
 
 New in v0.4.11:
 - Added `CODE_OF_CONDUCT.md` (Contributor Covenant v2.1; enforcement contact via GitHub issues or @l1a).
