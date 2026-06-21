@@ -346,6 +346,7 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
 - ~~**Mode 2 — `-R` remote forwarding**~~ **Done**: Both TCP and UDP remote port forwarding are supported using the `-R` CLI flag.
 - ~~**Client-side environment variable forwarding**~~ **Done**: `--env KEY=VALUE` (repeatable) sets arbitrary environment variables in the remote shell. `--env KEY` (no `=`) forwards from the local environment. Config file equivalent: `[client] env = ["KEY=VALUE", "KEY2"]`.
 - ~~**UDP reply routing**~~ **Done**: Each unique local UDP sender (`peer_addr:peer_port`) now gets its own ephemeral socket on the server (`-L`) and client (`-R`), so replies from the remote target are routed back to the correct sender regardless of interleaving. Idle sender sockets are evicted after 30 s. This removes the last-sender-wins limitation for concurrent DNS/STUN/game-protocol clients.
+- ~~**`--env` e2e test**~~ **Done**: `just e2e-env-local` tests both `--env KEY=VALUE` (explicit set) and `--env KEY` (bare forward from local env) end-to-end through a live `etr localhost` session.
 - **Multiple simultaneous sessions**: each `etr` invocation starts its own `etrs`
   child; there is no way to list or re-attach to an existing session from a new client.
   Session state (ID + passkey) is in-memory only.
