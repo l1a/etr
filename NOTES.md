@@ -9,7 +9,17 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.4.7 — meaningful errors on server exit + hang/SIGTERM fixes
+## Current state: v0.4.8 — remote environment variable forwarding
+
+New in v0.4.8:
+- `--env KEY=VALUE` (repeatable) sets arbitrary environment variables in the remote shell.
+  `--env KEY` (no `=`) forwards the variable from the local environment.
+  Config file equivalent: `[client] env = ["KEY=VALUE", "KEY2"]`.
+  Variables are sent over the SSH bootstrap channel and set before the shell starts,
+  so they are visible to `.zshrc`, `.zlogin`, and any login-time scripts.
+  Example: `etr --env ZELLIJ_AUTO_START=false remote` suppresses zellij auto-start.
+
+## Current state v0.4.7 — meaningful errors on server exit + hang/SIGTERM fixes
 
 The full round-trip works: `etr <host>` on the client, SSH bootstrap that starts
 `etrs` on the fly, QUIC connection with cert pinning, PTY session, keepalives,

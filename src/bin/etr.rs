@@ -97,6 +97,12 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     server_log_path: Option<String>,
 
+    /// Set or forward environment variables to the remote shell (repeatable).
+    /// "KEY=VALUE" sets the variable; "KEY" forwards it from the local environment.
+    /// Example: --env ZELLIJ_AUTO_START=false --env EDITOR
+    #[arg(long = "env", value_name = "KEY[=VALUE]")]
+    env: Vec<String>,
+
     /// Generate shell completions for the specified shell
     #[arg(long, value_enum, value_name = "SHELL")]
     completions: Option<ShellChoice>,
@@ -228,6 +234,24 @@ async fn main() -> io::Result<()> {
         cfg.client.gateway_ports.unwrap_or(false)
     };
 
+    // Merge --env flags with [client] env from config, resolving bare KEY entries
+    // from the local environment.
+    let raw_env: Vec<String> = if !cli.env.is_empty() {
+        cli.env.clone()
+    } else {
+        cfg.client.env.clone().unwrap_or_default()
+    };
+    let env_vars: Vec<String> = raw_env
+        .into_iter()
+        .filter_map(|e| {
+            if e.contains('=') {
+                Some(e)
+            } else {
+                std::env::var(&e).ok().map(|v| format!("{e}={v}"))
+            }
+        })
+        .collect();
+
     let session_id = generate_session_id();
     let passkey = generate_passkey();
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
@@ -249,6 +273,7 @@ async fn main() -> io::Result<()> {
         cli.server_log_path
             .as_deref()
             .or(cfg.client.server_log_path.as_deref()),
+        &env_vars,
         cli.verbose,
     ) {
         Ok(r) => r,
@@ -321,6 +346,7 @@ fn bootstrap_ssh(
     term: &str,
     server_path: &str,
     server_log_path: Option<&str>,
+    env_vars: &[String],
     verbose: u8,
 ) -> io::Result<(u16, Vec<u8>)> {
     let session_id_hex = hex_encode(session_id);
@@ -348,6 +374,9 @@ fn bootstrap_ssh(
         .take()
         .ok_or_else(|| io::Error::other("Failed to open SSH stdin pipe"))?;
     stdin.write_all(format!("{}/{}/{}\n", session_id_hex, passkey, term).as_bytes())?;
+    for kv in env_vars {
+        stdin.write_all(format!("{kv}\n").as_bytes())?;
+    }
     stdin.flush()?;
     drop(stdin);
 
