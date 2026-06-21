@@ -968,39 +968,27 @@ async fn run_session(
                                 }
                             };
                         vlog!(verbose, 2, "[etr] forwarding UDP reverse stream to {addr}");
+                        use std::collections::HashMap;
+                        use std::time::Instant;
                         use tokio::net::UdpSocket;
+                        use tokio::sync::mpsc as udp_mpsc;
                         let bind_addr = if addr.is_ipv6() {
                             "[::]:0"
                         } else {
                             "0.0.0.0:0"
                         };
-                        let socket = match UdpSocket::bind(bind_addr).await {
-                            Ok(s) => Arc::new(s),
-                            Err(e) => {
-                                vlog!(verbose, 1, "[etr] failed to bind local UDP socket: {e}");
-                                let _ = quic_send.finish();
-                                return;
-                            }
-                        };
 
-                        let socket2 = Arc::clone(&socket);
+                        // Each external sender (peer_addr:peer_port from QUIC envelope) gets
+                        // its own ephemeral socket toward the local target so replies can be
+                        // routed back to the correct sender.
+                        const SENDER_IDLE: Duration = Duration::from_secs(30);
+
+                        let (reply_tx, mut reply_rx) = udp_mpsc::channel::<Envelope>(256);
+
                         let mut quic_send = quic_send;
                         let verbose_reply = verbose;
                         let mut reply_task = tokio::spawn(async move {
-                            let mut buf = vec![0u8; 65535];
-                            while let Ok((n, src)) = socket2.recv_from(&mut buf).await {
-                                vlog!(
-                                    verbose_reply,
-                                    3,
-                                    "[etr] UDP reverse fwd: read {n} bytes from local target {src}"
-                                );
-                                let env = Envelope {
-                                    payload: Some(Payload::UdpDatagram(UdpDatagram {
-                                        peer_addr: String::new(),
-                                        peer_port: 0,
-                                        data: buf[..n].to_vec(),
-                                    })),
-                                };
+                            while let Some(env) = reply_rx.recv().await {
                                 if quic::write_msg(&mut quic_send, &env).await.is_err() {
                                     vlog!(
                                         verbose_reply,
@@ -1012,18 +1000,89 @@ async fn run_session(
                             }
                         });
 
-                        let socket_send = Arc::clone(&socket);
                         let verbose_send = verbose;
                         let mut send_task = tokio::spawn(async move {
+                            let mut sender_map: HashMap<(String, u32), (Arc<UdpSocket>, Instant)> =
+                                HashMap::new();
+
                             while let Ok(Some(env)) = quic::read_msg(&mut quic_recv).await {
                                 if let Some(Payload::UdpDatagram(dg)) = env.payload {
+                                    if dg.peer_addr.is_empty() {
+                                        continue;
+                                    }
+                                    let key = (dg.peer_addr.clone(), dg.peer_port);
+                                    let now = Instant::now();
+
+                                    sender_map.retain(|_, (_, last)| {
+                                        now.duration_since(*last) < SENDER_IDLE
+                                    });
+
+                                    let socket = if let Some((sock, last)) =
+                                        sender_map.get_mut(&key)
+                                    {
+                                        *last = now;
+                                        Arc::clone(sock)
+                                    } else {
+                                        let sock = match UdpSocket::bind(bind_addr).await {
+                                            Ok(s) => Arc::new(s),
+                                            Err(e) => {
+                                                vlog!(
+                                                    verbose_send,
+                                                    1,
+                                                    "[etr] UDP reverse fwd: bind failed for sender {}: {e}",
+                                                    key.0
+                                                );
+                                                continue;
+                                            }
+                                        };
+                                        sender_map.insert(key.clone(), (Arc::clone(&sock), now));
+
+                                        // Per-sender reply task: reads local-target replies
+                                        // and forwards them back with the original sender's
+                                        // peer_addr/peer_port so the server routes correctly.
+                                        let peer_addr = key.0.clone();
+                                        let peer_port = key.1;
+                                        let sock_r = Arc::clone(&sock);
+                                        let tx = reply_tx.clone();
+                                        let vr = verbose_send;
+                                        tokio::spawn(async move {
+                                            let mut buf = vec![0u8; 65535];
+                                            while let Ok(Ok((n, src))) = tokio::time::timeout(
+                                                SENDER_IDLE,
+                                                sock_r.recv_from(&mut buf),
+                                            )
+                                            .await
+                                            {
+                                                vlog!(
+                                                    vr,
+                                                    3,
+                                                    "[etr] UDP reverse fwd: {n} bytes from local target {src} → sender {peer_addr}:{peer_port}"
+                                                );
+                                                let env = Envelope {
+                                                    payload: Some(Payload::UdpDatagram(
+                                                        UdpDatagram {
+                                                            peer_addr: peer_addr.clone(),
+                                                            peer_port,
+                                                            data: buf[..n].to_vec(),
+                                                        },
+                                                    )),
+                                                };
+                                                if tx.send(env).await.is_err() {
+                                                    break;
+                                                }
+                                            }
+                                        });
+
+                                        sock
+                                    };
+
                                     vlog!(
                                         verbose_send,
                                         3,
                                         "[etr] UDP reverse fwd: forwarding {} bytes to local target {addr}",
                                         dg.data.len()
                                     );
-                                    let _ = socket_send.send_to(&dg.data, &addr).await;
+                                    let _ = socket.send_to(&dg.data, &addr).await;
                                 }
                             }
                         });

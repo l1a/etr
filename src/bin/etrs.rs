@@ -1076,7 +1076,8 @@ async fn run_udp_reverse_listener(
 
 /// Drive a single UDP reverse-forward socket: receive datagrams from external senders,
 /// multiplex them onto a shared QUIC stream toward the client, and route reply datagrams
-/// from the client back to the last-seen sender (last-sender routing).
+/// from the client back to the correct sender using the `peer_addr/peer_port` embedded
+/// in each reply envelope.
 ///
 /// One instance of this function runs per bound socket (i.e. per address returned by
 /// `spec.get_bind_addresses`).  `active_conn` is shared across all sockets for the same
@@ -1090,11 +1091,8 @@ async fn run_udp_reverse_listener_socket(
     let current_quic_tx: Arc<Mutex<Option<quinn::SendStream>>> = Arc::new(Mutex::new(None));
     let last_conn_id: Arc<std::sync::Mutex<Option<quinn::Connection>>> =
         Arc::new(std::sync::Mutex::new(None));
-    let last_peer: Arc<std::sync::Mutex<Option<std::net::SocketAddr>>> =
-        Arc::new(std::sync::Mutex::new(None));
 
     let socket_recv = Arc::clone(&socket);
-    let last_peer_recv = Arc::clone(&last_peer);
     let active_conn_recv = Arc::clone(&active_conn);
     let current_quic_tx_recv = Arc::clone(&current_quic_tx);
     let last_conn_id_recv = Arc::clone(&last_conn_id);
@@ -1104,7 +1102,6 @@ async fn run_udp_reverse_listener_socket(
         let mut buf = vec![0u8; 65535];
         while let Ok((n, src)) = socket_recv.recv_from(&mut buf).await {
             vlog!(3, "[etrs] UDP reverse fwd received {n} bytes from {src}");
-            *last_peer_recv.lock().unwrap() = Some(src);
 
             let conn = {
                 let g = active_conn_recv.lock().await;
@@ -1157,17 +1154,18 @@ async fn run_udp_reverse_listener_socket(
                     vlog!(2, "[etrs] UDP reverse fwd: stream opened and header sent");
 
                     let socket_send = Arc::clone(&socket_recv);
-                    let last_peer_send = Arc::clone(&last_peer_recv);
                     let mut rx = rx;
                     tokio::spawn(async move {
                         vlog!(3, "[etrs] UDP reverse fwd: rx reader task started");
                         while let Ok(Some(env)) = quic::read_msg(&mut rx).await {
-                            if let Some(Payload::UdpDatagram(dg)) = env.payload {
-                                let target_addr = {
-                                    let g = last_peer_send.lock().unwrap();
-                                    *g
-                                };
-                                if let Some(addr) = target_addr {
+                            if let Some(Payload::UdpDatagram(dg)) = env.payload
+                                && !dg.peer_addr.is_empty()
+                                && dg.peer_port > 0
+                            {
+                                // Parse peer_addr as IpAddr (not SocketAddr) so that bare
+                                // IPv6 addresses like "::1" are accepted without brackets.
+                                if let Ok(ip) = dg.peer_addr.parse::<std::net::IpAddr>() {
+                                    let addr = std::net::SocketAddr::new(ip, dg.peer_port as u16);
                                     vlog!(
                                         3,
                                         "[etrs] UDP reverse fwd rx: sending reply of {} bytes to {addr}",
@@ -1210,12 +1208,12 @@ async fn serve_udp_forward(
     mut quic_recv: quinn::RecvStream,
     _session: Arc<Mutex<SessionState>>,
 ) {
+    use std::collections::HashMap;
+    use std::time::Instant;
     use tokio::net::UdpSocket;
+    use tokio::sync::mpsc;
 
-    // Resolve the remote host to a concrete SocketAddr so that:
-    // (a) the UDP socket is bound to the matching IP family, and
-    // (b) send_to uses the already-resolved address instead of re-resolving
-    //     (which on macOS returns ::1 first, causing IPv4-socket sends to fail).
+    // Resolve the remote host once so every per-sender socket uses the same family.
     let remote_addr_str = format!("{}:{}", so.remote_host, so.remote_port);
     let remote_addr: std::net::SocketAddr =
         match etr::forward::resolve_udp_target(&remote_addr_str).await {
@@ -1232,52 +1230,86 @@ async fn serve_udp_forward(
     } else {
         "0.0.0.0:0"
     };
-    let socket = match UdpSocket::bind(bind_addr).await {
-        Ok(s) => Arc::new(s),
-        Err(e) => {
-            vlog!(1, "[etrs] UDP bind failed: {e}");
-            let _ = quic_send.finish();
-            return;
-        }
-    };
     vlog!(2, "[etrs] UDP forward → {remote_addr}");
 
-    let last_peer: Arc<std::sync::Mutex<Option<(String, u32)>>> =
-        Arc::new(std::sync::Mutex::new(None));
-    let last_peer2 = Arc::clone(&last_peer);
-    let socket2 = Arc::clone(&socket);
+    // Each local sender (peer_addr:peer_port) gets its own ephemeral UDP socket so
+    // that remote replies arrive on a distinct source port and can be routed back to
+    // the correct sender without any last-sender state.
+    const SENDER_IDLE: Duration = Duration::from_secs(30);
 
-    // Remote replies → QUIC (as UdpDatagram envelopes).
+    // Channel: per-sender reply tasks write here; one collector task drains to quic_send
+    // (avoids concurrent writes to the single SendStream).
+    let (reply_tx, mut reply_rx) = mpsc::channel::<Envelope>(256);
+
     let mut reply_task = tokio::spawn(async move {
-        let mut buf = vec![0u8; 65535];
-        while let Ok((n, _src)) = socket2.recv_from(&mut buf).await {
-            let (peer_addr, peer_port) = {
-                let g = last_peer2.lock().unwrap();
-                match g.as_ref() {
-                    Some((a, p)) => (a.clone(), *p),
-                    None => continue,
-                }
-            };
-            let env = Envelope {
-                payload: Some(Payload::UdpDatagram(UdpDatagram {
-                    peer_addr,
-                    peer_port,
-                    data: buf[..n].to_vec(),
-                })),
-            };
+        while let Some(env) = reply_rx.recv().await {
             if quic::write_msg(&mut quic_send, &env).await.is_err() {
                 break;
             }
         }
     });
 
-    // QUIC (UdpDatagram envelopes) → remote UDP.
+    // QUIC → remote UDP, with per-sender socket demux.
     let mut send_task = tokio::spawn(async move {
+        // Local map — only this task accesses it, so no locking needed.
+        let mut sender_map: HashMap<(String, u32), (Arc<UdpSocket>, Instant)> = HashMap::new();
+
         while let Ok(Some(env)) = quic::read_msg(&mut quic_recv).await {
             if let Some(Payload::UdpDatagram(dg)) = env.payload {
-                if !dg.peer_addr.is_empty() {
-                    *last_peer.lock().unwrap() = Some((dg.peer_addr.clone(), dg.peer_port));
+                if dg.peer_addr.is_empty() {
+                    continue;
                 }
+                let key = (dg.peer_addr.clone(), dg.peer_port);
+                let now = Instant::now();
+
+                // Evict sockets idle longer than SENDER_IDLE.
+                sender_map.retain(|_, (_, last)| now.duration_since(*last) < SENDER_IDLE);
+
+                let socket = if let Some((sock, last)) = sender_map.get_mut(&key) {
+                    *last = now;
+                    Arc::clone(sock)
+                } else {
+                    // New sender: bind a fresh ephemeral socket.
+                    let sock = match UdpSocket::bind(bind_addr).await {
+                        Ok(s) => Arc::new(s),
+                        Err(e) => {
+                            vlog!(
+                                1,
+                                "[etrs] UDP forward: bind failed for sender {}: {e}",
+                                key.0
+                            );
+                            continue;
+                        }
+                    };
+                    sender_map.insert(key.clone(), (Arc::clone(&sock), now));
+
+                    // Spawn a reply task: reads remote replies and routes them back to
+                    // this specific sender via the shared channel.
+                    let peer_addr = key.0.clone();
+                    let peer_port = key.1;
+                    let sock_r = Arc::clone(&sock);
+                    let tx = reply_tx.clone();
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 65535];
+                        while let Ok(Ok((n, _))) =
+                            tokio::time::timeout(SENDER_IDLE, sock_r.recv_from(&mut buf)).await
+                        {
+                            let env = Envelope {
+                                payload: Some(Payload::UdpDatagram(UdpDatagram {
+                                    peer_addr: peer_addr.clone(),
+                                    peer_port,
+                                    data: buf[..n].to_vec(),
+                                })),
+                            };
+                            if tx.send(env).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+
+                    sock
+                };
+
                 let _ = socket.send_to(&dg.data, &remote_addr).await;
             }
         }

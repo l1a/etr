@@ -67,6 +67,7 @@ Options:
   -R <[remote_port:]host:port[/udp]>
                                  Forward a remote port to a local address (repeatable)
   -v, -vv, -vvv                  Verbosity: connection events / QUIC details / stream trace
+      --env <KEY[=VALUE]>        Set or forward environment variables to the remote shell (repeatable)
       --server-path <PATH>       Path to etrs on the remote host [default: etrs]
       --log-path <PATH>          Path to the client log file [default: $XDG_STATE_HOME/etr/etr.log]
       --server-log-path <PATH>   Path to the server log file on the remote host [default: $XDG_STATE_HOME/etr/etrs.log]
@@ -121,7 +122,7 @@ By default, listeners bind to loopback addresses (`127.0.0.1` and `[::1]`). You 
 
 Multiple `-L` and `-R` specifications can be mixed in a single session.
 
-Port forwards survive the same reconnect cycle as the PTY session. Each TCP connection gets its own QUIC stream; UDP uses a dedicated QUIC stream per forward spec.
+Port forwards survive the same reconnect cycle as the PTY session. Each TCP connection gets its own QUIC stream; UDP uses a dedicated QUIC stream per forward spec. Multiple concurrent UDP senders on the same forwarded port are supported — each source address gets its own ephemeral socket on the forwarding side, so replies are routed correctly regardless of interleaving.
 
 ## Shell completions
 
@@ -152,14 +153,15 @@ Optional TOML config at `~/.config/etr/config.toml`:
 ```toml
 [client]
 ssh_port = 22                        # default SSH port
-server_path = "/usr/local/bin/etrs"      # path to etrs on remote hosts
+server_path = "/usr/local/bin/etrs"  # path to etrs on remote hosts
 log_path = "/tmp/client.log"         # path to the client log file
-server_log_path = "/tmp/server.log"   # path to the server log file on remote host
+server_log_path = "/tmp/server.log"  # path to the server log file on remote host
+env = ["COLORTERM", "EDITOR=nvim"]   # variables to set/forward in the remote shell
 ```
 
 ## Limitations
 
-- Linux and macOS supported (Windows untested)
+- Linux and macOS supported
 - macOS binaries (`macos-aarch64`) are published on each release
 - Sessions are not persistent across client reboots — the session ID and passkey are in-memory only
 - Post-quantum key exchange (ML-KEM) is not yet implemented; standard TLS 1.3 uses X25519 ECDH
