@@ -9,7 +9,19 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.4.9 — per-sender UDP routing
+## Current state: v0.4.10 — documentation and test coverage improvements
+
+New in v0.4.10:
+- `src/login.rs`: module doc converted from `//` to `//!`; `///` doc comments added to
+  `record_login` and `record_logout`; `// SAFETY:` comments added to both `unsafe` FFI
+  call sites.
+- `just e2e-env-local`: new end-to-end test covering `--env KEY=VALUE` (explicit set)
+  and `--env KEY` (bare forward from local environment) through a live session.
+- `just e2e-udp-concurrent` + `scripts/stress/udp_concurrent_senders.py`: regression
+  test for the v0.4.9 per-sender UDP routing fix.  Two concurrent senders each assert
+  they receive their own echo reply, not the other sender's.
+- AGENTS.md: added unconditional-step table and anti-rationalization language to prevent
+  future agents from skipping the version bump (4.10) or man page build (4.5).
 
 New in v0.4.9:
 - UDP forwarding (`-L` and `-R`) now correctly handles multiple concurrent senders.
