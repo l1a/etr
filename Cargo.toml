@@ -1,6 +1,6 @@
 [package]
 name = "etr"
-version = "0.4.10"
+version = "0.4.11"
 edition = "2024"
 description = "A Rust implementation of Eternal Terminal (et)"
 license = "GPL-3.0-only"
