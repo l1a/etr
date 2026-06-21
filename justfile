@@ -9,6 +9,12 @@ STRESS_BIN := justfile_directory() + "/tools/stress/target/release/stress_tool"
 INSTALL    := home_directory() + "/.cargo/bin"
 LOG_FILE   := `echo "${XDG_STATE_HOME:-$HOME/.local/state}/etr/etrs.log"`
 MAN_DIR    := `echo "${XDG_DATA_HOME:-$HOME/.local/share}/man"`
+BASH_COMP  := `echo "${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions"`
+ZSH_COMP   := `echo "${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions"`
+FISH_COMP  := `echo "${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions"`
+ELVISH_COMP := `echo "${XDG_CONFIG_HOME:-$HOME/.config}/elvish/lib"`
+NU_COMP    := `echo "${XDG_CONFIG_HOME:-$HOME/.config}/nushell/completions"`
+PS_COMP    := `echo "${XDG_CONFIG_HOME:-$HOME/.config}/powershell"`
 TMUX_SESS  := "etr_test"
 
 # List available recipes
@@ -128,6 +134,31 @@ install-man: man
     cp man/build/etrs.1 "{{MAN_DIR}}/man1/etrs.1"
     echo "Installed etr.1 and etrs.1 to {{MAN_DIR}}/man1"
     echo "Tip: add {{MAN_DIR}} to MANPATH if not already present"
+
+# Install shell completions for etr and etrs (bash, zsh, fish, elvish, nushell, powershell)
+install-completions: build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p "{{BASH_COMP}}" "{{ZSH_COMP}}" "{{FISH_COMP}}" "{{ELVISH_COMP}}" "{{NU_COMP}}" "{{PS_COMP}}"
+    for bin in etr etrs; do
+        BIN="{{justfile_directory()}}/target/debug/${bin}"
+        "$BIN" --completions bash        > "{{BASH_COMP}}/${bin}"
+        "$BIN" --completions zsh         > "{{ZSH_COMP}}/_${bin}"
+        "$BIN" --completions fish        > "{{FISH_COMP}}/${bin}.fish"
+        "$BIN" --completions elvish      > "{{ELVISH_COMP}}/${bin}.elv"
+        "$BIN" --completions nushell     > "{{NU_COMP}}/${bin}.nu"
+        "$BIN" --completions power-shell > "{{PS_COMP}}/${bin}.ps1"
+        echo "Installed completions for ${bin}"
+    done
+    echo ""
+    echo "Notes for shells that require manual sourcing:"
+    echo "  zsh        auto-loaded ({{ZSH_COMP}} is in zsh's default \$fpath)"
+    echo "  elvish    add to rc.elv:  eval (slurp < {{ELVISH_COMP}}/etr.elv)"
+    echo "                            eval (slurp < {{ELVISH_COMP}}/etrs.elv)"
+    echo "  nushell   add to config.nu:  source {{NU_COMP}}/etr.nu"
+    echo "                               source {{NU_COMP}}/etrs.nu"
+    echo "  powershell  add to \$PROFILE:  . {{PS_COMP}}/etr.ps1"
+    echo "                                . {{PS_COMP}}/etrs.ps1"
 
 # ── Local end-to-end testing ─────────────────────────────────────────────────
 

@@ -9,7 +9,19 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.4.13 — config generation and merge
+## Current state: v0.4.14 — install-completions just recipe
+
+New in v0.4.14:
+- `just install-completions`: generates and installs shell completions for `etr` and `etrs`
+  into the correct XDG directories for all six supported shells (bash, zsh, fish, elvish,
+  nushell, powershell). Depends on `build` (debug binaries). Shells that require manual
+  sourcing (elvish, nushell, powershell) print instructions at the end of the run.
+- Six new justfile variables (`BASH_COMP`, `ZSH_COMP`, `FISH_COMP`, `ELVISH_COMP`,
+  `NU_COMP`, `PS_COMP`) follow the same `${XDG_…:-default}` pattern as `MAN_DIR`.
+  zsh uses `$XDG_DATA_HOME/zsh/site-functions` (in zsh's compiled-in default `$fpath`);
+  `$XDG_DATA_HOME/zsh/completions` is NOT in the default and requires user configuration.
+
+## Previous: v0.4.13 — config generation and merge
 
 New in v0.4.13:
 - `etr --generate-config`: prints a fully-commented default `config.toml` to stdout.
