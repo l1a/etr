@@ -50,6 +50,24 @@ Before opening a pull request — and before each subsequent push to an open PR 
 MUST verify every item below. Work through the list top-to-bottom; do not submit until
 all items are satisfied or explicitly marked N/A with a reason.
 
+### STOP — read this before marking anything N/A
+
+Two items are **unconditional** — they apply to every PR without exception, including
+doc-only, test-only, and chore PRs.  There is no "this is just a small change" carve-out.
+
+| Step | Command | Why unconditional |
+|------|---------|------------------|
+| **4.5 — `just man`** | `just man` | Verifies pandoc still builds both man pages; the version header must match the bumped version. |
+| **4.10 — Version bump** | edit `Cargo.toml` | Every merged PR changes the codebase; the published version must reflect that. Use **patch** for fixes, tests, and doc improvements; **minor** for new user-visible features. |
+
+Rationalising either of these away — "it's only docs", "it's only tests", "no behaviour
+changed" — is incorrect.  If you find yourself about to skip 4.5 or 4.10, stop and do
+them instead.
+
+NOTES.md (4.9) and the wiki (4.11) are also required on every PR. They must be updated
+**before** the PR is opened, not deferred.  AGENTS.md itself must be included in the
+same PR as any change to the checklist — never pushed to `main` as a standalone commit.
+
 ### 4.1 Code quality gate
 - [ ] `just check` passes — `cargo fmt --check` + `cargo clippy --all-targets -D warnings`
 - [ ] `just test` passes — all unit and integration tests green
