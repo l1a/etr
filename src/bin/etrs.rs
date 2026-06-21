@@ -294,6 +294,11 @@ async fn run_session(
     // to SSH_CONNECTION / SSH_TTY set by OpenSSH.
     cmd.env("ETR_CONNECTION", "1");
     cmd.env("ETR_VERSION", env!("CARGO_PKG_VERSION"));
+    // Pass SSH_CONNECTION through so shell startup scripts can detect loopback
+    // connections (e.g. "etr localhost") via the client IP in its first field.
+    if let Ok(v) = std::env::var("SSH_CONNECTION") {
+        cmd.env("SSH_CONNECTION", v);
+    }
     // Apply any extra env vars requested by the client (--env / config [client] env).
     for kv in &extra_env {
         if let Some((k, v)) = kv.split_once('=') {
