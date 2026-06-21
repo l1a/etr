@@ -410,6 +410,7 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
   more syscalls, not fewer copies, determines throughput here.
   UDP (~9 Mb/s) is still limited by per-datagram protobuf encoding overhead.
 - ~~**UDP forward target resolution should prefer IPv6 when genuinely available**~~ **Done**: `etr::forward::resolve_udp_target` (new helper in `src/forward.rs`) resolves the target, tries IPv6 candidates first, and probes routing via a no-packet UDP `connect()` call.  The first address whose routing probe succeeds is used.  Falls back to IPv4 if no IPv6 route exists.  The stress-tool UDP echo server now also binds `[::1]:port` alongside `0.0.0.0:port` so both families reach it in tests.
+- **GitHub release retention**: the release workflow should automatically delete releases beyond the 20 most recent, keeping the list from growing indefinitely.
 
 ---
 
