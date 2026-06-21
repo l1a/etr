@@ -10,7 +10,7 @@ INSTALL    := home_directory() + "/.cargo/bin"
 LOG_FILE   := `echo "${XDG_STATE_HOME:-$HOME/.local/state}/etr/etrs.log"`
 MAN_DIR    := `echo "${XDG_DATA_HOME:-$HOME/.local/share}/man"`
 BASH_COMP  := `echo "${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions"`
-ZSH_COMP   := `echo "${XDG_DATA_HOME:-$HOME/.local/share}/zsh/completions"`
+ZSH_COMP   := `echo "${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions"`
 FISH_COMP  := `echo "${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions"`
 ELVISH_COMP := `echo "${XDG_CONFIG_HOME:-$HOME/.config}/elvish/lib"`
 NU_COMP    := `echo "${XDG_CONFIG_HOME:-$HOME/.config}/nushell/completions"`
@@ -152,7 +152,7 @@ install-completions: build
     done
     echo ""
     echo "Notes for shells that require manual sourcing:"
-    echo "  zsh        add {{ZSH_COMP}} to \$fpath if not present"
+    echo "  zsh        auto-loaded ({{ZSH_COMP}} is in zsh's default \$fpath)"
     echo "  elvish    add to rc.elv:  eval (slurp < {{ELVISH_COMP}}/etr.elv)"
     echo "                            eval (slurp < {{ELVISH_COMP}}/etrs.elv)"
     echo "  nushell   add to config.nu:  source {{NU_COMP}}/etr.nu"

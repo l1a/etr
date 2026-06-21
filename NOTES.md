@@ -18,6 +18,8 @@ New in v0.4.14:
   sourcing (elvish, nushell, powershell) print instructions at the end of the run.
 - Six new justfile variables (`BASH_COMP`, `ZSH_COMP`, `FISH_COMP`, `ELVISH_COMP`,
   `NU_COMP`, `PS_COMP`) follow the same `${XDG_…:-default}` pattern as `MAN_DIR`.
+  zsh uses `$XDG_DATA_HOME/zsh/site-functions` (in zsh's compiled-in default `$fpath`);
+  `$XDG_DATA_HOME/zsh/completions` is NOT in the default and requires user configuration.
 
 ## Previous: v0.4.13 — config generation and merge
 
