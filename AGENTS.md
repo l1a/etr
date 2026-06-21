@@ -120,7 +120,8 @@ all items are satisfied or explicitly marked N/A with a reason.
       flag, stop: something tracked was left uncommitted. Commit or discard it first.
 
 ### 4.11 Wiki
-Update the GitHub wiki (clone `https://github.com/l1a/etr.wiki.git`, edit, push):
+Update the GitHub wiki **before opening the PR** (not deferred to publish time).
+Clone `https://github.com/l1a/etr.wiki.git`, edit the relevant pages, and push:
 - [ ] **Home.md** — if the one-line project description or quick-start changed.
 - [ ] **Getting-Started.md** — if prerequisites, install steps, or connection syntax changed.
 - [ ] **How-It-Works.md** — if the connection lifecycle, reconnect logic, stream layout,
