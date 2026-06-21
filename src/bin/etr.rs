@@ -456,10 +456,15 @@ async fn run_connection_loop(
     // Ctrl-^ . triggers this to exit the reconnect loop.
     let (escape_tx, escape_rx) = tokio::sync::watch::channel(false);
 
+    // true = no active session (reconnecting); escape fires without needing line-start.
+    let (reconnect_mode_tx, reconnect_mode_rx) = tokio::sync::watch::channel(true);
+
     let _stdin_reader = tokio::task::spawn_blocking(move || {
         use std::io::Read;
         let mut buf = [0u8; 1024];
-        // Track position so Ctrl-^ is only recognised at the start of a line.
+        // Track position so Ctrl-^ is only recognised at the start of a line
+        // (mimics ssh ~. behaviour).  Bypassed while reconnecting so the user
+        // can escape without needing to be at a line boundary.
         let mut at_line_start = true;
         let mut escape_pending = false;
         while let Ok(n) = std::io::stdin().read(&mut buf) {
@@ -468,6 +473,7 @@ async fn run_connection_loop(
             }
             let mut out = Vec::with_capacity(n);
             for &b in &buf[..n] {
+                let in_reconnect = *reconnect_mode_rx.borrow();
                 if escape_pending {
                     escape_pending = false;
                     match b {
@@ -488,7 +494,7 @@ async fn run_connection_loop(
                             at_line_start = matches!(b, b'\r' | b'\n');
                         }
                     }
-                } else if b == ESCAPE_CHAR && at_line_start {
+                } else if b == ESCAPE_CHAR && (at_line_start || in_reconnect) {
                     escape_pending = true;
                 } else {
                     out.push(b);
@@ -580,6 +586,7 @@ async fn run_connection_loop(
         enable_raw_mode().unwrap();
         IN_RAW_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
         in_raw = true;
+        let _ = reconnect_mode_tx.send(false);
         let result = tokio::select! {
             r = run_session(
                 conn,
@@ -615,6 +622,7 @@ async fn run_connection_loop(
             }
             Err(e) => {
                 // Keep raw mode ON during reconnect so Ctrl-^ . fires immediately.
+                let _ = reconnect_mode_tx.send(true);
                 eprint!("\r\n[etr] Connection lost.\r\n");
                 if let Some(f) = LOG_FILE.get() {
                     let _ = writeln!(f.lock().unwrap(), "[etr] Connection lost.");
