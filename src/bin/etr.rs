@@ -524,9 +524,7 @@ async fn run_connection_loop(
             // Stay in raw mode if we were already in it so ~. is
             // recognised immediately (no trailing Enter required).
             if in_raw {
-                eprint!(
-                    "[etr] Reconnecting to {server_addr}...  (Enter ~. to force-quit)\r\n"
-                );
+                eprint!("[etr] Reconnecting to {server_addr}...  (Enter ~. to force-quit)\r\n");
             } else {
                 eprintln!("[etr] Reconnecting to {server_addr}...  (Enter ~. to force-quit)");
             }
