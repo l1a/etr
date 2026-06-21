@@ -207,6 +207,18 @@ Generate zsh completions:
 
     etr --completions zsh > ~/.zfunc/_etr
 
+# ESCAPE SEQUENCES
+
+While a session is active, **etr** recognises SSH-style escape sequences at
+the start of a line (after a newline or at session start):
+
+**~.**
+:   Force-disconnect and exit. Use this when the server is unreachable and
+    the normal reconnect loop is not making progress.
+
+**~~**
+:   Send a literal `~` to the remote shell.
+
 # EXIT STATUS
 
 **0**
