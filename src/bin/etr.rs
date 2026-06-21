@@ -468,15 +468,15 @@ async fn run_connection_loop(
             if n == 0 {
                 break;
             }
-            if verbose >= 3 {
-                if let Some(f) = LOG_FILE.get() {
-                    let hex: String = buf[..n]
-                        .iter()
-                        .map(|b| format!("{b:02x}"))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    let _ = writeln!(f.lock().unwrap(), "[etr] stdin raw bytes: {hex}");
-                }
+            if verbose >= 3
+                && let Some(f) = LOG_FILE.get()
+            {
+                let hex: String = buf[..n]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let _ = writeln!(f.lock().unwrap(), "[etr] stdin raw bytes: {hex}");
             }
             let mut out = Vec::with_capacity(n);
             for &b in &buf[..n] {
