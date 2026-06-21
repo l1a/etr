@@ -107,6 +107,21 @@ struct Cli {
     /// Generate shell completions for the specified shell
     #[arg(long, value_enum, value_name = "SHELL")]
     completions: Option<ShellChoice>,
+
+    /// Print a fully-commented default config to stdout
+    #[arg(long, help_heading = "Configuration")]
+    generate_config: bool,
+
+    /// Write the default config to PATH (default: ~/.config/etr/config.toml).
+    /// Creates parent directories as needed. Overwrites any existing file.
+    #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "",
+          help_heading = "Configuration")]
+    write_config: Option<String>,
+
+    /// Add any missing config options (as comments) to the existing config file.
+    /// Safe to re-run: already-present keys (active or commented) are never duplicated.
+    #[arg(long, help_heading = "Configuration")]
+    merge_config: bool,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy)]
@@ -145,6 +160,50 @@ async fn main() -> io::Result<()> {
             ShellChoice::Nushell => {
                 clap_complete::generate(Nushell, &mut cmd, "etr", &mut io::stdout())
             }
+        }
+        return Ok(());
+    }
+
+    if cli.generate_config {
+        print!("{}", etr::config::DEFAULT_CONFIG);
+        return Ok(());
+    }
+
+    if let Some(path_str) = &cli.write_config {
+        let path = if path_str.is_empty() {
+            etr::config::config_path()
+        } else {
+            std::path::PathBuf::from(path_str)
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, etr::config::DEFAULT_CONFIG)?;
+        println!("[etr] Wrote default config to {}", path.display());
+        return Ok(());
+    }
+
+    if cli.merge_config {
+        let path = etr::config::config_path();
+        if path.exists() {
+            let existing = std::fs::read_to_string(&path)?;
+            let (new_content, additions) = etr::config::merge_defaults(&existing);
+            if additions.is_empty() {
+                println!("[etr] Config already contains all known options.");
+            } else {
+                std::fs::write(&path, &new_content)?;
+                println!(
+                    "[etr] Added missing options ({}) to {}",
+                    additions.join(", "),
+                    path.display()
+                );
+            }
+        } else {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, etr::config::DEFAULT_CONFIG)?;
+            println!("[etr] Created config at {}", path.display());
         }
         return Ok(());
     }

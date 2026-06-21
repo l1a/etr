@@ -9,7 +9,17 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.4.12 — issue templates
+## Current state: v0.4.13 — config generation and merge
+
+New in v0.4.13:
+- `etr --generate-config`: prints a fully-commented default `config.toml` to stdout.
+- `etr --write-config [PATH]`: writes the default config to `~/.config/etr/config.toml` (or a custom path), creating parent directories as needed.
+- `etr --merge-config`: adds any missing config keys (as commented-out blocks) to the existing config file without touching keys already present. Idempotent. Missing keys are inserted inside their existing section header rather than appended with a duplicate header, so the result is always valid TOML.
+- `config.rs`: new `pub const DEFAULT_CONFIG`, `pub fn merge_defaults`, 10 new unit tests.
+- `Configuration` wiki page: rewritten to document every CLI flag and every config key with types, defaults, and examples.
+- Test count: 85 (up from 78).
+
+## Previous: v0.4.12 — issue templates
 
 New in v0.4.12:
 - Added `.github/ISSUE_TEMPLATE/bug_report.md` and `feature_request.md`, completing GitHub community standards.
