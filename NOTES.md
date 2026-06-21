@@ -271,7 +271,7 @@ just install-release  # copies target/release/{etr,etrs} to ~/.cargo/bin
 
 # Code quality gate — run before every commit
 just check            # cargo fmt --check + cargo clippy -D warnings
-just test             # cargo test (71 tests)
+just test             # cargo test (78 tests)
 ```
 
 ---
@@ -378,7 +378,7 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
 
 ---
 
-## Test coverage (71 tests)
+## Test coverage (78 tests)
 
 | Module | What's tested |
 |--------|--------------|
