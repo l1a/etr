@@ -9,15 +9,14 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.4.8 — remote environment variable forwarding
+## Current state: v0.4.9 — per-sender UDP routing
 
-New in v0.4.8:
-- `--env KEY=VALUE` (repeatable) sets arbitrary environment variables in the remote shell.
-  `--env KEY` (no `=`) forwards the variable from the local environment.
-  Config file equivalent: `[client] env = ["KEY=VALUE", "KEY2"]`.
-  Variables are sent over the SSH bootstrap channel and set before the shell starts,
-  so they are visible to `.zshrc`, `.zlogin`, and any login-time scripts.
-  Example: `etr --env ZELLIJ_AUTO_START=false remote` suppresses zellij auto-start.
+New in v0.4.9:
+- UDP forwarding (`-L` and `-R`) now correctly handles multiple concurrent senders.
+  Each unique source address gets its own ephemeral UDP socket on the forwarding side,
+  so replies are routed back to the correct sender regardless of interleaving order.
+  Idle sender sockets are evicted after 30 s.  Removes the last-sender-wins limitation
+  for concurrent DNS/STUN/game-protocol clients on the same forwarded port.
 
 ## Current state v0.4.7 — meaningful errors on server exit + hang/SIGTERM fixes
 
@@ -345,16 +344,8 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
   and do not show utmp-only sessions.  Non-Linux builds get no-op stubs.
 - ~~**Benchmarking**~~ **Done**: Criterion benchmark suite implemented in `benches/session_bench.rs` measuring certificate generation, QUIC connection handshake latency, PTY round-trip latency (100b), and throughput (64kb).
 - ~~**Mode 2 — `-R` remote forwarding**~~ **Done**: Both TCP and UDP remote port forwarding are supported using the `-R` CLI flag.
-- **Client-side environment variable forwarding**: `etr` has no equivalent of
-  `ssh SendEnv` / `AcceptEnv`.  The client should be able to pass a set of
-  `KEY=VALUE` pairs (via `-e KEY=VALUE` flags or a config `[forward_env]` list)
-  that `etrs` injects into the shell environment alongside `ETR_CONNECTION` and
-  `ETR_VERSION`.  Useful for propagating `COLORTERM`, locale variables, or
-  per-session overrides without editing the remote shell config.
-- **UDP reply routing**: current shared-socket design uses last-sender routing —
-  replies from the remote UDP target go to whichever local client sent the most recent
-  datagram.  Suitable for single-sender and sequential request/response (DNS, STUN);
-  not suitable for multiple concurrent UDP senders to the same forwarded port.
+- ~~**Client-side environment variable forwarding**~~ **Done**: `--env KEY=VALUE` (repeatable) sets arbitrary environment variables in the remote shell. `--env KEY` (no `=`) forwards from the local environment. Config file equivalent: `[client] env = ["KEY=VALUE", "KEY2"]`.
+- ~~**UDP reply routing**~~ **Done**: Each unique local UDP sender (`peer_addr:peer_port`) now gets its own ephemeral socket on the server (`-L`) and client (`-R`), so replies from the remote target are routed back to the correct sender regardless of interleaving. Idle sender sockets are evicted after 30 s. This removes the last-sender-wins limitation for concurrent DNS/STUN/game-protocol clients.
 - **Multiple simultaneous sessions**: each `etr` invocation starts its own `etrs`
   child; there is no way to list or re-attach to an existing session from a new client.
   Session state (ID + passkey) is in-memory only.
@@ -362,8 +353,6 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
   persisted anywhere, so a new machine cannot reconnect to an existing session.
 - **PQC key exchange**: ML-KEM was retired with the QUIC migration.  Can be re-added
   via `rustls-post-quantum` (X25519MLKEM768 hybrid) once it stabilises.
-- **Windows**: the PTY layer uses `portable-pty` (cross-platform) but has only been
-  tested on Linux and macOS.
 - **macOS**: fully tested and working.  PTY session, reconnect, and port forwarding
   all pass.  Test harness fixes applied: `ps -o ppid=` replaces Linux-only
   `/proc/$$/status`; reconnect test stops the etrs daemon (not the etr client)
