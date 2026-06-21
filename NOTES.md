@@ -9,12 +9,31 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.4.6 — login shell, ETR_CONNECTION, escape sequence, reconnect timeout
+## Current state: v0.4.7 — meaningful errors on server exit + hang/SIGTERM fixes
 
 The full round-trip works: `etr <host>` on the client, SSH bootstrap that starts
 `etrs` on the fly, QUIC connection with cert pinning, PTY session, keepalives,
 reconnecting after drops, `-L` local port forwarding, and `-R` remote port forwarding (both TCP and UDP).
 Tested on Linux and macOS (aarch64).  Published to crates.io; `cargo install etr` installs both binaries.
+
+New in v0.4.7:
+- When the server exits unexpectedly (crash, reboot), `etr` now prints `[etr] Connection lost.`
+  unconditionally (previously the message was only shown with `-v`).
+- The reconnect-in-progress message `[etr] Reconnecting to <addr>...  (Enter then Ctrl-^ . to force-quit)`
+  is now always visible, not hidden behind `-v`.
+- Bootstrap errors are printed as `[etr] <message>` instead of the cryptic Rust
+  `Error: Custom { kind: Other, error: "..." }` Debug format.
+- Internal error string "PTY stream closed" replaced with "server connection dropped" so that
+  the dropped-session reason shown at `-v` is user-facing.
+- **QUIC idle timeout (30 s) and keepalive (10 s)** added to both client and server transport
+  config.  Previously, if the server vanished (crash, reboot, network partition) the client
+  would hang indefinitely; now the connection is declared dead within 30 s and the client
+  moves to the reconnect loop automatically.
+- **`etrs` SIGTERM/SIGHUP during active session**: previously the server only checked for
+  signals while waiting for the next reconnect; if a signal arrived while a session was
+  active it was silently dropped and the server continued running.  Now a second signal
+  listener pair wraps `handle_connection` in a `tokio::select!` — the connection is closed
+  cleanly, utmp logout is recorded, and the server exits.
 
 New in v0.4.6:
 - `etrs` now spawns the shell as a proper login shell (argv[0]=`-zsh`) via

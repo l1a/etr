@@ -359,10 +359,19 @@ async fn run_session(
     // ── Reconnect loop ───────────────────────────────────────────────────────
     let reconnect_window = reconnect_timeout;
 
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .map_err(io::Error::other)?;
-    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-        .map_err(io::Error::other)?;
+    use tokio::signal::unix::SignalKind;
+
+    let mut sigterm =
+        tokio::signal::unix::signal(SignalKind::terminate()).map_err(io::Error::other)?;
+    let mut sighup = tokio::signal::unix::signal(SignalKind::hangup()).map_err(io::Error::other)?;
+    // A second pair of listeners that cover the window while handle_connection
+    // is running.  Tokio notifies every registered listener for a signal, so
+    // a single SIGTERM wakes both; whichever select is currently being polled
+    // will win.
+    let mut sigterm_conn =
+        tokio::signal::unix::signal(SignalKind::terminate()).map_err(io::Error::other)?;
+    let mut sighup_conn =
+        tokio::signal::unix::signal(SignalKind::hangup()).map_err(io::Error::other)?;
 
     loop {
         let mut shell_rx = shell_exit_rx.clone();
@@ -416,20 +425,37 @@ async fn run_session(
             }
         };
 
-        let clean = handle_connection(
-            conn,
-            session_id,
-            &passkey,
-            Arc::clone(&session_state),
-            Arc::clone(&outbound_pty_tx),
-            Arc::clone(&outbound_ctrl_tx),
-            pty_in_tx.clone(),
-            Arc::clone(&master),
-            master_fd,
-            Arc::clone(&active_conn),
-            Arc::clone(&active_reverse_listeners),
-        )
-        .await;
+        // Run handle_connection, but also watch for signals so that
+        // `pkill etrs` during an active session is handled promptly.
+        let conn_for_sig = conn.clone();
+        let (clean, signal_shutdown) = tokio::select! {
+            r = handle_connection(
+                conn,
+                session_id,
+                &passkey,
+                Arc::clone(&session_state),
+                Arc::clone(&outbound_pty_tx),
+                Arc::clone(&outbound_ctrl_tx),
+                pty_in_tx.clone(),
+                Arc::clone(&master),
+                master_fd,
+                Arc::clone(&active_conn),
+                Arc::clone(&active_reverse_listeners),
+            ) => (r, false),
+            _ = sigterm_conn.recv() => {
+                vlog!(1, "[etrs] SIGTERM during active session, closing connection");
+                conn_for_sig.close(quinn::VarInt::from_u32(0), b"server shutdown");
+                // Allow Quinn to flush the CONNECTION_CLOSE frame.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                (false, true)
+            }
+            _ = sighup_conn.recv() => {
+                vlog!(1, "[etrs] SIGHUP during active session, closing connection");
+                conn_for_sig.close(quinn::VarInt::from_u32(0), b"server shutdown");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                (false, true)
+            }
+        };
 
         *outbound_pty_tx.lock().unwrap() = None;
         *outbound_ctrl_tx.lock().unwrap() = None;
@@ -437,6 +463,15 @@ async fn run_session(
 
         if clean {
             vlog!(1, "[etrs] client disconnected cleanly, shutting down");
+            break;
+        }
+        if signal_shutdown {
+            vlog!(1, "[etrs] shutting down after signal");
+            if let Some(fd) = master_fd {
+                tokio::task::spawn_blocking(move || login::record_logout(fd))
+                    .await
+                    .ok();
+            }
             break;
         }
     }
