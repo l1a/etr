@@ -29,7 +29,7 @@ Tested on Linux and macOS (aarch64).  Published to crates.io; `cargo install etr
 New in v0.4.7:
 - When the server exits unexpectedly (crash, reboot), `etr` now prints `[etr] Connection lost.`
   unconditionally (previously the message was only shown with `-v`).
-- The reconnect-in-progress message `[etr] Reconnecting to <addr>...  (Enter then Ctrl-^ . to force-quit)`
+- The reconnect-in-progress message `[etr] Reconnecting to <addr>...  (Enter ~. to force-quit)`
   is now always visible, not hidden behind `-v`.
 - Bootstrap errors are printed as `[etr] <message>` instead of the cryptic Rust
   `Error: Custom { kind: Other, error: "..." }` Debug format.
@@ -49,7 +49,7 @@ New in v0.4.6:
 - `etrs` now spawns the shell as a proper login shell (argv[0]=`-zsh`) via
   `CommandBuilder::new_default_prog()`, so `.zprofile`/`.zlogin` are sourced, matching SSH.
 - `ETR_CONNECTION=1` and `ETR_VERSION` are set in the remote shell environment.
-- `etr` supports a `Ctrl-^ .` escape sequence to force-disconnect when the server is unresponsive.
+- `etr` supports a `~.` escape sequence (SSH-style, at line-start) to force-disconnect when the server is unresponsive.
 - Server reconnect timeout is configurable via `--reconnect-timeout`, `ETR_SERVER_NETWORK_TMOUT`
   env var, or `[server] reconnect_timeout` in the config file (default: 1800 s).
 

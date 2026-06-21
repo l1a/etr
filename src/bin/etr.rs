@@ -21,9 +21,10 @@ use etr::session::SessionState;
 static LOG_FILE: std::sync::OnceLock<std::sync::Mutex<std::fs::File>> = std::sync::OnceLock::new();
 static IN_RAW_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Escape character for the client: Ctrl-^ (0x1E).  Type it at the start of
-/// a line, followed by '.', to force-disconnect when the server is unreachable.
-const ESCAPE_CHAR: u8 = 0x1E;
+/// Escape character for the client: `~` (0x7E), SSH-style.  Type it at the
+/// start of a line followed by `.` to force-disconnect.  The line-start guard
+/// prevents false triggers from `~` in shell paths or git refs.
+const ESCAPE_CHAR: u8 = b'~';
 
 macro_rules! vlog {
     ($verbose:expr, $level:expr, $($arg:tt)*) => {
@@ -453,18 +454,29 @@ async fn run_connection_loop(
     let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>(1000);
     let stdin_rx = Arc::new(Mutex::new(stdin_rx));
 
-    // Ctrl-^ . triggers this to exit the reconnect loop.
+    // ~. triggers this to exit the reconnect loop.
     let (escape_tx, escape_rx) = tokio::sync::watch::channel(false);
 
     let _stdin_reader = tokio::task::spawn_blocking(move || {
         use std::io::Read;
         let mut buf = [0u8; 1024];
-        // Track position so Ctrl-^ is only recognised at the start of a line.
+        // `~` is common in shell input, so only recognise it at line-start
+        // (mirrors ssh ~. behaviour).
         let mut at_line_start = true;
         let mut escape_pending = false;
         while let Ok(n) = std::io::stdin().read(&mut buf) {
             if n == 0 {
                 break;
+            }
+            if verbose >= 3
+                && let Some(f) = LOG_FILE.get()
+            {
+                let hex: String = buf[..n]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let _ = writeln!(f.lock().unwrap(), "[etr] stdin raw bytes: {hex}");
             }
             let mut out = Vec::with_capacity(n);
             for &b in &buf[..n] {
@@ -472,12 +484,12 @@ async fn run_connection_loop(
                     escape_pending = false;
                     match b {
                         b'.' => {
-                            // Ctrl-^ . — signal force-disconnect and stop reading.
+                            // ~. — signal force-disconnect and stop reading.
                             let _ = escape_tx.send(true);
                             return;
                         }
                         b if b == ESCAPE_CHAR => {
-                            // Ctrl-^ Ctrl-^ — send a literal Ctrl-^.
+                            // ~~ — send a literal ~.
                             out.push(ESCAPE_CHAR);
                             at_line_start = false;
                         }
@@ -509,14 +521,12 @@ async fn run_connection_loop(
 
     'reconnect: loop {
         if !first {
-            // Stay in raw mode if we were already in it so Ctrl-^ . is
+            // Stay in raw mode if we were already in it so ~. is
             // recognised immediately (no trailing Enter required).
             if in_raw {
-                eprint!(
-                    "[etr] Reconnecting to {server_addr}...  (Enter Ctrl-^ . to force-quit)\r\n"
-                );
+                eprint!("[etr] Reconnecting to {server_addr}...  (Enter ~. to force-quit)\r\n");
             } else {
-                eprintln!("[etr] Reconnecting to {server_addr}...  (Enter Ctrl-^ . to force-quit)");
+                eprintln!("[etr] Reconnecting to {server_addr}...  (Enter ~. to force-quit)");
             }
             vlog!(verbose, 2, "[etr] Reconnect delay 2s");
             tokio::select! {
@@ -525,9 +535,9 @@ async fn run_connection_loop(
                     if in_raw {
                         IN_RAW_MODE.store(false, std::sync::atomic::Ordering::Relaxed);
                         let _ = disable_raw_mode();
-                        eprint!("\r\n[etr] Disconnected (Ctrl-^ .).\r\n");
+                        eprint!("\r\n[etr] Disconnected (~.).\r\n");
                     } else {
-                        eprintln!("[etr] Disconnected (Ctrl-^ .).");
+                        eprintln!("[etr] Disconnected (~.).");
                     }
                     return Ok(());
                 }
@@ -549,7 +559,7 @@ async fn run_connection_loop(
                 continue 'reconnect;
             }
         };
-        // Also poll escape here so Ctrl-^ . is responsive during the connect wait.
+        // Also poll escape here so ~. is responsive during the connect wait.
         let conn = tokio::select! {
             r = tokio::time::timeout(Duration::from_secs(15), connecting) => match r {
                 Ok(Ok(c)) => c,
@@ -566,9 +576,9 @@ async fn run_connection_loop(
                 if in_raw {
                     IN_RAW_MODE.store(false, std::sync::atomic::Ordering::Relaxed);
                     let _ = disable_raw_mode();
-                    eprint!("\r\n[etr] Disconnected (Ctrl-^ .).\r\n");
+                    eprint!("\r\n[etr] Disconnected (~.).\r\n");
                 } else {
-                    eprintln!("[etr] Disconnected (Ctrl-^ .).");
+                    eprintln!("[etr] Disconnected (~.).");
                 }
                 return Ok(());
             }
@@ -595,7 +605,7 @@ async fn run_connection_loop(
             Ok(_) = escape_rx.wait_for(|&v| v) => {
                 IN_RAW_MODE.store(false, std::sync::atomic::Ordering::Relaxed);
                 let _ = disable_raw_mode();
-                eprint!("\r\n[etr] Disconnected (Ctrl-^ .).\r\n");
+                eprint!("\r\n[etr] Disconnected (~.).\r\n");
                 std::process::exit(0);
             }
         };
@@ -614,7 +624,7 @@ async fn run_connection_loop(
                 std::process::exit(0);
             }
             Err(e) => {
-                // Keep raw mode ON during reconnect so Ctrl-^ . fires immediately.
+                // Keep raw mode ON during reconnect so ~. fires immediately.
                 eprint!("\r\n[etr] Connection lost.\r\n");
                 if let Some(f) = LOG_FILE.get() {
                     let _ = writeln!(f.lock().unwrap(), "[etr] Connection lost.");
@@ -683,7 +693,7 @@ async fn run_session(
     vlog!(
         verbose,
         1,
-        "\r\n[etr] Connected. Session active.  (Escape: Ctrl-^ then . to disconnect)"
+        "\r\n[etr] Connected. Session active.  (Escape: ~. to disconnect)"
     );
 
     // Trim send history using server's ack map.
@@ -1403,8 +1413,8 @@ mod tests {
 
     #[test]
     fn test_escape_char_value() {
-        // Ctrl-^ is 0x1E; verify the constant matches mosh's escape convention.
-        assert_eq!(ESCAPE_CHAR, 0x1E);
+        // SSH-style tilde escape; verify the constant is `~`.
+        assert_eq!(ESCAPE_CHAR, b'~');
     }
 
     #[test]
