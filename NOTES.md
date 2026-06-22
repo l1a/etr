@@ -9,7 +9,14 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.4.20 — patch quinn-proto memory exhaustion vuln
+## Current state: v0.4.21 — vibe-coded disclosure in README
+
+New in v0.4.21:
+- Added a "Vibe coded" section to README.md disclosing that the project is
+  entirely AI-generated (Claude and Gemini) and welcoming real programmers
+  to review and contribute.
+
+## Previous: v0.4.20 — patch quinn-proto memory exhaustion vuln
 
 New in v0.4.20:
 - `quinn` 0.11.9→0.11.11, `quinn-proto` 0.11.14→0.11.15: fixes
