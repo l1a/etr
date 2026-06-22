@@ -319,7 +319,9 @@ async fn main() -> io::Result<()> {
         })
         .collect();
 
-    // Automatically forward locale variables (mirrors SSH's SendEnv LANG LC_*).
+    // Automatically forward terminal/locale variables (mirrors SSH's SendEnv LANG LC_*).
+    // COLORTERM and TERM_PROGRAM let TUI programs (btop, delta, fzf, …) pick the
+    // right color depth; LANG/LC_* supply the locale.
     // Prepend so explicit --env entries take precedence.
     let locale_keys = [
         "LANG",
@@ -330,6 +332,9 @@ async fn main() -> io::Result<()> {
         "LC_MONETARY",
         "LC_NUMERIC",
         "LC_TIME",
+        "COLORTERM",
+        "TERM_PROGRAM",
+        "TERM_PROGRAM_VERSION",
     ];
     let mut locale_prefix: Vec<String> = locale_keys
         .iter()
