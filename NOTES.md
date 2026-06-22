@@ -20,6 +20,13 @@ New in v0.4.22:
   exits.  Example: `etr host 'distrobox -- btop'`.
 - Bootstrap protocol: client writes `ETRCMD:<command>` as an extra line after
   env vars; old servers ignore it (no `=` → silently skipped).
+- **Bug fixes** (same version, follow-up commit):
+  - `etrs`: use `$SHELL -c` instead of `sh -c` so the command runs with the
+    user's PATH — fixes commands only available via `~/.local/bin` (e.g. distrobox).
+  - `etr`: don't enter the reconnect loop when running a remote command; exit
+    with a clear error instead. Prevents the raw-mode hang where the server exits
+    (command not found or immediate exit) before the client connects, leaving etr
+    stuck in raw mode with Ctrl-C disabled.
 - `just e2e-cmd-local`: end-to-end test — runs a sentinel-echo command through
   a live session, checks the output appears, and verifies etr exits cleanly
   when the command finishes.

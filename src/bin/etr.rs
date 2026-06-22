@@ -371,6 +371,7 @@ async fn main() -> io::Result<()> {
         forward_specs,
         reverse_forward_specs,
         gateway_ports,
+        !remote_command.is_empty(),
         cli.verbose,
     )
     .await
@@ -497,6 +498,7 @@ async fn run_connection_loop(
     forward_specs: Vec<ForwardSpec>,
     reverse_forward_specs: Vec<String>,
     gateway_ports: bool,
+    has_remote_command: bool,
     verbose: u8,
 ) -> io::Result<()> {
     let host = if let Some(idx) = target.find('@') {
@@ -632,6 +634,10 @@ async fn run_connection_loop(
             Ok(c) => c,
             Err(e) => {
                 vlog!(verbose, 1, "[etr] Connect error: {e}");
+                if has_remote_command {
+                    eprintln!("[etr] Failed to connect: {e}");
+                    std::process::exit(1);
+                }
                 continue 'reconnect;
             }
         };
@@ -641,10 +647,18 @@ async fn run_connection_loop(
                 Ok(Ok(c)) => c,
                 Ok(Err(e)) => {
                     vlog!(verbose, 1, "[etr] QUIC handshake failed: {e}");
+                    if has_remote_command {
+                        eprintln!("[etr] Failed to connect: {e}");
+                        std::process::exit(1);
+                    }
                     continue 'reconnect;
                 }
                 Err(_) => {
                     vlog!(verbose, 1, "[etr] QUIC connect timed out");
+                    if has_remote_command {
+                        eprintln!("[etr] Connection timed out.");
+                        std::process::exit(1);
+                    }
                     continue 'reconnect;
                 }
             },
@@ -700,6 +714,15 @@ async fn run_connection_loop(
                 std::process::exit(0);
             }
             Err(e) => {
+                // For remote commands: exit rather than reconnect.  The command
+                // has finished (or the server is gone), so there is nothing to
+                // reconnect to.  Restore the terminal before printing.
+                if has_remote_command {
+                    IN_RAW_MODE.store(false, std::sync::atomic::Ordering::Relaxed);
+                    let _ = disable_raw_mode();
+                    eprintln!("\n[etr] Session ended: {e}");
+                    std::process::exit(1);
+                }
                 // Keep raw mode ON during reconnect so ~. fires immediately.
                 eprint!("\r\n[etr] Connection lost.\r\n");
                 if let Some(f) = LOG_FILE.get() {

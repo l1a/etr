@@ -289,11 +289,13 @@ async fn run_session(
         })
         .map_err(io::Error::other)?;
 
-    // With a remote command, run it via `sh -c` under the PTY so shell
-    // metacharacters (pipes, redirects) work.  Without one, start the user's
-    // default login shell (argv[0]="-zsh" sentinel via new_default_prog()).
+    // With a remote command, run it via the user's shell (from $SHELL, same as
+    // SSH does) so the PATH and environment match what the user expects.
+    // Falls back to /bin/sh if $SHELL is unset.  Without a command, start the
+    // user's default login shell (argv[0]="-zsh" sentinel via new_default_prog()).
     let mut cmd = if let Some(ref rcmd) = remote_command {
-        let mut c = CommandBuilder::new("sh");
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let mut c = CommandBuilder::new(&shell);
         c.arg("-c");
         c.arg(rcmd);
         c
