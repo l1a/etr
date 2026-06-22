@@ -9,9 +9,13 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.4.20 — improve docs and test coverage
+## Current state: v0.4.19 — bump major deps; improve docs and test coverage
 
-New in v0.4.20:
+New in v0.4.19:
+- `rand` 0.8→0.9: updated call sites in `src/bin/etr.rs` — `thread_rng()` → `rng()`,
+  `Rng::gen()` → `rand::random()`, `distributions::Alphanumeric` → `distr::Alphanumeric`.
+- `criterion` 0.5→0.8: no code changes required; bench suite passes.
+- `clap_complete_nushell` 0.1→4.6: no code changes required.
 - Added `///` doc comments to `Config` struct, `config_path()`, `StreamOpen.stream_id`,
   `StreamOpen.stream_type`, and the `Payload` enum.
 - `login.rs`: added 3 tests (record_login/record_logout with invalid fd — no-panic check).
@@ -21,14 +25,6 @@ New in v0.4.20:
 - `forward.rs`: added 6 `split_ignoring_brackets` edge-case tests (IPv6 host, bind+IPv6,
   no colon, empty, trailing colon).
 - Test count: 78 → 98.
-
-## Previous: v0.4.19 — bump rand, criterion, clap_complete_nushell
-
-New in v0.4.19:
-- `rand` 0.8→0.9: updated call sites in `src/bin/etr.rs` — `thread_rng()` → `rng()`,
-  `Rng::gen()` → `rand::random()`, `distributions::Alphanumeric` → `distr::Alphanumeric`.
-- `criterion` 0.5→0.8: no code changes required; bench suite passes.
-- `clap_complete_nushell` 0.1→4.6: no code changes required.
 
 ## Previous: v0.4.18 — fix stress-local pump connect race
 

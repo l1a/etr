@@ -585,7 +585,7 @@ dependencies = [
 
 [[package]]
 name = "etr"
-version = "0.4.20"
+version = "0.4.19"
 dependencies = [
  "clap",
  "clap_complete",
