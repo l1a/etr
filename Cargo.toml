@@ -1,6 +1,6 @@
 [package]
 name = "etr"
-version = "0.4.15"
+version = "0.4.16"
 edition = "2024"
 description = "A Rust implementation of Eternal Terminal (et)"
 license = "GPL-3.0-only"
@@ -25,13 +25,13 @@ clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
 clap_complete_nushell = "0.1"
 portable-pty = "0.9"
-prost = "0.13"
+prost = "0.14"
 quinn = "0.11"
 rcgen = "0.14"
 rustls = "0.23"
 rand = "0.8"
-crossterm = "0.27"
-nix = { version = "0.29", features = ["fs", "term", "process", "signal"] }
+crossterm = "0.29"
+nix = { version = "0.31", features = ["fs", "term", "process", "signal"] }
 dirs = "5"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
