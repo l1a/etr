@@ -9,7 +9,15 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.4.14 — install-completions just recipe
+## Current state: v0.4.15 — prune old GitHub releases
+
+New in v0.4.15:
+- Release workflow now prunes releases beyond the 20 most recent after each publish.
+  Uses `gh release list --limit 1000 | .[20:]` piped to `gh release delete --cleanup-tag`
+  in a `prune` job that runs after the `release` job. No new permissions needed —
+  `contents: write` was already set at the workflow level.
+
+## Previous: v0.4.14 — install-completions just recipe
 
 New in v0.4.14:
 - `just install-completions`: generates and installs shell completions for `etr` and `etrs`
@@ -393,11 +401,6 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
 - ~~**UDP reply routing**~~ **Done**: Each unique local UDP sender (`peer_addr:peer_port`) now gets its own ephemeral socket on the server (`-L`) and client (`-R`), so replies from the remote target are routed back to the correct sender regardless of interleaving. Idle sender sockets are evicted after 30 s. This removes the last-sender-wins limitation for concurrent DNS/STUN/game-protocol clients.
 - ~~**`--env` e2e test**~~ **Done**: `just e2e-env-local` tests both `--env KEY=VALUE` (explicit set) and `--env KEY` (bare forward from local env) end-to-end through a live `etr localhost` session.
 - ~~**Concurrent UDP senders regression test**~~ **Done**: `just e2e-udp-concurrent` sends interleaved datagrams from two independent sockets through `-L` UDP forwarding and asserts each socket receives its own reply. Regression coverage for the v0.4.9 per-sender routing fix.
-- **Multiple simultaneous sessions**: each `etr` invocation starts its own `etrs`
-  child; there is no way to list or re-attach to an existing session from a new client.
-  Session state (ID + passkey) is in-memory only.
-- **Re-attach from a new client machine**: the `session_id` and `passkey` are not
-  persisted anywhere, so a new machine cannot reconnect to an existing session.
 - **PQC key exchange**: ML-KEM was retired with the QUIC migration.  Can be re-added
   via `rustls-post-quantum` (X25519MLKEM768 hybrid) once it stabilises.
 - **macOS**: fully tested and working.  PTY session, reconnect, and port forwarding
@@ -422,7 +425,7 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
   more syscalls, not fewer copies, determines throughput here.
   UDP (~9 Mb/s) is still limited by per-datagram protobuf encoding overhead.
 - ~~**UDP forward target resolution should prefer IPv6 when genuinely available**~~ **Done**: `etr::forward::resolve_udp_target` (new helper in `src/forward.rs`) resolves the target, tries IPv6 candidates first, and probes routing via a no-packet UDP `connect()` call.  The first address whose routing probe succeeds is used.  Falls back to IPv4 if no IPv6 route exists.  The stress-tool UDP echo server now also binds `[::1]:port` alongside `0.0.0.0:port` so both families reach it in tests.
-- **GitHub release retention**: the release workflow should automatically delete releases beyond the 20 most recent, keeping the list from growing indefinitely.
+- ~~**GitHub release retention**~~ **Done**: the release workflow's `prune` job deletes releases beyond the 20 most recent after each publish, using `gh release delete --cleanup-tag`.
 
 ---
 
