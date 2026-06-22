@@ -38,16 +38,23 @@ fn main() {
     }
     let port: u16 = args[2].parse().expect("invalid port");
 
-    // Install SIGTERM handler for pump subcommands.
-    unsafe {
-        libc::signal(libc::SIGTERM, on_sigterm as *const () as libc::sighandler_t);
-    }
-
     match args[1].as_str() {
         "tcp-echo" => tcp_echo(port),
         "udp-echo" => udp_echo(port),
-        "tcp-pump" => tcp_pump(port),
-        "udp-pump" => udp_pump(port),
+        "tcp-pump" => {
+            // Install SIGTERM handler so the pump can print stats before exiting.
+            // Echo servers use the default SIGTERM handler (immediate termination).
+            unsafe {
+                libc::signal(libc::SIGTERM, on_sigterm as *const () as libc::sighandler_t);
+            }
+            tcp_pump(port)
+        }
+        "udp-pump" => {
+            unsafe {
+                libc::signal(libc::SIGTERM, on_sigterm as *const () as libc::sighandler_t);
+            }
+            udp_pump(port)
+        }
         other => {
             eprintln!("Unknown command: {other}");
             std::process::exit(1);

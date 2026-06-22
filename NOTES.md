@@ -19,6 +19,12 @@ New in v0.4.18:
 - `tcp_connect_with_retry` in the stress tool no longer panics on timeout; it prints
   `TCP sent=0 recv=0 elapsed=0.001` to stdout so the output file is never empty and
   the failure is visible in the throughput report rather than silently absent.
+- Fixed stress_tool echo servers surviving SIGTERM: the custom SIGTERM handler (which
+  sets STOP=true instead of terminating) was installed for all subcommands. Echo servers
+  never check STOP so they ran indefinitely, causing "Address already in use" on the
+  next run. The handler is now only installed for pump subcommands; echo servers use
+  the default SIGTERM behaviour (immediate termination). Added `pkill -x stress_tool`
+  to both the cleanup trap and the pre-run stale-process sweep.
 
 ## Previous: v0.4.17 — bump dirs and toml
 - Bumped `dirs` 5→6, `toml` 0.8→1. No code changes required; both APIs were compatible.

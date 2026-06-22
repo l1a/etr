@@ -865,11 +865,17 @@ stress-local: check-tools install build-stress
         echo "--- cleanup ---"
         kill "$TCP_ECHO_PID" "$UDP_ECHO_PID" "$TCP_PUMP_PID" "$UDP_PUMP_PID" \
              "$TCP_R_ECHO_PID" "$UDP_R_ECHO_PID" "$TCP_R_PUMP_PID" "$UDP_R_PUMP_PID" 2>/dev/null || true
+        pkill -x stress_tool 2>/dev/null || true
         tmux kill-session -t "$STRESS_SESS" 2>/dev/null || true
         pkill -x etrs 2>/dev/null || true
         rm -f "$TCP_PUMP_OUT" "$UDP_PUMP_OUT" "$TCP_R_PUMP_OUT" "$UDP_R_PUMP_OUT"
     }
     trap cleanup EXIT
+
+    # Kill any stress_tool processes left over from a previous crashed run so
+    # their ports are free before we try to bind them.
+    pkill -x stress_tool 2>/dev/null || true
+    sleep 0.3
 
     mkdir -p "$(dirname "{{LOG_FILE}}")"
 
