@@ -54,3 +54,27 @@ mod imp {
 }
 
 pub use imp::{record_login, record_logout};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // On Linux these call through to libutempter with an invalid fd; utempter
+    // forks a helper that fails internally and returns an error code we ignore,
+    // so both calls must complete without panicking.
+    // On non-Linux the stubs are no-ops that trivially pass.
+    #[test]
+    fn test_record_login_invalid_fd_does_not_panic() {
+        record_login(-1, "127.0.0.1");
+    }
+
+    #[test]
+    fn test_record_logout_invalid_fd_does_not_panic() {
+        record_logout(-1);
+    }
+
+    #[test]
+    fn test_record_login_empty_addr_does_not_panic() {
+        record_login(-1, "");
+    }
+}

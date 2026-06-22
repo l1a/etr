@@ -275,4 +275,102 @@ mod tests {
         assert_eq!(seq, 42);
         assert_eq!(&data, b"hello pty");
     }
+
+    #[tokio::test]
+    async fn test_read_tag_round_trip() {
+        let (server_ep, client_ep) = make_endpoints();
+        let server_addr = server_ep.local_addr().unwrap();
+
+        let srv_task = tokio::spawn(async move {
+            let conn = server_ep
+                .accept()
+                .await
+                .unwrap()
+                .accept()
+                .unwrap()
+                .await
+                .unwrap();
+            let (_, mut recv) = conn.accept_bi().await.unwrap();
+            read_tag(&mut recv).await.unwrap()
+        });
+
+        let conn = client_ep
+            .connect(server_addr, "etr")
+            .unwrap()
+            .await
+            .unwrap();
+        let (mut send, _) = conn.open_bi().await.unwrap();
+        send.write_all(&[TAG_FORWARD]).await.unwrap();
+        let tag = srv_task.await.unwrap();
+        assert_eq!(tag, TAG_FORWARD);
+    }
+
+    #[tokio::test]
+    async fn test_read_msg_rejects_oversized_message() {
+        let (server_ep, client_ep) = make_endpoints();
+        let server_addr = server_ep.local_addr().unwrap();
+
+        let srv_task = tokio::spawn(async move {
+            let conn = server_ep
+                .accept()
+                .await
+                .unwrap()
+                .accept()
+                .unwrap()
+                .await
+                .unwrap();
+            let (_, mut recv) = conn.accept_bi().await.unwrap();
+            read_msg(&mut recv).await
+        });
+
+        let conn = client_ep
+            .connect(server_addr, "etr")
+            .unwrap()
+            .await
+            .unwrap();
+        let (mut send, _) = conn.open_bi().await.unwrap();
+        // Send a length prefix of 4 MB + 1 byte — just over the limit.
+        let oversized_len: u32 = 4 * 1024 * 1024 + 1;
+        send.write_all(&oversized_len.to_be_bytes()).await.unwrap();
+
+        let result = srv_task.await.unwrap();
+        assert!(result.is_err(), "expected error for oversized message");
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn test_read_pty_chunk_rejects_oversized_chunk() {
+        let (server_ep, client_ep) = make_endpoints();
+        let server_addr = server_ep.local_addr().unwrap();
+
+        let srv_task = tokio::spawn(async move {
+            let conn = server_ep
+                .accept()
+                .await
+                .unwrap()
+                .accept()
+                .unwrap()
+                .await
+                .unwrap();
+            let (_, mut recv) = conn.accept_bi().await.unwrap();
+            read_pty_chunk(&mut recv).await
+        });
+
+        let conn = client_ep
+            .connect(server_addr, "etr")
+            .unwrap()
+            .await
+            .unwrap();
+        let (mut send, _) = conn.open_bi().await.unwrap();
+        // Header: seq=1, len=1 MB + 1 — just over the PTY chunk limit.
+        let mut hdr = [0u8; 12];
+        hdr[..8].copy_from_slice(&1u64.to_be_bytes());
+        let oversized_len: u32 = 1024 * 1024 + 1;
+        hdr[8..12].copy_from_slice(&oversized_len.to_be_bytes());
+        send.write_all(&hdr).await.unwrap();
+
+        let result = srv_task.await.unwrap();
+        assert!(result.is_err(), "expected error for oversized PTY chunk");
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
 }

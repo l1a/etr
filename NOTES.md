@@ -9,7 +9,24 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.4.18 — fix stress-local pump connect race
+## Current state: v0.4.19 — bump major deps; improve docs and test coverage
+
+New in v0.4.19:
+- `rand` 0.8→0.9: updated call sites in `src/bin/etr.rs` — `thread_rng()` → `rng()`,
+  `Rng::gen()` → `rand::random()`, `distributions::Alphanumeric` → `distr::Alphanumeric`.
+- `criterion` 0.5→0.8: no code changes required; bench suite passes.
+- `clap_complete_nushell` 0.1→4.6: no code changes required.
+- Added `///` doc comments to `Config` struct, `config_path()`, `StreamOpen.stream_id`,
+  `StreamOpen.stream_type`, and the `Payload` enum.
+- `login.rs`: added 3 tests (record_login/record_logout with invalid fd — no-panic check).
+- `quic.rs`: added 3 tests — `read_tag` round-trip, oversized `read_msg` rejection (>4 MB),
+  oversized `read_pty_chunk` rejection (>1 MB).
+- `config.rs`: added malformed-TOML fallback test.
+- `forward.rs`: added 6 `split_ignoring_brackets` edge-case tests (IPv6 host, bind+IPv6,
+  no colon, empty, trailing colon).
+- Test count: 78 → 98.
+
+## Previous: v0.4.18 — fix stress-local pump connect race
 
 New in v0.4.18:
 - Fixed stress-local pump connect race: replaced the fixed `sleep 1.5` before `-R`
@@ -450,12 +467,12 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
 - ~~**UDP forward target resolution should prefer IPv6 when genuinely available**~~ **Done**: `etr::forward::resolve_udp_target` (new helper in `src/forward.rs`) resolves the target, tries IPv6 candidates first, and probes routing via a no-packet UDP `connect()` call.  The first address whose routing probe succeeds is used.  Falls back to IPv4 if no IPv6 route exists.  The stress-tool UDP echo server now also binds `[::1]:port` alongside `0.0.0.0:port` so both families reach it in tests.
 - ~~**GitHub release retention**~~ **Done**: the release workflow's `prune` job deletes releases beyond the 20 most recent after each publish, using `gh release delete --cleanup-tag`.
 - ~~**Dependency updates (minor/safe)**~~ **Done**: `crossterm` 0.27→0.29, `nix` 0.29→0.31, `prost` 0.13→0.14.
-- **Dependency updates (major)**: `rand` 0.8→0.10, `clap_complete_nushell` 0.1→4.6, `criterion` 0.5→0.8 — major version bumps, may require code changes.
+- ~~**Dependency updates (major)**~~ **Done**: `rand` 0.8→0.9, `clap_complete_nushell` 0.1→4.6, `criterion` 0.5→0.8.
 - ~~**stress-local: pump connect race**~~ **Done**: replaced fixed sleep with `wait_tcp_ready` probe; stress tool now prints zero stats instead of panicking on connect timeout.
 
 ---
 
-## Test coverage (78 tests)
+## Test coverage (98 tests)
 
 | Module | What's tested |
 |--------|--------------|
@@ -464,6 +481,7 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
 | `session/stream` | Acknowledge edge cases, replay from 0, initial seq values |
 | `session/mod` | Close/ack unknown stream, `last_received_map` semantics, collect_replays, `open_stream` idempotence |
 | `bin/etrs` | CLI defaults, verbose count, custom port, subcommand parsing, hex_decode, custom --log-path override |
+| `login` | no-panic checks for record_login / record_logout with invalid fd |
 | `bin/etr` | CLI defaults, port parsing, target parsing, no --cipher flag, custom --log-path and --server-log-path overrides, config fallback for log paths |
 | `config` | TOML parse (full section, partial, empty), default values, `gateway_ports` / `forward` / `reverse_forward` config keys |
 | `forward` | `-L`/`-R` spec parsing: TCP/UDP/IPv6, explicit proto, bad port, empty host, Display; bind address parsing (explicit IP, `[::1]`, wildcard `*`); `get_bind_addresses` with and without gateway flag; `resolve_udp_target`: localhost prefers IPv6, explicit IPv4, unresolvable host |

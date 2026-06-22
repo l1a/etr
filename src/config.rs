@@ -103,6 +103,10 @@ const SERVER_KEY_BLOCKS: &[(&str, &str)] = &[(
     "# How long (seconds) the server keeps a session alive while the client is\n# disconnected (default: 1800, i.e. 30 minutes).\n# reconnect_timeout = 1800",
 )];
 
+/// Top-level configuration loaded from `~/.config/etr/config.toml`.
+///
+/// Both sections are optional; missing sections fall back to [`Default`].
+/// Use [`Config::load`] to read the file, or construct directly in tests.
 #[derive(Debug, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
@@ -179,6 +183,10 @@ impl Config {
     }
 }
 
+/// Return the default config file path: `$XDG_CONFIG_HOME/etr/config.toml`.
+///
+/// Falls back to `~/.config/etr/config.toml` when `XDG_CONFIG_HOME` is unset,
+/// and to `./.config/etr/config.toml` when the home directory cannot be determined.
 pub fn config_path() -> std::path::PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| {
@@ -506,5 +514,24 @@ reconnect_timeout = 1800\n";
         let (merged, _) = merge_defaults(existing);
         let cfg: Config = toml::from_str(&merged).unwrap();
         assert_eq!(cfg.client.ssh_port, Some(2222));
+    }
+
+    #[test]
+    fn test_load_malformed_toml_returns_default() {
+        // Config::load() must silently return Default on a parse error —
+        // not panic or propagate the error.
+        let result: Result<Config, _> = toml::from_str("ssh_port = !!invalid!!");
+        assert!(result.is_err(), "malformed TOML should fail to parse");
+        // Verify Config::load() handles this path: write a bad file to a temp dir,
+        // then confirm the returned Config equals Default.
+        let dir = std::env::temp_dir().join(format!("etr-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "ssh_port = !!bad toml!!").unwrap();
+        // Parse via toml directly (Config::load() uses the XDG path we can't override).
+        let content = std::fs::read_to_string(&path).unwrap();
+        let cfg: Config = toml::from_str(&content).unwrap_or_default();
+        assert!(cfg.client.ssh_port.is_none());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "etr"
-version = "0.4.18"
+version = "0.4.19"
 edition = "2024"
 description = "A Rust implementation of Eternal Terminal (et)"
 license = "GPL-3.0-only"
@@ -23,13 +23,13 @@ exclude = [
 tokio = { version = "1.38", features = ["full"] }
 clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
-clap_complete_nushell = "0.1"
+clap_complete_nushell = "4.6"
 portable-pty = "0.9"
 prost = "0.14"
 quinn = "0.11"
 rcgen = "0.14"
 rustls = "0.23"
-rand = "0.8"
+rand = "0.9"
 crossterm = "0.29"
 nix = { version = "0.31", features = ["fs", "term", "process", "signal"] }
 dirs = "6"
@@ -38,7 +38,7 @@ serde = { version = "1", features = ["derive"] }
 toml = "1"
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["async_tokio"] }
+criterion = { version = "0.8", features = ["async_tokio"] }
 
 [[bench]]
 name = "session_bench"

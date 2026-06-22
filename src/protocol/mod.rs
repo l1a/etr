@@ -70,8 +70,10 @@ pub struct SessionAccept {
 /// describing the remote target to connect to.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct StreamOpen {
+    /// Client-assigned stream identifier for correlating with [`StreamClose`].
     #[prost(uint32, tag = "1")]
     pub stream_id: u32,
+    /// Whether this stream carries terminal I/O or a port-forward connection.
     #[prost(enumeration = "StreamType", tag = "2")]
     pub stream_type: i32,
     /// Remote host the server should connect to.
@@ -139,6 +141,10 @@ pub struct Envelope {
     pub payload: Option<Payload>,
 }
 
+/// Discriminated union of all message types that travel inside an [`Envelope`].
+///
+/// Each variant corresponds to one logical operation on the control stream.
+/// The integer tags are stable protobuf field numbers — do not renumber them.
 #[derive(Clone, PartialEq, prost::Oneof)]
 pub enum Payload {
     #[prost(message, tag = "3")]

@@ -351,4 +351,39 @@ mod tests {
         let addr = super::resolve_udp_target("this.hostname.does.not.exist.invalid:53").await;
         assert!(addr.is_none(), "unresolvable host must return None");
     }
+
+    #[test]
+    fn test_split_ignoring_brackets_plain() {
+        assert_eq!(split_ignoring_brackets("a:b:c"), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_split_ignoring_brackets_ipv6_host() {
+        // Colons inside brackets must not be treated as separators.
+        let parts = split_ignoring_brackets("8080:[::1]:80");
+        assert_eq!(parts, vec!["8080", "[::1]", "80"]);
+    }
+
+    #[test]
+    fn test_split_ignoring_brackets_bind_and_ipv6() {
+        let parts = split_ignoring_brackets("[::1]:9090:[::1]:80");
+        assert_eq!(parts, vec!["[::1]", "9090", "[::1]", "80"]);
+    }
+
+    #[test]
+    fn test_split_ignoring_brackets_no_colon() {
+        assert_eq!(split_ignoring_brackets("8080"), vec!["8080"]);
+    }
+
+    #[test]
+    fn test_split_ignoring_brackets_empty() {
+        assert_eq!(split_ignoring_brackets(""), vec![""]);
+    }
+
+    #[test]
+    fn test_split_ignoring_brackets_trailing_colon() {
+        // A trailing colon produces an empty final segment.
+        let parts = split_ignoring_brackets("a:b:");
+        assert_eq!(parts, vec!["a", "b", ""]);
+    }
 }
