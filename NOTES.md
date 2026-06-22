@@ -436,6 +436,7 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
 - ~~**GitHub release retention**~~ **Done**: the release workflow's `prune` job deletes releases beyond the 20 most recent after each publish, using `gh release delete --cleanup-tag`.
 - ~~**Dependency updates (minor/safe)**~~ **Done**: `crossterm` 0.27→0.29, `nix` 0.29→0.31, `prost` 0.13→0.14.
 - **Dependency updates (major)**: `rand` 0.8→0.10, `clap_complete_nushell` 0.1→4.6, `criterion` 0.5→0.8 — major version bumps, may require code changes.
+- **stress-local: pump connect race**: on slower machines the `-R` forward listeners may not be ready by the time the pumps start, causing all four pumps to time out and report "no stats available". Need a readiness probe before starting pumps.
 
 ---
 
