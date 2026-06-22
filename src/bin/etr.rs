@@ -382,14 +382,13 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 }
 
 fn generate_session_id() -> [u8; 16] {
-    use rand::Rng;
-    rand::thread_rng().r#gen()
+    rand::random()
 }
 
 fn generate_passkey() -> String {
     use rand::Rng;
-    rand::thread_rng()
-        .sample_iter(&rand::distributions::Alphanumeric)
+    rand::rng()
+        .sample_iter(rand::distr::Alphanumeric)
         .take(32)
         .map(char::from)
         .collect()
