@@ -354,10 +354,7 @@ mod tests {
 
     #[test]
     fn test_split_ignoring_brackets_plain() {
-        assert_eq!(
-            split_ignoring_brackets("a:b:c"),
-            vec!["a", "b", "c"]
-        );
+        assert_eq!(split_ignoring_brackets("a:b:c"), vec!["a", "b", "c"]);
     }
 
     #[test]
