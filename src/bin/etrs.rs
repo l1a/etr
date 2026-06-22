@@ -219,29 +219,26 @@ fn main() -> io::Result<()> {
 }
 
 fn detach_stdio(log_path: &std::path::Path) -> io::Result<()> {
-    use nix::unistd::dup2;
-    use std::os::unix::io::IntoRawFd;
+    use nix::unistd::{dup2_stderr, dup2_stdin, dup2_stdout};
 
-    let null_fd = std::fs::File::open("/dev/null")
-        .map(|f| f.into_raw_fd())
-        .unwrap_or(-1);
+    let null_file = std::fs::File::open("/dev/null").ok();
 
     if let Some(p) = log_path.parent() {
         std::fs::create_dir_all(p).ok();
     }
-    let log_fd = std::fs::OpenOptions::new()
+    let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(log_path)
-        .map(|f| f.into_raw_fd())
-        .unwrap_or(null_fd);
+        .ok();
 
-    if null_fd >= 0 {
-        dup2(null_fd, 0).ok();
-        dup2(null_fd, 1).ok();
+    if let Some(ref f) = null_file {
+        dup2_stdin(f).ok();
+        dup2_stdout(f).ok();
     }
-    if log_fd >= 0 {
-        dup2(log_fd, 2).ok();
+    let stderr_src = log_file.as_ref().or(null_file.as_ref());
+    if let Some(f) = stderr_src {
+        dup2_stderr(f).ok();
     }
     Ok(())
 }

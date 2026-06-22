@@ -9,9 +9,14 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.4.15 — prune old GitHub releases
+## Current state: v0.4.16 — bump minor dependencies
 
-New in v0.4.15:
+New in v0.4.16:
+- Bumped `crossterm` 0.27→0.29, `nix` 0.29→0.31, `prost` 0.13→0.14.
+- `nix` 0.31 removed `dup2(RawFd, RawFd)`; replaced with the new `dup2_stdin` /
+  `dup2_stdout` / `dup2_stderr` helpers in `detach_stdio` (`src/bin/etrs.rs`).
+
+## Previous: v0.4.15 — prune old GitHub releases
 - Release workflow now prunes releases beyond the 20 most recent after each publish.
   Uses `gh release list --limit 1000 | .[20:]` piped to `gh release delete --cleanup-tag`
   in a `prune` job that runs after the `release` job. No new permissions needed —
@@ -426,6 +431,8 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
   UDP (~9 Mb/s) is still limited by per-datagram protobuf encoding overhead.
 - ~~**UDP forward target resolution should prefer IPv6 when genuinely available**~~ **Done**: `etr::forward::resolve_udp_target` (new helper in `src/forward.rs`) resolves the target, tries IPv6 candidates first, and probes routing via a no-packet UDP `connect()` call.  The first address whose routing probe succeeds is used.  Falls back to IPv4 if no IPv6 route exists.  The stress-tool UDP echo server now also binds `[::1]:port` alongside `0.0.0.0:port` so both families reach it in tests.
 - ~~**GitHub release retention**~~ **Done**: the release workflow's `prune` job deletes releases beyond the 20 most recent after each publish, using `gh release delete --cleanup-tag`.
+- ~~**Dependency updates (minor/safe)**~~ **Done**: `crossterm` 0.27→0.29, `nix` 0.29→0.31, `prost` 0.13→0.14.
+- **Dependency updates (major)**: `rand` 0.8→0.10, `dirs` 5→6, `toml` 0.8→1.1, `clap_complete_nushell` 0.1→4.6, `criterion` 0.5→0.8 — major version bumps, may require code changes.
 
 ---
 
