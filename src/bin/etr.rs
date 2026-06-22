@@ -308,7 +308,7 @@ async fn main() -> io::Result<()> {
     } else {
         cfg.client.env.clone().unwrap_or_default()
     };
-    let env_vars: Vec<String> = raw_env
+    let mut env_vars: Vec<String> = raw_env
         .into_iter()
         .filter_map(|e| {
             if e.contains('=') {
@@ -318,6 +318,26 @@ async fn main() -> io::Result<()> {
             }
         })
         .collect();
+
+    // Automatically forward locale variables (mirrors SSH's SendEnv LANG LC_*).
+    // Prepend so explicit --env entries take precedence.
+    let locale_keys = [
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LC_COLLATE",
+        "LC_MESSAGES",
+        "LC_MONETARY",
+        "LC_NUMERIC",
+        "LC_TIME",
+    ];
+    let mut locale_prefix: Vec<String> = locale_keys
+        .iter()
+        .filter(|k| !env_vars.iter().any(|e| e.starts_with(&format!("{k}="))))
+        .filter_map(|k| std::env::var(k).ok().map(|v| format!("{k}={v}")))
+        .collect();
+    locale_prefix.append(&mut env_vars);
+    let env_vars = locale_prefix;
 
     let session_id = generate_session_id();
     let passkey = generate_passkey();
