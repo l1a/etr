@@ -486,6 +486,11 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
 - ~~**UDP reply routing**~~ **Done**: Each unique local UDP sender (`peer_addr:peer_port`) now gets its own ephemeral socket on the server (`-L`) and client (`-R`), so replies from the remote target are routed back to the correct sender regardless of interleaving. Idle sender sockets are evicted after 30 s. This removes the last-sender-wins limitation for concurrent DNS/STUN/game-protocol clients.
 - ~~**`--env` e2e test**~~ **Done**: `just e2e-env-local` tests both `--env KEY=VALUE` (explicit set) and `--env KEY` (bare forward from local env) end-to-end through a live `etr localhost` session.
 - ~~**Concurrent UDP senders regression test**~~ **Done**: `just e2e-udp-concurrent` sends interleaved datagrams from two independent sockets through `-L` UDP forwarding and asserts each socket receives its own reply. Regression coverage for the v0.4.9 per-sender routing fix.
+- **X11 / Wayland forwarding**: `DISPLAY` and `WAYLAND_DISPLAY` are not forwarded
+  because there is no X11/Wayland channel implementation.  Adding this would require
+  an X11 proxy (like OpenSSH's `-X`/`-Y` mode) or a Wayland compositor proxy — a
+  meaningful feature, not a one-liner.  For now, GUI programs launched via
+  `etr host cmd` will fail if they need a display server.
 - **PQC key exchange**: ML-KEM was retired with the QUIC migration.  Can be re-added
   via `rustls-post-quantum` (X25519MLKEM768 hybrid) once it stabilises.
 - **macOS**: fully tested and working.  PTY session, reconnect, and port forwarding
