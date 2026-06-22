@@ -63,3 +63,16 @@ jobs:
           files: dist/**/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  prune:
+    name: Prune old releases
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete releases beyond 20 most recent
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release list --limit 1000 --json tagName --jq '.[20:][].tagName' \
+            | xargs -r -I{} gh release delete {} --yes --cleanup-tag
