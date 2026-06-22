@@ -9,9 +9,12 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.4.16 — bump minor dependencies
+## Current state: v0.4.17 — bump dirs and toml
 
-New in v0.4.16:
+New in v0.4.17:
+- Bumped `dirs` 5→6, `toml` 0.8→1. No code changes required; both APIs were compatible.
+
+## Previous: v0.4.16 — bump minor dependencies
 - Bumped `crossterm` 0.27→0.29, `nix` 0.29→0.31, `prost` 0.13→0.14.
 - `nix` 0.31 removed `dup2(RawFd, RawFd)`; replaced with the new `dup2_stdin` /
   `dup2_stdout` / `dup2_stderr` helpers in `detach_stdio` (`src/bin/etrs.rs`).
@@ -432,7 +435,8 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
 - ~~**UDP forward target resolution should prefer IPv6 when genuinely available**~~ **Done**: `etr::forward::resolve_udp_target` (new helper in `src/forward.rs`) resolves the target, tries IPv6 candidates first, and probes routing via a no-packet UDP `connect()` call.  The first address whose routing probe succeeds is used.  Falls back to IPv4 if no IPv6 route exists.  The stress-tool UDP echo server now also binds `[::1]:port` alongside `0.0.0.0:port` so both families reach it in tests.
 - ~~**GitHub release retention**~~ **Done**: the release workflow's `prune` job deletes releases beyond the 20 most recent after each publish, using `gh release delete --cleanup-tag`.
 - ~~**Dependency updates (minor/safe)**~~ **Done**: `crossterm` 0.27→0.29, `nix` 0.29→0.31, `prost` 0.13→0.14.
-- **Dependency updates (major)**: `rand` 0.8→0.10, `dirs` 5→6, `toml` 0.8→1.1, `clap_complete_nushell` 0.1→4.6, `criterion` 0.5→0.8 — major version bumps, may require code changes.
+- **Dependency updates (major)**: `rand` 0.8→0.10, `clap_complete_nushell` 0.1→4.6, `criterion` 0.5→0.8 — major version bumps, may require code changes.
+- **stress-local: pump connect race**: on slower machines the `-R` forward listeners may not be ready by the time the pumps start, causing all four pumps to time out and report "no stats available". Need a readiness probe before starting pumps.
 
 ---
 
