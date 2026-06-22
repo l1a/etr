@@ -26,15 +26,24 @@ ephemeral TLS certificate for pinning.
 
 ```
 SESSION_ID_HEX/PASSKEY/TERM\n
+[KEY=VALUE\n ...]
+[ETRCMD:<command>\n]
 ```
 
-| Field | Format | Description |
+The first line is required. It is followed by zero or more optional lines, each
+terminated by `\n`, sent before `stdin` is closed:
+
+| Line | Format | Description |
+|------|--------|-------------|
+| Header | `SESSION_ID_HEX/PASSKEY/TERM` | Required. Fields separated by `/`. |
+| Env var | `KEY=VALUE` | Optional, repeatable. Sets an environment variable in the remote shell/command. Automatically includes `LANG`, `LC_*`, `COLORTERM`, and `TERM_PROGRAM*` if set on the client. |
+| Remote command | `ETRCMD:<command>` | Optional, at most once. If present, the server runs `$SHELL -c <command>` instead of an interactive shell and sends `Disconnect` when the command exits. Lines without a `=` and not starting with `ETRCMD:` are ignored for forward compatibility. |
+
+| Header field | Format | Description |
 |-------|--------|-------------|
 | `SESSION_ID_HEX` | 32 hex chars (16 bytes) | Randomly generated session identifier |
 | `PASSKEY` | printable ASCII, ≤ 64 chars | Randomly generated pre-shared secret |
 | `TERM` | string | Value of `$TERM` on the client (e.g. `xterm-256color`) |
-
-Fields are separated by `/`. The line is terminated by `\n`.
 
 ### Server → Client (SSH stdout)
 

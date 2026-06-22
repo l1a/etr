@@ -9,7 +9,38 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.4.21 — vibe-coded disclosure in README
+## Current state: v0.4.22 — remote command support
+
+New in v0.4.22:
+- `etr host [command [args...]]`: optional trailing arguments run a remote
+  command under the PTY instead of an interactive shell.
+  Multiple words are joined with spaces and passed to `$SHELL -c`, so shell
+  metacharacters (pipes, redirects) work and full-screen TUI programs like
+  `btop` and `distrobox` work correctly.  The session ends when the command
+  exits.  Example: `etr host 'distrobox -- btop'`.
+- Bootstrap protocol: client writes `ETRCMD:<command>` as an extra line after
+  env vars; old servers ignore it (no `=` → silently skipped).
+- **Bug fixes** (same version, follow-up commits):
+  - `etrs`: use `$SHELL -c` instead of `sh -c` so the command runs with the
+    user's PATH — fixes commands only available via `~/.local/bin` (e.g. distrobox).
+  - `etr`: don't enter the reconnect loop when running a remote command; exit
+    with a clear error instead. Prevents the raw-mode hang where the server exits
+    (command not found or immediate exit) before the client connects, leaving etr
+    stuck in raw mode with Ctrl-C disabled.
+  - `etrs`: when the command exits before any client connects, wait up to 1 s
+    for a pending QUIC connection instead of immediately dropping the endpoint.
+    The client then gets a clean Disconnect rather than a 15-second QUIC timeout.
+  - `handle_connection`: if `shell_exit_rx` is already true when the connection
+    arrives, immediately queue a Disconnect so it is delivered as soon as the
+    PTY stream is established — covers the race where the command exits between
+    QUIC accept and the first PTY exchange.
+- `just e2e-cmd-local`: end-to-end test — runs a sentinel-echo command through
+  a live session, checks the output appears, verifies etr exits cleanly when
+  the command finishes, and (Part 2) verifies etr exits within 20 s after a
+  fast-exiting command (`true`) instead of hanging forever.
+- Test count: 98 → 103 (3 new `etr` CLI tests, 2 new `etrs` parse tests).
+
+## Previous: v0.4.21 — vibe-coded disclosure in README
 
 New in v0.4.21:
 - Added a "Vibe coded" section to README.md disclosing that the project is
@@ -378,7 +409,7 @@ just install-release  # copies target/release/{etr,etrs} to ~/.cargo/bin
 
 # Code quality gate — run before every commit
 just check            # cargo fmt --check + cargo clippy -D warnings
-just test             # cargo test (78 tests)
+just test             # cargo test (103 tests)
 ```
 
 ---
@@ -455,6 +486,11 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
 - ~~**UDP reply routing**~~ **Done**: Each unique local UDP sender (`peer_addr:peer_port`) now gets its own ephemeral socket on the server (`-L`) and client (`-R`), so replies from the remote target are routed back to the correct sender regardless of interleaving. Idle sender sockets are evicted after 30 s. This removes the last-sender-wins limitation for concurrent DNS/STUN/game-protocol clients.
 - ~~**`--env` e2e test**~~ **Done**: `just e2e-env-local` tests both `--env KEY=VALUE` (explicit set) and `--env KEY` (bare forward from local env) end-to-end through a live `etr localhost` session.
 - ~~**Concurrent UDP senders regression test**~~ **Done**: `just e2e-udp-concurrent` sends interleaved datagrams from two independent sockets through `-L` UDP forwarding and asserts each socket receives its own reply. Regression coverage for the v0.4.9 per-sender routing fix.
+- **X11 / Wayland forwarding**: `DISPLAY` and `WAYLAND_DISPLAY` are not forwarded
+  because there is no X11/Wayland channel implementation.  Adding this would require
+  an X11 proxy (like OpenSSH's `-X`/`-Y` mode) or a Wayland compositor proxy — a
+  meaningful feature, not a one-liner.  For now, GUI programs launched via
+  `etr host cmd` will fail if they need a display server.
 - **PQC key exchange**: ML-KEM was retired with the QUIC migration.  Can be re-added
   via `rustls-post-quantum` (X25519MLKEM768 hybrid) once it stabilises.
 - **macOS**: fully tested and working.  PTY session, reconnect, and port forwarding
@@ -486,7 +522,7 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
 
 ---
 
-## Test coverage (98 tests)
+## Test coverage (103 tests)
 
 | Module | What's tested |
 |--------|--------------|

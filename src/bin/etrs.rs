@@ -133,14 +133,19 @@ fn main() -> io::Result<()> {
     let term = parts[2].to_string();
 
     // Read any extra KEY=VALUE lines the client wrote after the first line.
-    // Old clients close stdin immediately, yielding EOF here (zero iterations).
+    // A line prefixed with "ETRCMD:" carries the remote command to run instead
+    // of an interactive shell.  Old clients close stdin immediately (zero iters).
     let mut extra_env: Vec<String> = Vec::new();
+    let mut remote_command: Option<String> = None;
     {
         use std::io::BufRead;
         let stdin = io::stdin();
         for line in stdin.lock().lines() {
             match line {
                 Ok(l) if l.is_empty() => break,
+                Ok(l) if l.starts_with("ETRCMD:") => {
+                    remote_command = l.strip_prefix("ETRCMD:").map(str::to_string);
+                }
                 Ok(l) => extra_env.push(l),
                 Err(_) => break,
             }
@@ -213,6 +218,7 @@ fn main() -> io::Result<()> {
                 term,
                 reconnect_timeout,
                 extra_env,
+                remote_command,
             )
             .await
         })
@@ -263,6 +269,7 @@ async fn run_session(
     term: String,
     reconnect_timeout: Duration,
     extra_env: Vec<String>,
+    remote_command: Option<String>,
 ) -> io::Result<()> {
     vlog!(
         1,
@@ -282,10 +289,19 @@ async fn run_session(
         })
         .map_err(io::Error::other)?;
 
-    // Use new_default_prog() so portable-pty sets argv[0] to "-zsh" (the
-    // traditional login-shell sentinel), which is more reliable than the -l
-    // flag when the shell is spawned via execve from a Rust process.
-    let mut cmd = CommandBuilder::new_default_prog();
+    // With a remote command, run it via the user's shell (from $SHELL, same as
+    // SSH does) so the PATH and environment match what the user expects.
+    // Falls back to /bin/sh if $SHELL is unset.  Without a command, start the
+    // user's default login shell (argv[0]="-zsh" sentinel via new_default_prog()).
+    let mut cmd = if let Some(ref rcmd) = remote_command {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let mut c = CommandBuilder::new(&shell);
+        c.arg("-c");
+        c.arg(rcmd);
+        c
+    } else {
+        CommandBuilder::new_default_prog()
+    };
     cmd.env("TERM", &term);
     // Signal to shell startup scripts that this is an etr session, analogous
     // to SSH_CONNECTION / SSH_TTY set by OpenSSH.
@@ -410,8 +426,19 @@ async fn run_session(
         let incoming = tokio::select! {
             biased;
             _ = shell_rx.wait_for(|&v| v) => {
-                vlog!(1, "[etrs] shell exited, shutting down");
-                break;
+                // Give a pending client up to 1 s to connect so it receives a
+                // clean Disconnect rather than timing out.
+                vlog!(1, "[etrs] shell exited; waiting briefly for any pending client...");
+                match tokio::time::timeout(
+                    Duration::from_secs(1),
+                    endpoint.accept(),
+                ).await {
+                    Ok(Some(inc)) => inc,
+                    _ => {
+                        vlog!(1, "[etrs] no pending client, shutting down");
+                        break;
+                    }
+                }
             }
             _ = sigterm.recv() => {
                 vlog!(1, "[etrs] SIGTERM received, shutting down");
@@ -473,6 +500,7 @@ async fn run_session(
                 master_fd,
                 Arc::clone(&active_conn),
                 Arc::clone(&active_reverse_listeners),
+                shell_exit_rx.clone(),
             ) => (r, false),
             _ = sigterm_conn.recv() => {
                 vlog!(1, "[etrs] SIGTERM during active session, closing connection");
@@ -528,6 +556,7 @@ async fn handle_connection(
     master_fd: Option<std::os::unix::io::RawFd>,
     active_conn: Arc<Mutex<Option<quinn::Connection>>>,
     active_reverse_listeners: Arc<Mutex<std::collections::HashSet<String>>>,
+    shell_exit_rx: tokio::sync::watch::Receiver<bool>,
 ) -> bool {
     let peer = conn.remote_address();
     vlog!(
@@ -660,6 +689,14 @@ async fn handle_connection(
 
     let (ctrl_ob_tx, mut ctrl_ob_rx) = mpsc::channel::<Envelope>(64);
     *outbound_ctrl_tx.lock().unwrap() = Some(ctrl_ob_tx.clone());
+
+    // If the shell already exited before this connection was accepted, queue a
+    // Disconnect now so ctrl_writer_task delivers it as soon as it starts.
+    if *shell_exit_rx.borrow() {
+        let _ = ctrl_ob_tx.try_send(Envelope {
+            payload: Some(Payload::Disconnect(Disconnect {})),
+        });
+    }
 
     // Queue replay data ahead of live PTY output.
     if let Some(stream0_replays) = replays.get(&0) {
@@ -1429,5 +1466,38 @@ mod tests {
         let mut cmd = Cli::command();
         let help = cmd.render_help().to_string();
         assert!(help.contains("--reconnect-timeout"));
+    }
+
+    #[test]
+    fn test_etrcmd_line_parsing() {
+        // Simulate the bootstrap line-parsing logic for ETRCMD:.
+        let lines = vec![
+            "KEY=VALUE".to_string(),
+            "ETRCMD:distrobox -- btop".to_string(),
+            "OTHER=foo".to_string(),
+        ];
+        let mut extra_env: Vec<String> = Vec::new();
+        let mut remote_command: Option<String> = None;
+        for l in lines {
+            if let Some(cmd) = l.strip_prefix("ETRCMD:") {
+                remote_command = Some(cmd.to_string());
+            } else {
+                extra_env.push(l);
+            }
+        }
+        assert_eq!(remote_command.as_deref(), Some("distrobox -- btop"));
+        assert_eq!(extra_env, vec!["KEY=VALUE", "OTHER=foo"]);
+    }
+
+    #[test]
+    fn test_etrcmd_absent_yields_none() {
+        let lines: Vec<String> = vec!["KEY=VALUE".to_string()];
+        let mut remote_command: Option<String> = None;
+        for l in lines {
+            if let Some(cmd) = l.strip_prefix("ETRCMD:") {
+                remote_command = Some(cmd.to_string());
+            }
+        }
+        assert!(remote_command.is_none());
     }
 }

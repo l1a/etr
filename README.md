@@ -19,6 +19,10 @@ cargo install etr
 # Connect
 etr user@host
 
+# Run a remote command (exits when the command exits)
+etr user@host btop
+etr user@host 'distrobox -- btop'
+
 # Connect on a non-standard SSH port
 etr -s 2222 user@host
 
@@ -61,10 +65,11 @@ just bench            # runs performance benchmarks via Criterion
 ## Usage
 
 ```
-etr [OPTIONS] [TARGET]
+etr [OPTIONS] [TARGET] [COMMAND]...
 
 Arguments:
-  [TARGET]  Remote host (e.g. user@host or host)
+  [TARGET]      Remote host (e.g. user@host or host)
+  [COMMAND]...  Optional command to run instead of an interactive shell
 
 Options:
   -s, --ssh-port <PORT>          SSH port [default: 22]

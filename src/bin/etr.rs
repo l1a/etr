@@ -108,6 +108,13 @@ struct Cli {
     #[arg(long, value_enum, value_name = "SHELL")]
     completions: Option<ShellChoice>,
 
+    /// Remote command to run instead of an interactive shell.
+    /// Multiple words are joined with spaces and passed to `sh -c`.
+    /// Example: etr host 'distrobox -- btop'
+    /// Example: etr host ls -la /tmp
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    command: Vec<String>,
+
     /// Print a fully-commented default config to stdout
     #[arg(long, help_heading = "Configuration")]
     generate_config: bool,
@@ -301,7 +308,7 @@ async fn main() -> io::Result<()> {
     } else {
         cfg.client.env.clone().unwrap_or_default()
     };
-    let env_vars: Vec<String> = raw_env
+    let mut env_vars: Vec<String> = raw_env
         .into_iter()
         .filter_map(|e| {
             if e.contains('=') {
@@ -311,6 +318,31 @@ async fn main() -> io::Result<()> {
             }
         })
         .collect();
+
+    // Automatically forward terminal/locale variables (mirrors SSH's SendEnv LANG LC_*).
+    // COLORTERM and TERM_PROGRAM let TUI programs (btop, delta, fzf, …) pick the
+    // right color depth; LANG/LC_* supply the locale.
+    // Prepend so explicit --env entries take precedence.
+    let locale_keys = [
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LC_COLLATE",
+        "LC_MESSAGES",
+        "LC_MONETARY",
+        "LC_NUMERIC",
+        "LC_TIME",
+        "COLORTERM",
+        "TERM_PROGRAM",
+        "TERM_PROGRAM_VERSION",
+    ];
+    let mut locale_prefix: Vec<String> = locale_keys
+        .iter()
+        .filter(|k| !env_vars.iter().any(|e| e.starts_with(&format!("{k}="))))
+        .filter_map(|k| std::env::var(k).ok().map(|v| format!("{k}={v}")))
+        .collect();
+    locale_prefix.append(&mut env_vars);
+    let env_vars = locale_prefix;
 
     let session_id = generate_session_id();
     let passkey = generate_passkey();
@@ -323,6 +355,8 @@ async fn main() -> io::Result<()> {
         target
     );
 
+    let remote_command: String = cli.command.join(" ");
+
     let (server_port, server_cert) = match bootstrap_ssh(
         &target,
         ssh_port,
@@ -334,6 +368,11 @@ async fn main() -> io::Result<()> {
             .as_deref()
             .or(cfg.client.server_log_path.as_deref()),
         &env_vars,
+        if remote_command.is_empty() {
+            None
+        } else {
+            Some(remote_command.as_str())
+        },
         cli.verbose,
     ) {
         Ok(r) => r,
@@ -357,6 +396,7 @@ async fn main() -> io::Result<()> {
         forward_specs,
         reverse_forward_specs,
         gateway_ports,
+        !remote_command.is_empty(),
         cli.verbose,
     )
     .await
@@ -406,6 +446,7 @@ fn bootstrap_ssh(
     server_path: &str,
     server_log_path: Option<&str>,
     env_vars: &[String],
+    remote_command: Option<&str>,
     verbose: u8,
 ) -> io::Result<(u16, Vec<u8>)> {
     let session_id_hex = hex_encode(session_id);
@@ -435,6 +476,9 @@ fn bootstrap_ssh(
     stdin.write_all(format!("{}/{}/{}\n", session_id_hex, passkey, term).as_bytes())?;
     for kv in env_vars {
         stdin.write_all(format!("{kv}\n").as_bytes())?;
+    }
+    if let Some(cmd) = remote_command {
+        stdin.write_all(format!("ETRCMD:{cmd}\n").as_bytes())?;
     }
     stdin.flush()?;
     drop(stdin);
@@ -479,6 +523,7 @@ async fn run_connection_loop(
     forward_specs: Vec<ForwardSpec>,
     reverse_forward_specs: Vec<String>,
     gateway_ports: bool,
+    has_remote_command: bool,
     verbose: u8,
 ) -> io::Result<()> {
     let host = if let Some(idx) = target.find('@') {
@@ -614,6 +659,10 @@ async fn run_connection_loop(
             Ok(c) => c,
             Err(e) => {
                 vlog!(verbose, 1, "[etr] Connect error: {e}");
+                if has_remote_command {
+                    eprintln!("[etr] Failed to connect: {e}");
+                    std::process::exit(1);
+                }
                 continue 'reconnect;
             }
         };
@@ -623,10 +672,18 @@ async fn run_connection_loop(
                 Ok(Ok(c)) => c,
                 Ok(Err(e)) => {
                     vlog!(verbose, 1, "[etr] QUIC handshake failed: {e}");
+                    if has_remote_command {
+                        eprintln!("[etr] Failed to connect: {e}");
+                        std::process::exit(1);
+                    }
                     continue 'reconnect;
                 }
                 Err(_) => {
                     vlog!(verbose, 1, "[etr] QUIC connect timed out");
+                    if has_remote_command {
+                        eprintln!("[etr] Connection timed out.");
+                        std::process::exit(1);
+                    }
                     continue 'reconnect;
                 }
             },
@@ -682,6 +739,15 @@ async fn run_connection_loop(
                 std::process::exit(0);
             }
             Err(e) => {
+                // For remote commands: exit rather than reconnect.  The command
+                // has finished (or the server is gone), so there is nothing to
+                // reconnect to.  Restore the terminal before printing.
+                if has_remote_command {
+                    IN_RAW_MODE.store(false, std::sync::atomic::Ordering::Relaxed);
+                    let _ = disable_raw_mode();
+                    eprintln!("\n[etr] Session ended: {e}");
+                    std::process::exit(1);
+                }
                 // Keep raw mode ON during reconnect so ~. fires immediately.
                 eprint!("\r\n[etr] Connection lost.\r\n");
                 if let Some(f) = LOG_FILE.get() {
@@ -1526,6 +1592,27 @@ mod tests {
         let cli =
             Cli::try_parse_from(["etr", "--server-log-path", "/tmp/server.log", "host"]).unwrap();
         assert_eq!(cli.server_log_path.as_deref(), Some("/tmp/server.log"));
+    }
+
+    #[test]
+    fn test_remote_command_single_arg() {
+        let cli = Cli::try_parse_from(["etr", "host", "distrobox -- btop"]).unwrap();
+        assert_eq!(cli.target.as_deref(), Some("host"));
+        assert_eq!(cli.command, vec!["distrobox -- btop"]);
+    }
+
+    #[test]
+    fn test_remote_command_multi_word() {
+        let cli = Cli::try_parse_from(["etr", "host", "ls", "-la", "/tmp"]).unwrap();
+        assert_eq!(cli.target.as_deref(), Some("host"));
+        assert_eq!(cli.command, vec!["ls", "-la", "/tmp"]);
+        assert_eq!(cli.command.join(" "), "ls -la /tmp");
+    }
+
+    #[test]
+    fn test_remote_command_empty_without_args() {
+        let cli = Cli::try_parse_from(["etr", "host"]).unwrap();
+        assert!(cli.command.is_empty());
     }
 
     #[test]
