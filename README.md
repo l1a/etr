@@ -6,7 +6,7 @@ Unlike SSH, when your network drops, `etr` keeps the remote shell alive and tran
 
 ## Vibe coded
 
-This project is entirely vibe coded — every line was written by AI (Claude) with a human directing at a high level. The code compiles, the tests pass, and the tool works, but it has not been reviewed by an experienced systems or networking engineer.
+This project is entirely vibe coded — every line was written by AI (Claude and Gemini) with a human directing at a high level. The code compiles, the tests pass, and the tool works, but it has not been reviewed by an experienced systems or networking engineer.
 
 **Real programmers are welcome.** If you spot something wrong, fragile, or just un-idiomatic, please open an issue or a PR — your expertise is exactly what this project needs. See [CONTRIBUTING.md](CONTRIBUTING.md) for how to get started.
 
