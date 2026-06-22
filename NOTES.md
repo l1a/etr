@@ -20,6 +20,9 @@ New in v0.4.22:
   exits.  Example: `etr host 'distrobox -- btop'`.
 - Bootstrap protocol: client writes `ETRCMD:<command>` as an extra line after
   env vars; old servers ignore it (no `=` → silently skipped).
+- `just e2e-cmd-local`: end-to-end test — runs a sentinel-echo command through
+  a live session, checks the output appears, and verifies etr exits cleanly
+  when the command finishes.
 - Test count: 98 → 103 (3 new `etr` CLI tests, 2 new `etrs` parse tests).
 
 ## Previous: v0.4.21 — vibe-coded disclosure in README

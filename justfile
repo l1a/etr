@@ -394,6 +394,77 @@ e2e-env-local: check-tools install
     echo ""
     echo "==> All --env tests passed."
 
+# Run the local E2E test for remote command execution (etr host 'command')
+e2e-cmd-local: check-tools install
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    CLIENT_LOG="${XDG_STATE_HOME:-$HOME/.local/state}/etr/etr.log"
+    TMUX_SESS_CMD="etr_cmd_test"
+    SENTINEL="CMD_TEST_SENTINEL_$$"
+
+    cleanup() {
+        echo ""
+        echo "--- cleanup ---"
+        tmux kill-session -t "$TMUX_SESS_CMD" 2>/dev/null && echo "killed tmux session $TMUX_SESS_CMD" || true
+        pkill -x etrs 2>/dev/null && echo "stopped etrs" || true
+    }
+    trap cleanup EXIT
+
+    mkdir -p "$(dirname "$CLIENT_LOG")"
+    > "$CLIENT_LOG"
+
+    # ── 1. Launch etr with a remote command ──────────────────────────────────
+    # The command prints a sentinel then sleeps briefly so the pane stays open
+    # long enough to capture; the session ends when the command exits.
+    echo "==> Launching etr with remote command: echo ${SENTINEL} && sleep 5"
+    tmux new-session -d -s "$TMUX_SESS_CMD" -x 200 -y 50 -- \
+        "{{INSTALL}}/etr" -v localhost "echo ${SENTINEL} && sleep 5"
+
+    # ── 2. Wait for "[etr] Connected." ────────────────────────────────────────
+    echo "    waiting for etr to connect..."
+    READY=0
+    for i in $(seq 1 30); do
+        sleep 1
+        grep -q '\[etr\] Connected\.' "$CLIENT_LOG" 2>/dev/null && { READY=1; break; }
+    done
+    if [[ $READY -eq 0 ]]; then
+        echo "ERROR: '[etr] Connected.' not seen within 30 s" >&2
+        cat "$CLIENT_LOG" >&2
+        exit 1
+    fi
+
+    # ── 3. Wait for command output to appear in the pane ─────────────────────
+    echo "    waiting for command output..."
+    FOUND=0
+    for i in $(seq 1 15); do
+        sleep 1
+        tmux capture-pane -t "$TMUX_SESS_CMD" -p -S - 2>/dev/null \
+            | grep -q "${SENTINEL}" && { FOUND=1; break; }
+    done
+    if [[ $FOUND -eq 0 ]]; then
+        echo "FAIL: sentinel '${SENTINEL}' not seen in pane within 15 s." >&2
+        tmux capture-pane -t "$TMUX_SESS_CMD" -p -S - >&2
+        exit 1
+    fi
+    echo "    PASS: remote command output received."
+
+    # ── 4. Verify etr exits when the command finishes ─────────────────────────
+    echo "    waiting for etr to exit after command completes..."
+    EXIT_SEEN=0
+    for i in $(seq 1 12); do
+        sleep 1
+        tmux has-session -t "$TMUX_SESS_CMD" 2>/dev/null || { EXIT_SEEN=1; break; }
+    done
+    if [[ $EXIT_SEEN -eq 0 ]]; then
+        echo "FAIL: etr did not exit within 12 s after command should have finished." >&2
+        exit 1
+    fi
+    echo "    PASS: etr exited cleanly when command finished."
+
+    echo ""
+    echo "==> Remote command test passed."
+
 # Run the local E2E test for local port forwarding -L (TCP + UDP, IPv4 + IPv6, reconnect)
 e2e-forward-local: check-tools install
     #!/usr/bin/env bash
