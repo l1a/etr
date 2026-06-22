@@ -9,7 +9,16 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.4.22 — remote command support
+## Current state: v0.4.23 — resolve GitHub CI warnings (Node 20 deprecations)
+
+New in v0.4.23:
+- Upgraded GitHub Actions workflow versions to resolve Node.js 20 deprecation warnings.
+- Upgraded `actions/checkout` to `@v6` across all workflows.
+- Upgraded `actions/upload-artifact` to `@v7` and `actions/download-artifact` to `@v8` in `release.yml`.
+- Upgraded `softprops/action-gh-release` to `@v3` in `release.yml`.
+- Replaced the deprecated `rustsec/audit-check` action with the actively maintained `actions-rust-lang/audit@v1` in `ci.yml`.
+
+## Previous: v0.4.22 — remote command support
 
 New in v0.4.22:
 - `etr host [command [args...]]`: optional trailing arguments run a remote
