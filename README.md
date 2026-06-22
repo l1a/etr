@@ -4,6 +4,12 @@ A Rust reimplementation of [Eternal Terminal](https://eternalterminal.dev/) (`et
 
 Unlike SSH, when your network drops, `etr` keeps the remote shell alive and transparently reconnects when connectivity returns. Like mosh, no server daemon needs to be pre-installed or running: `etr` bootstraps a per-session server process via SSH, then hands off to a persistent [QUIC](https://www.rfc-editor.org/rfc/rfc9000) connection.
 
+## Vibe coded
+
+This project is entirely vibe coded — every line was written by AI (Claude) with a human directing at a high level. The code compiles, the tests pass, and the tool works, but it has not been reviewed by an experienced systems or networking engineer.
+
+**Real programmers are warmly welcome.** If you spot something wrong, fragile, or just un-idiomatic, please open an issue or a PR — your expertise is exactly what this project needs. See [CONTRIBUTING.md](CONTRIBUTING.md) for how to get started.
+
 ## Quick start
 
 ```bash
