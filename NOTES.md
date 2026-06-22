@@ -9,9 +9,18 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.4.17 — bump dirs and toml
+## Current state: v0.4.18 — fix stress-local pump connect race
 
-New in v0.4.17:
+New in v0.4.18:
+- Fixed stress-local pump connect race: replaced the fixed `sleep 1.5` before `-R`
+  pumps with a `wait_tcp_ready` bash function that polls `/dev/tcp/127.0.0.1/PORT`
+  every 200ms (up to 15s) before starting each TCP pump. The `-L` pump now also
+  probes its port rather than assuming the listener is immediately ready.
+- `tcp_connect_with_retry` in the stress tool no longer panics on timeout; it prints
+  `TCP sent=0 recv=0 elapsed=0.001` to stdout so the output file is never empty and
+  the failure is visible in the throughput report rather than silently absent.
+
+## Previous: v0.4.17 — bump dirs and toml
 - Bumped `dirs` 5→6, `toml` 0.8→1. No code changes required; both APIs were compatible.
 
 ## Previous: v0.4.16 — bump minor dependencies
@@ -436,7 +445,7 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
 - ~~**GitHub release retention**~~ **Done**: the release workflow's `prune` job deletes releases beyond the 20 most recent after each publish, using `gh release delete --cleanup-tag`.
 - ~~**Dependency updates (minor/safe)**~~ **Done**: `crossterm` 0.27→0.29, `nix` 0.29→0.31, `prost` 0.13→0.14.
 - **Dependency updates (major)**: `rand` 0.8→0.10, `clap_complete_nushell` 0.1→4.6, `criterion` 0.5→0.8 — major version bumps, may require code changes.
-- **stress-local: pump connect race**: on slower machines the `-R` forward listeners may not be ready by the time the pumps start, causing all four pumps to time out and report "no stats available". Need a readiness probe before starting pumps.
+- ~~**stress-local: pump connect race**~~ **Done**: replaced fixed sleep with `wait_tcp_ready` probe; stress tool now prints zero stats instead of panicking on connect timeout.
 
 ---
 

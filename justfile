@@ -962,8 +962,22 @@ stress-local: check-tools install build-stress
         "dd if=/dev/urandom bs=65536 2>/dev/null | base64 > /dev/null & dd if=/dev/urandom bs=65536 of=/dev/null 2>/dev/null &" Enter
     sleep 0.5
 
+    # Helper: block until a TCP port is accepting connections (Linux + macOS bash).
+    # /dev/tcp is a bash built-in — no external tools required.
+    wait_tcp_ready() {
+        local port=$1 label=$2
+        local deadline=$(( SECONDS + 15 ))
+        while (( SECONDS < deadline )); do
+            bash -c "echo >/dev/tcp/127.0.0.1/${port}" 2>/dev/null && return 0
+            sleep 0.2
+        done
+        echo "ERROR: ${label} (127.0.0.1:${port}) not ready after 15s" >&2
+        exit 1
+    }
+
     # ── -L pumps ──────────────────────────────────────────────────────────────
     echo "==> TCP -L pump on :${TCP_FWD_PORT}..."
+    wait_tcp_ready "$TCP_FWD_PORT" "TCP -L forward listener"
     "$STRESS_BIN" tcp-pump "$TCP_FWD_PORT" > "$TCP_PUMP_OUT" &
     TCP_PUMP_PID=$!
 
@@ -971,9 +985,10 @@ stress-local: check-tools install build-stress
     "$STRESS_BIN" udp-pump "$UDP_FWD_PORT" > "$UDP_PUMP_OUT" &
     UDP_PUMP_PID=$!
 
-    # ── -R pumps (connect to etrs-side listeners; brief wait for bind) ────────
-    sleep 1.5
+    # ── -R pumps (etrs binds these after the QUIC session is fully up) ────────
+    # Probe the TCP -R port; once it accepts, the UDP -R listener is also ready.
     echo "==> TCP -R pump on :${TCP_R_FWD_PORT}..."
+    wait_tcp_ready "$TCP_R_FWD_PORT" "TCP -R forward listener"
     "$STRESS_BIN" tcp-pump "$TCP_R_FWD_PORT" > "$TCP_R_PUMP_OUT" &
     TCP_R_PUMP_PID=$!
 

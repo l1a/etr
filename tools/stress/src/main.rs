@@ -126,7 +126,10 @@ fn udp_echo(port: u16) {
 /// Sends 64 KiB chunks; a drain thread counts received bytes. Exits on SIGTERM
 /// and prints `TCP sent=<n> recv=<n> elapsed=<s>` to stdout.
 fn tcp_pump(port: u16) {
-    let stream = tcp_connect_with_retry(port);
+    let Some(stream) = tcp_connect_with_retry(port) else {
+        println!("TCP sent=0 recv=0 elapsed=0.001");
+        return;
+    };
     stream.set_nodelay(true).ok();
 
     let bytes_sent = std::sync::Arc::new(AtomicU64::new(0));
@@ -216,12 +219,13 @@ fn udp_pump(port: u16) {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn tcp_connect_with_retry(port: u16) -> TcpStream {
+fn tcp_connect_with_retry(port: u16) -> Option<TcpStream> {
     for _ in 0..50 {
         match TcpStream::connect(format!("127.0.0.1:{port}")) {
-            Ok(s) => return s,
+            Ok(s) => return Some(s),
             Err(_) => thread::sleep(Duration::from_millis(100)),
         }
     }
-    panic!("tcp_pump: could not connect to 127.0.0.1:{port} after 5s");
+    eprintln!("tcp_pump: could not connect to 127.0.0.1:{port} after 5s");
+    None
 }
