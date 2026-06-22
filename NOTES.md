@@ -9,7 +9,14 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.4.19 — bump major deps; improve docs and test coverage
+## Current state: v0.4.20 — patch quinn-proto memory exhaustion vuln
+
+New in v0.4.20:
+- `quinn` 0.11.9→0.11.11, `quinn-proto` 0.11.14→0.11.15: fixes
+  RUSTSEC-2026-0185 (remote memory exhaustion via unbounded out-of-order
+  stream reassembly, severity 7.5 high, published 2026-06-22).
+
+## Previous: v0.4.19 — bump major deps; improve docs and test coverage
 
 New in v0.4.19:
 - `rand` 0.8→0.9: updated call sites in `src/bin/etr.rs` — `thread_rng()` → `rng()`,
