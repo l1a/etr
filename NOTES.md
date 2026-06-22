@@ -9,7 +9,14 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.4.23 — resolve GitHub CI warnings (Node 20 deprecations)
+## Current state: v0.4.24 — Nushell zero-config completions autoloading
+
+New in v0.4.24:
+- Changed the default Nushell completions directory (`NU_COMP`) in the `justfile` to `~/.config/nushell/autoload` (respecting `XDG_CONFIG_HOME` if set) to leverage Nushell's native autoload paths.
+- Naming of installed Nushell completions updated to `50etr-completions.nu` and `50etrs-completions.nu` for order management and clarity.
+- `install-completions` print instructions updated to denote auto-loaded state rather than manual sourcing.
+
+## Previous: v0.4.23 — resolve GitHub CI warnings (Node 20 deprecations)
 
 New in v0.4.23:
 - Upgraded GitHub Actions workflow versions to resolve Node.js 20 deprecation warnings.
