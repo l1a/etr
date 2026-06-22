@@ -9,7 +9,20 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.4.21 — vibe-coded disclosure in README
+## Current state: v0.4.22 — remote command support
+
+New in v0.4.22:
+- `etr host [command [args...]]`: optional trailing arguments run a remote
+  command under the PTY instead of an interactive shell.
+  Multiple words are joined with spaces and passed to `sh -c`, so shell
+  metacharacters (pipes, redirects) work and full-screen TUI programs like
+  `btop` and `distrobox` work correctly.  The session ends when the command
+  exits.  Example: `etr host 'distrobox -- btop'`.
+- Bootstrap protocol: client writes `ETRCMD:<command>` as an extra line after
+  env vars; old servers ignore it (no `=` → silently skipped).
+- Test count: 98 → 103 (3 new `etr` CLI tests, 2 new `etrs` parse tests).
+
+## Previous: v0.4.21 — vibe-coded disclosure in README
 
 New in v0.4.21:
 - Added a "Vibe coded" section to README.md disclosing that the project is
@@ -378,7 +391,7 @@ just install-release  # copies target/release/{etr,etrs} to ~/.cargo/bin
 
 # Code quality gate — run before every commit
 just check            # cargo fmt --check + cargo clippy -D warnings
-just test             # cargo test (78 tests)
+just test             # cargo test (103 tests)
 ```
 
 ---
@@ -486,7 +499,7 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
 
 ---
 
-## Test coverage (98 tests)
+## Test coverage (103 tests)
 
 | Module | What's tested |
 |--------|--------------|

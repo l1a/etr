@@ -108,6 +108,13 @@ struct Cli {
     #[arg(long, value_enum, value_name = "SHELL")]
     completions: Option<ShellChoice>,
 
+    /// Remote command to run instead of an interactive shell.
+    /// Multiple words are joined with spaces and passed to `sh -c`.
+    /// Example: etr host 'distrobox -- btop'
+    /// Example: etr host ls -la /tmp
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    command: Vec<String>,
+
     /// Print a fully-commented default config to stdout
     #[arg(long, help_heading = "Configuration")]
     generate_config: bool,
@@ -323,6 +330,8 @@ async fn main() -> io::Result<()> {
         target
     );
 
+    let remote_command: String = cli.command.join(" ");
+
     let (server_port, server_cert) = match bootstrap_ssh(
         &target,
         ssh_port,
@@ -334,6 +343,11 @@ async fn main() -> io::Result<()> {
             .as_deref()
             .or(cfg.client.server_log_path.as_deref()),
         &env_vars,
+        if remote_command.is_empty() {
+            None
+        } else {
+            Some(remote_command.as_str())
+        },
         cli.verbose,
     ) {
         Ok(r) => r,
@@ -406,6 +420,7 @@ fn bootstrap_ssh(
     server_path: &str,
     server_log_path: Option<&str>,
     env_vars: &[String],
+    remote_command: Option<&str>,
     verbose: u8,
 ) -> io::Result<(u16, Vec<u8>)> {
     let session_id_hex = hex_encode(session_id);
@@ -435,6 +450,9 @@ fn bootstrap_ssh(
     stdin.write_all(format!("{}/{}/{}\n", session_id_hex, passkey, term).as_bytes())?;
     for kv in env_vars {
         stdin.write_all(format!("{kv}\n").as_bytes())?;
+    }
+    if let Some(cmd) = remote_command {
+        stdin.write_all(format!("ETRCMD:{cmd}\n").as_bytes())?;
     }
     stdin.flush()?;
     drop(stdin);
@@ -1526,6 +1544,27 @@ mod tests {
         let cli =
             Cli::try_parse_from(["etr", "--server-log-path", "/tmp/server.log", "host"]).unwrap();
         assert_eq!(cli.server_log_path.as_deref(), Some("/tmp/server.log"));
+    }
+
+    #[test]
+    fn test_remote_command_single_arg() {
+        let cli = Cli::try_parse_from(["etr", "host", "distrobox -- btop"]).unwrap();
+        assert_eq!(cli.target.as_deref(), Some("host"));
+        assert_eq!(cli.command, vec!["distrobox -- btop"]);
+    }
+
+    #[test]
+    fn test_remote_command_multi_word() {
+        let cli = Cli::try_parse_from(["etr", "host", "ls", "-la", "/tmp"]).unwrap();
+        assert_eq!(cli.target.as_deref(), Some("host"));
+        assert_eq!(cli.command, vec!["ls", "-la", "/tmp"]);
+        assert_eq!(cli.command.join(" "), "ls -la /tmp");
+    }
+
+    #[test]
+    fn test_remote_command_empty_without_args() {
+        let cli = Cli::try_parse_from(["etr", "host"]).unwrap();
+        assert!(cli.command.is_empty());
     }
 
     #[test]

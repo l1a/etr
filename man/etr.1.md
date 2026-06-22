@@ -11,7 +11,7 @@ etr - Eternal Terminal client
 
 # SYNOPSIS
 
-**etr** \[*OPTIONS*\] \[*user*@\]*host*
+**etr** \[*OPTIONS*\] \[*user*@\]*host* \[*command* \[*args*...\]\]
 
 **etr** **\-\-completions** *SHELL*
 
@@ -33,6 +33,20 @@ SSH channel and pinned for subsequent QUIC connections.
 *\[user@\]host*
 :   Remote host to connect to. May include an optional *user* prefix
     (e.g. **alice@example.com**). If omitted, help is printed.
+
+*command* \[*args*...\]
+:   Optional remote command to execute instead of an interactive shell.
+    All words after *host* are joined with spaces and passed to **sh -c**
+    on the remote host, so shell metacharacters work as expected.
+    The command runs under a PTY, so full-screen programs like **btop**,
+    **vim**, and **distrobox** work correctly.
+    When the command exits the session ends.
+
+    Examples:
+
+        etr host 'distrobox -- btop'
+        etr host ls -la /tmp
+        etr host 'tail -f /var/log/syslog | grep error'
 
 **-s**, **\-\-ssh-port** *PORT*
 :   SSH port to use for the initial bootstrap connection. Defaults to 22,
@@ -202,6 +216,11 @@ Reverse forward a remote port on the server to a local web server:
 Reverse forward allowing external connections to the server's port:
 
     etr -R 0.0.0.0:8080:localhost:80 user@example.com
+
+Run a remote command under a PTY (session ends when the command exits):
+
+    etr user@example.com 'distrobox -- btop'
+    etr user@example.com ls -la /tmp
 
 Generate zsh completions:
 
