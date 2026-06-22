@@ -13,7 +13,7 @@ BASH_COMP  := `echo "${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/comple
 ZSH_COMP   := `echo "${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions"`
 FISH_COMP  := `echo "${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions"`
 ELVISH_COMP := `echo "${XDG_CONFIG_HOME:-$HOME/.config}/elvish/lib"`
-NU_COMP    := `echo "${XDG_CONFIG_HOME:-$HOME/.config}/nushell/completions"`
+NU_COMP    := `echo "${XDG_CONFIG_HOME:-$HOME/.config}/nushell/autoload"`
 PS_COMP    := `echo "${XDG_CONFIG_HOME:-$HOME/.config}/powershell"`
 TMUX_SESS  := "etr_test"
 
@@ -146,7 +146,7 @@ install-completions: build
         "$BIN" --completions zsh         > "{{ZSH_COMP}}/_${bin}"
         "$BIN" --completions fish        > "{{FISH_COMP}}/${bin}.fish"
         "$BIN" --completions elvish      > "{{ELVISH_COMP}}/${bin}.elv"
-        "$BIN" --completions nushell     > "{{NU_COMP}}/${bin}.nu"
+        "$BIN" --completions nushell     > "{{NU_COMP}}/50${bin}-completions.nu"
         "$BIN" --completions power-shell > "{{PS_COMP}}/${bin}.ps1"
         echo "Installed completions for ${bin}"
     done
@@ -155,8 +155,7 @@ install-completions: build
     echo "  zsh        auto-loaded ({{ZSH_COMP}} is in zsh's default \$fpath)"
     echo "  elvish    add to rc.elv:  eval (slurp < {{ELVISH_COMP}}/etr.elv)"
     echo "                            eval (slurp < {{ELVISH_COMP}}/etrs.elv)"
-    echo "  nushell   add to config.nu:  source {{NU_COMP}}/etr.nu"
-    echo "                               source {{NU_COMP}}/etrs.nu"
+    echo "  nushell   auto-loaded ({{NU_COMP}} is in nushell's autoload paths)"
     echo "  powershell  add to \$PROFILE:  . {{PS_COMP}}/etr.ps1"
     echo "                                . {{PS_COMP}}/etrs.ps1"
 
