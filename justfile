@@ -463,7 +463,32 @@ e2e-cmd-local: check-tools install
     echo "    PASS: etr exited cleanly when command finished."
 
     echo ""
-    echo "==> Remote command test passed."
+    echo "==> Part 1 passed."
+
+    # ── 5. Fast-exit: command exits before client connects ────────────────────
+    # Regression test for the raw-mode hang: if the remote command exits
+    # immediately (e.g. command not found), etr must exit cleanly rather than
+    # spin in the reconnect loop with Ctrl-C disabled.
+    > "$CLIENT_LOG"
+    TMUX_SESS_FAST="etr_cmd_fast_test"
+    echo "==> Part 2: fast-exit command ('true') must not hang..."
+    tmux new-session -d -s "$TMUX_SESS_FAST" -x 200 -y 50 -- \
+        "{{INSTALL}}/etr" -v localhost true
+
+    FAST_EXIT=0
+    for i in $(seq 1 20); do
+        sleep 1
+        tmux has-session -t "$TMUX_SESS_FAST" 2>/dev/null || { FAST_EXIT=1; break; }
+    done
+    if [[ $FAST_EXIT -eq 0 ]]; then
+        echo "FAIL: etr did not exit within 20 s after 'true'; likely hung in reconnect loop." >&2
+        tmux kill-session -t "$TMUX_SESS_FAST" 2>/dev/null || true
+        exit 1
+    fi
+    echo "    PASS: etr exited cleanly after fast-exit command."
+
+    echo ""
+    echo "==> All remote command tests passed."
 
 # Run the local E2E test for local port forwarding -L (TCP + UDP, IPv4 + IPv6, reconnect)
 e2e-forward-local: check-tools install

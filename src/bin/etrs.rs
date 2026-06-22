@@ -426,8 +426,19 @@ async fn run_session(
         let incoming = tokio::select! {
             biased;
             _ = shell_rx.wait_for(|&v| v) => {
-                vlog!(1, "[etrs] shell exited, shutting down");
-                break;
+                // Give a pending client up to 1 s to connect so it receives a
+                // clean Disconnect rather than timing out.
+                vlog!(1, "[etrs] shell exited; waiting briefly for any pending client...");
+                match tokio::time::timeout(
+                    Duration::from_secs(1),
+                    endpoint.accept(),
+                ).await {
+                    Ok(Some(inc)) => inc,
+                    _ => {
+                        vlog!(1, "[etrs] no pending client, shutting down");
+                        break;
+                    }
+                }
             }
             _ = sigterm.recv() => {
                 vlog!(1, "[etrs] SIGTERM received, shutting down");
@@ -489,6 +500,7 @@ async fn run_session(
                 master_fd,
                 Arc::clone(&active_conn),
                 Arc::clone(&active_reverse_listeners),
+                shell_exit_rx.clone(),
             ) => (r, false),
             _ = sigterm_conn.recv() => {
                 vlog!(1, "[etrs] SIGTERM during active session, closing connection");
@@ -544,6 +556,7 @@ async fn handle_connection(
     master_fd: Option<std::os::unix::io::RawFd>,
     active_conn: Arc<Mutex<Option<quinn::Connection>>>,
     active_reverse_listeners: Arc<Mutex<std::collections::HashSet<String>>>,
+    shell_exit_rx: tokio::sync::watch::Receiver<bool>,
 ) -> bool {
     let peer = conn.remote_address();
     vlog!(
@@ -676,6 +689,14 @@ async fn handle_connection(
 
     let (ctrl_ob_tx, mut ctrl_ob_rx) = mpsc::channel::<Envelope>(64);
     *outbound_ctrl_tx.lock().unwrap() = Some(ctrl_ob_tx.clone());
+
+    // If the shell already exited before this connection was accepted, queue a
+    // Disconnect now so ctrl_writer_task delivers it as soon as it starts.
+    if *shell_exit_rx.borrow() {
+        let _ = ctrl_ob_tx.try_send(Envelope {
+            payload: Some(Payload::Disconnect(Disconnect {})),
+        });
+    }
 
     // Queue replay data ahead of live PTY output.
     if let Some(stream0_replays) = replays.get(&0) {

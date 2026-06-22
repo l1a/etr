@@ -14,22 +14,30 @@ and TLS 1.3 built-in.
 New in v0.4.22:
 - `etr host [command [args...]]`: optional trailing arguments run a remote
   command under the PTY instead of an interactive shell.
-  Multiple words are joined with spaces and passed to `sh -c`, so shell
+  Multiple words are joined with spaces and passed to `$SHELL -c`, so shell
   metacharacters (pipes, redirects) work and full-screen TUI programs like
   `btop` and `distrobox` work correctly.  The session ends when the command
   exits.  Example: `etr host 'distrobox -- btop'`.
 - Bootstrap protocol: client writes `ETRCMD:<command>` as an extra line after
   env vars; old servers ignore it (no `=` → silently skipped).
-- **Bug fixes** (same version, follow-up commit):
+- **Bug fixes** (same version, follow-up commits):
   - `etrs`: use `$SHELL -c` instead of `sh -c` so the command runs with the
     user's PATH — fixes commands only available via `~/.local/bin` (e.g. distrobox).
   - `etr`: don't enter the reconnect loop when running a remote command; exit
     with a clear error instead. Prevents the raw-mode hang where the server exits
     (command not found or immediate exit) before the client connects, leaving etr
     stuck in raw mode with Ctrl-C disabled.
+  - `etrs`: when the command exits before any client connects, wait up to 1 s
+    for a pending QUIC connection instead of immediately dropping the endpoint.
+    The client then gets a clean Disconnect rather than a 15-second QUIC timeout.
+  - `handle_connection`: if `shell_exit_rx` is already true when the connection
+    arrives, immediately queue a Disconnect so it is delivered as soon as the
+    PTY stream is established — covers the race where the command exits between
+    QUIC accept and the first PTY exchange.
 - `just e2e-cmd-local`: end-to-end test — runs a sentinel-echo command through
-  a live session, checks the output appears, and verifies etr exits cleanly
-  when the command finishes.
+  a live session, checks the output appears, verifies etr exits cleanly when
+  the command finishes, and (Part 2) verifies etr exits within 20 s after a
+  fast-exiting command (`true`) instead of hanging forever.
 - Test count: 98 → 103 (3 new `etr` CLI tests, 2 new `etrs` parse tests).
 
 ## Previous: v0.4.21 — vibe-coded disclosure in README
