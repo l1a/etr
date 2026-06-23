@@ -1,10 +1,3 @@
----
-title: ETRS
-section: 1
-header: User Commands
-date: June 2026
----
-
 # NAME
 
 etrs - Eternal Terminal server (per-session)

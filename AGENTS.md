@@ -57,7 +57,7 @@ doc-only, test-only, and chore PRs.  There is no "this is just a small change" c
 
 | Step | Command | Why unconditional |
 |------|---------|------------------|
-| **4.5 — `just man`** | `just man` | Verifies pandoc still builds both man pages; the version header must match the bumped version. |
+| **4.5 — `just man`** | `just man` | Verifies mandown still builds both man pages; the version header must match the bumped version. |
 | **4.10 — Version bump** | edit `Cargo.toml` | Every merged PR changes the codebase; the published version must reflect that. Use **patch** for fixes, tests, and doc improvements; **minor** for new user-visible features. |
 
 Rationalising either of these away — "it's only docs", "it's only tests", "no behaviour
@@ -96,7 +96,7 @@ same PR as any change to the checklist — never pushed to `main` as a standalon
       `etr --completions bash` and `etrs --completions bash`.
 
 ### 4.5 Man pages
-- [ ] Run `just man` and verify it succeeds (requires `pandoc`).
+- [ ] Run `just man` and verify it succeeds (requires `mandown` — `cargo install mandown`).
 - [ ] If a new flag or behaviour was added, update the relevant section in
       `man/etr.1.md` or `man/etrs.1.md` before running `just man`.
 - [ ] `man/build/` is gitignored — do not commit its contents.

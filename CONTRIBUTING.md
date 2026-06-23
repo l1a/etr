@@ -31,7 +31,7 @@ First off, thank you for considering contributing to `etr`! It's people like you
 
 - [Rust](https://www.rust-lang.org/tools/install) (latest stable)
 - [just](https://github.com/casey/just) (command runner)
-- [pandoc](https://pandoc.org/installing.html) (for generating man pages)
+- [mandown](https://crates.io/crates/mandown) (for generating man pages — `cargo install mandown`)
 - SSH access to localhost (required for the end-to-end test suite)
 
 ### Build and Run

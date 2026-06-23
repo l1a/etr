@@ -9,7 +9,17 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.5.1 — X11 forwarding support with Wayland/Niri fixes
+## Current state: v0.5.2 — switch man page tooling from pandoc to mandown
+
+New in v0.5.2:
+- Man page build tooling replaced: `pandoc` → `mandown` (`cargo install mandown`).
+  `just man` now invokes `mandown man/etr.1.md ETR 1` and patches the `.TH` line via
+  sed to embed the version and "User Commands" header, matching prior pandoc output.
+- YAML front matter removed from `man/etr.1.md` and `man/etrs.1.md` (mandown takes
+  title and section as CLI args, not from front matter).
+- `CONTRIBUTING.md` and `AGENTS.md` §4.5 updated to reference mandown.
+
+## Previous: v0.5.1 — X11 forwarding support with Wayland/Niri fixes
 
 New in v0.5.1:
 - Wayland/Niri Compatibility: Correctly handles Wayland compositors (like `niri`) where local X11 authentication cookies are absent. The server dynamically negotiates and rewrites setup blocks to specify no-authentication, avoiding hangs.
