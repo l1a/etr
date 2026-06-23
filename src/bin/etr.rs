@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 
 use etr::config::Config;
-use etr::forward::ForwardSpec;
+use etr::forward::{ForwardSpec, X11Display, get_xauth_cookie};
 use etr::protocol::{
     Envelope, ForwardProto, Heartbeat, Payload, SessionOpen, StreamOpen, TerminalResize,
     UdpDatagram,
@@ -103,6 +103,14 @@ struct Cli {
     /// Example: --env ZELLIJ_AUTO_START=false --env EDITOR
     #[arg(long = "env", value_name = "KEY[=VALUE]")]
     env: Vec<String>,
+
+    /// Enable X11 forwarding
+    #[arg(short = 'X')]
+    x11: bool,
+
+    /// Enable trusted X11 forwarding (treated same as -X)
+    #[arg(short = 'Y')]
+    x11_trusted: bool,
 
     /// Generate shell completions for the specified shell
     #[arg(long, value_enum, value_name = "SHELL")]
@@ -357,6 +365,11 @@ async fn main() -> io::Result<()> {
 
     let remote_command: String = cli.command.join(" ");
 
+    let x11_enabled = cli.x11
+        || cli.x11_trusted
+        || cfg.client.x11.unwrap_or(false)
+        || cfg.client.x11_trusted.unwrap_or(false);
+
     let (server_port, server_cert) = match bootstrap_ssh(
         &target,
         ssh_port,
@@ -373,6 +386,7 @@ async fn main() -> io::Result<()> {
         } else {
             Some(remote_command.as_str())
         },
+        x11_enabled,
         cli.verbose,
     ) {
         Ok(r) => r,
@@ -386,6 +400,28 @@ async fn main() -> io::Result<()> {
 
     let session = Arc::new(Mutex::new(SessionState::new(session_id, passkey.clone())));
 
+    let mut x11_auth_proto = String::new();
+    let mut x11_auth_cookie = Vec::new();
+    if x11_enabled {
+        match std::env::var("DISPLAY") {
+            Ok(disp) => match get_xauth_cookie(&disp) {
+                Ok((proto, cookie)) => {
+                    x11_auth_proto = proto;
+                    x11_auth_cookie = cookie;
+                }
+                Err(e) => {
+                    eprintln!("[etr] warning: X11 cookie extraction failed: {e}");
+                }
+            },
+            Err(_) => {
+                eprintln!(
+                    "[etr] error: X11 forwarding requested but DISPLAY environment variable is not set"
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+
     if let Err(e) = run_connection_loop(
         target,
         server_port,
@@ -397,6 +433,9 @@ async fn main() -> io::Result<()> {
         reverse_forward_specs,
         gateway_ports,
         !remote_command.is_empty(),
+        x11_enabled,
+        x11_auth_proto,
+        x11_auth_cookie,
         cli.verbose,
     )
     .await
@@ -447,6 +486,7 @@ fn bootstrap_ssh(
     server_log_path: Option<&str>,
     env_vars: &[String],
     remote_command: Option<&str>,
+    x11_enabled: bool,
     verbose: u8,
 ) -> io::Result<(u16, Vec<u8>)> {
     let session_id_hex = hex_encode(session_id);
@@ -476,6 +516,9 @@ fn bootstrap_ssh(
     stdin.write_all(format!("{}/{}/{}\n", session_id_hex, passkey, term).as_bytes())?;
     for kv in env_vars {
         stdin.write_all(format!("{kv}\n").as_bytes())?;
+    }
+    if x11_enabled {
+        stdin.write_all(b"ETRX11:true\n")?;
     }
     if let Some(cmd) = remote_command {
         stdin.write_all(format!("ETRCMD:{cmd}\n").as_bytes())?;
@@ -524,6 +567,9 @@ async fn run_connection_loop(
     reverse_forward_specs: Vec<String>,
     gateway_ports: bool,
     has_remote_command: bool,
+    x11_enabled: bool,
+    x11_auth_proto: String,
+    x11_auth_cookie: Vec<u8>,
     verbose: u8,
 ) -> io::Result<()> {
     let host = if let Some(idx) = target.find('@') {
@@ -715,6 +761,9 @@ async fn run_connection_loop(
                 forward_specs.clone(),
                 reverse_forward_specs.clone(),
                 gateway_ports,
+                x11_enabled,
+                x11_auth_proto.clone(),
+                x11_auth_cookie.clone(),
                 verbose,
             ) => r,
             Ok(_) = escape_rx.wait_for(|&v| v) => {
@@ -769,6 +818,9 @@ async fn run_session(
     forward_specs: Vec<ForwardSpec>,
     reverse_forward_specs: Vec<String>,
     gateway_ports: bool,
+    x11_enabled: bool,
+    x11_auth_proto: String,
+    x11_auth_cookie: Vec<u8>,
     verbose: u8,
 ) -> io::Result<()> {
     // ── Open control stream ───────────────────────────────────────────────
@@ -790,6 +842,9 @@ async fn run_session(
             last_received_seq: last_received,
             reverse_forwards: reverse_forward_specs.clone(),
             gateway_ports,
+            x11_enabled,
+            x11_auth_proto: x11_auth_proto.clone(),
+            x11_auth_cookie: x11_auth_cookie.clone(),
         })),
     };
 
@@ -1056,6 +1111,34 @@ async fn run_session(
                     },
                     _ => return,
                 };
+                if so.stream_type == etr::protocol::StreamType::X11 as i32 {
+                    let local_display = match std::env::var("DISPLAY") {
+                        Ok(d) => d,
+                        Err(_) => {
+                            vlog!(
+                                verbose,
+                                1,
+                                "[etr] X11: local DISPLAY env var not set, rejecting stream"
+                            );
+                            let _ = quic_send.finish();
+                            return;
+                        }
+                    };
+                    match connect_local_x11(&local_display, verbose).await {
+                        Ok(stream) => {
+                            run_x11_connection_quic(stream, quic_send, quic_recv).await;
+                        }
+                        Err(e) => {
+                            vlog!(
+                                verbose,
+                                1,
+                                "[etr] X11: failed to connect to local display {local_display}: {e}"
+                            );
+                            let _ = quic_send.finish();
+                        }
+                    }
+                    return;
+                }
                 let proto = ForwardProto::try_from(so.forward_proto).unwrap_or(ForwardProto::Tcp);
                 match proto {
                     ForwardProto::Tcp => {
@@ -1525,6 +1608,130 @@ async fn run_udp_forward_client_socket(
     }
     dgram_in.abort();
     dgram_out.abort();
+}
+
+enum X11Stream {
+    Unix(tokio::net::UnixStream),
+    Tcp(tokio::net::TcpStream),
+}
+
+async fn connect_local_x11(display_str: &str, verbose: u8) -> io::Result<X11Stream> {
+    let display = X11Display::parse(display_str)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
+    match display {
+        X11Display::Unix(n) => {
+            let path = format!("/tmp/.X11-unix/X{n}");
+            vlog!(
+                verbose,
+                2,
+                "[etr] X11: connecting to local Unix socket {path}"
+            );
+            let s = tokio::net::UnixStream::connect(&path).await?;
+            Ok(X11Stream::Unix(s))
+        }
+        X11Display::Path(p) => {
+            vlog!(verbose, 2, "[etr] X11: connecting to local Unix path {p}");
+            let s = tokio::net::UnixStream::connect(&p).await?;
+            Ok(X11Stream::Unix(s))
+        }
+        X11Display::Tcp(host, port) => {
+            let addr = format!("{host}:{port}");
+            vlog!(
+                verbose,
+                2,
+                "[etr] X11: connecting to local TCP address {addr}"
+            );
+            let s = tokio::net::TcpStream::connect(&addr).await?;
+            Ok(X11Stream::Tcp(s))
+        }
+    }
+}
+
+async fn run_x11_connection_quic(
+    stream: X11Stream,
+    mut quic_send: quinn::SendStream,
+    mut quic_recv: quinn::RecvStream,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    match stream {
+        X11Stream::Unix(s) => {
+            let (mut r, mut w) = s.into_split();
+            let mut t1 = tokio::spawn(async move {
+                let mut buf = vec![0u8; 256 * 1024];
+                loop {
+                    match r.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if quic_send.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let _ = quic_send.finish();
+            });
+            let mut t2 = tokio::spawn(async move {
+                let mut buf = vec![0u8; 256 * 1024];
+                loop {
+                    match quic_recv.read(&mut buf).await {
+                        Ok(None) | Err(_) => break,
+                        Ok(Some(0)) => continue,
+                        Ok(Some(n)) => {
+                            if w.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let _ = w.shutdown().await;
+            });
+            tokio::select! {
+                _ = &mut t1 => {}
+                _ = &mut t2 => {}
+            }
+            t1.abort();
+            t2.abort();
+        }
+        X11Stream::Tcp(s) => {
+            let (mut r, mut w) = s.into_split();
+            let mut t1 = tokio::spawn(async move {
+                let mut buf = vec![0u8; 256 * 1024];
+                loop {
+                    match r.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if quic_send.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let _ = quic_send.finish();
+            });
+            let mut t2 = tokio::spawn(async move {
+                let mut buf = vec![0u8; 256 * 1024];
+                loop {
+                    match quic_recv.read(&mut buf).await {
+                        Ok(None) | Err(_) => break,
+                        Ok(Some(0)) => continue,
+                        Ok(Some(n)) => {
+                            if w.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                let _ = w.shutdown().await;
+            });
+            tokio::select! {
+                _ = &mut t1 => {}
+                _ = &mut t2 => {}
+            }
+            t1.abort();
+            t2.abort();
+        }
+    }
 }
 
 #[cfg(test)]

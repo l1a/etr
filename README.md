@@ -77,6 +77,8 @@ Options:
                                  Forward a local port to a remote address (repeatable)
   -R <[remote_port:]host:port[/udp]>
                                  Forward a remote port to a local address (repeatable)
+  -X                             Enable X11 forwarding
+  -Y                             Enable trusted X11 forwarding (treated same as -X)
   -v, -vv, -vvv                  Verbosity: connection events / QUIC details / stream trace
       --env <KEY[=VALUE]>        Set or forward environment variables to the remote shell (repeatable)
       --server-path <PATH>       Path to etrs on the remote host [default: etrs]
@@ -168,6 +170,8 @@ server_path = "/usr/local/bin/etrs"  # path to etrs on remote hosts
 log_path = "/tmp/client.log"         # path to the client log file
 server_log_path = "/tmp/server.log"  # path to the server log file on remote host
 env = ["COLORTERM", "EDITOR=nvim"]   # variables to set/forward in the remote shell
+x11 = false                          # enable X11 forwarding
+x11_trusted = false                  # enable trusted X11 forwarding
 ```
 
 ## Limitations

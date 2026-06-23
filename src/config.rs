@@ -53,6 +53,12 @@ pub const DEFAULT_CONFIG: &str = r#"# etr configuration file
 # "KEY=VALUE" sets the variable; "KEY" alone forwards it from the local environment.
 # env = ["EDITOR", "TERM=xterm-256color"]
 
+# Enable X11 forwarding (default: false).
+# x11 = false
+
+# Enable trusted X11 forwarding (default: false).
+# x11_trusted = false
+
 [server]
 
 # How long (seconds) the server keeps a session alive while the client is
@@ -94,6 +100,14 @@ const CLIENT_KEY_BLOCKS: &[(&str, &str)] = &[
     (
         "env",
         "# Environment variables to set or forward in the remote shell.\n# \"KEY=VALUE\" sets the variable; \"KEY\" alone forwards it from the local environment.\n# env = [\"EDITOR\", \"TERM=xterm-256color\"]",
+    ),
+    (
+        "x11",
+        "# Enable X11 forwarding (default: false).\n# x11 = false",
+    ),
+    (
+        "x11_trusted",
+        "# Enable trusted X11 forwarding (default: false).\n# x11_trusted = false",
     ),
 ];
 
@@ -141,6 +155,12 @@ pub struct ClientConfig {
     /// Extra environment variables to set in the remote shell.
     /// Each entry is either "KEY=VALUE" or just "KEY" (forwarded from the local environment).
     pub env: Option<Vec<String>>,
+
+    /// Enable X11 forwarding.
+    pub x11: Option<bool>,
+
+    /// Enable trusted X11 forwarding.
+    pub x11_trusted: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -417,6 +437,18 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_x11_options() {
+        let toml = r#"
+            [client]
+            x11 = true
+            x11_trusted = false
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.client.x11, Some(true));
+        assert_eq!(cfg.client.x11_trusted, Some(false));
+    }
+
+    #[test]
     fn test_default_config_is_valid_toml() {
         // The DEFAULT_CONFIG constant (with all lines commented out) must parse cleanly.
         let cfg: Config = toml::from_str(DEFAULT_CONFIG).unwrap();
@@ -452,6 +484,8 @@ gateway_ports = false\n\
 forward = []\n\
 reverse_forward = []\n\
 env = []\n\
+x11 = false\n\
+x11_trusted = false\n\
 [server]\n\
 reconnect_timeout = 1800\n";
         let (merged, additions) = merge_defaults(existing);
@@ -472,6 +506,8 @@ reconnect_timeout = 1800\n";
 # forward = []\n\
 # reverse_forward = []\n\
 # env = []\n\
+# x11 = false\n\
+# x11_trusted = false\n\
 [server]\n\
 # reconnect_timeout = 1800\n";
         let (_, additions) = merge_defaults(existing);

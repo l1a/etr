@@ -386,4 +386,160 @@ mod tests {
         let parts = split_ignoring_brackets("a:b:");
         assert_eq!(parts, vec!["a", "b", ""]);
     }
+
+    #[test]
+    fn test_parse_display() {
+        let d = X11Display::parse(":0").unwrap();
+        assert_eq!(d, X11Display::Unix(0));
+        assert_eq!(d.display_num(), 0);
+
+        let d = X11Display::parse("unix:10.0").unwrap();
+        assert_eq!(d, X11Display::Unix(10));
+        assert_eq!(d.display_num(), 10);
+
+        let d = X11Display::parse("localhost:10.0").unwrap();
+        assert_eq!(d, X11Display::Tcp("localhost".to_string(), 6010));
+        assert_eq!(d.display_num(), 10);
+
+        let d = X11Display::parse("/tmp/launch-123/org.xquartz:0").unwrap();
+        assert_eq!(
+            d,
+            X11Display::Path("/tmp/launch-123/org.xquartz:0".to_string())
+        );
+        assert_eq!(d.display_num(), 0);
+    }
+}
+
+/// Representation of a parsed X11 DISPLAY target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum X11Display {
+    /// Local Unix socket (e.g. `:0` or `unix:0`), carrying display number.
+    Unix(u16),
+    /// Local explicit Unix socket path (common on macOS / launchd, e.g. `/tmp/launch-XXX/org.xquartz:0`).
+    Path(String),
+    /// TCP host and port (e.g. `localhost:10.0` -> `localhost`, port `6010`).
+    Tcp(String, u16),
+}
+
+impl X11Display {
+    /// Parse a DISPLAY environment string.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        if s.starts_with('/') {
+            return Ok(Self::Path(s.to_string()));
+        }
+        let parts = split_ignoring_brackets(s);
+        if parts.len() < 2 {
+            return Err(format!("invalid DISPLAY '{}'", s));
+        }
+        let host = &parts[0];
+        let rest = &parts[1];
+        let display_num_str = rest.split('.').next().unwrap_or(rest);
+        let display_num = display_num_str
+            .parse::<u16>()
+            .map_err(|_| format!("invalid display number '{}'", display_num_str))?;
+
+        if host.is_empty() || host == "unix" {
+            Ok(Self::Unix(display_num))
+        } else {
+            Ok(Self::Tcp(host.clone(), 6000 + display_num))
+        }
+    }
+
+    /// Extract display number (offset from 6000).
+    pub fn display_num(&self) -> u16 {
+        match self {
+            Self::Unix(n) => *n,
+            Self::Path(p) => {
+                if let Some(pos) = p.rfind(':') {
+                    let rest = &p[pos + 1..];
+                    rest.split('.')
+                        .next()
+                        .unwrap_or(rest)
+                        .parse::<u16>()
+                        .unwrap_or(0)
+                } else {
+                    0
+                }
+            }
+            Self::Tcp(_, port) => {
+                if *port >= 6000 {
+                    port - 6000
+                } else {
+                    0
+                }
+            }
+        }
+    }
+}
+
+/// Retrieve the X11 auth protocol and key (cookie) for the specified display string.
+///
+/// Runs `xauth list` and matches the parsed display number or falls back to
+/// the first available `MIT-MAGIC-COOKIE-1` entry.
+pub fn get_xauth_cookie(display_str: &str) -> Result<(String, Vec<u8>), String> {
+    let display = X11Display::parse(display_str)?;
+    let target_num = display.display_num();
+
+    let output = std::process::Command::new("xauth")
+        .arg("list")
+        .output()
+        .map_err(|e| format!("failed to execute xauth: {e}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "xauth failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 3 {
+            continue;
+        }
+        let entry = fields[0];
+        let proto = fields[1];
+        let cookie_hex = fields[2];
+
+        if let Some(pos) = entry.rfind(':') {
+            let rest = &entry[pos + 1..];
+            let display_part = rest
+                .split('/')
+                .next()
+                .unwrap_or(rest)
+                .split('.')
+                .next()
+                .unwrap_or(rest);
+            if let Ok(num) = display_part.parse::<u16>()
+                && num == target_num
+                && let Some(cookie) = hex_decode(cookie_hex)
+            {
+                return Ok((proto.to_string(), cookie));
+            }
+        }
+    }
+
+    // Fallback: first MIT-MAGIC-COOKIE-1 entry
+    for line in stdout.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() >= 3
+            && fields[1] == "MIT-MAGIC-COOKIE-1"
+            && let Some(cookie) = hex_decode(fields[2])
+        {
+            return Ok((fields[1].to_string(), cookie));
+        }
+    }
+
+    Err(format!("no xauth cookie found for display {}", display_str))
+}
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
 }
