@@ -9,7 +9,12 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.5.0 — X11 forwarding support (-X and -Y)
+## Current state: v0.5.1 — X11 forwarding support with Wayland/Niri fixes
+
+New in v0.5.1:
+- Wayland/Niri Compatibility: Correctly handles Wayland compositors (like `niri`) where local X11 authentication cookies are absent. The server dynamically negotiates and rewrites setup blocks to specify no-authentication, avoiding hangs.
+- Robust xauth State Handling: Skips client cookie verification on the server side when the server host is missing `xauth` or command execution fails.
+- Reconstructed X11 Setup Blocks: Dynamically rebuilds setup blocks (injecting `MIT-MAGIC-COOKIE-1` when client cookies are present) preserving endianness.
 
 New in v0.5.0:
 - Secure X11 Forwarding: Client accepts `-X`/`-Y` flags, extracts X11 display details and the local cookie (via `xauth`), and passes them during bootstrap.
@@ -433,7 +438,7 @@ just install-release  # copies target/release/{etr,etrs} to ~/.cargo/bin
 
 # Code quality gate — run before every commit
 just check            # cargo fmt --check + cargo clippy -D warnings
-just test             # cargo test (103 tests)
+just test             # cargo test (110 tests)
 ```
 
 ---
@@ -542,7 +547,7 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
 
 ---
 
-## Test coverage (106 tests)
+## Test coverage (110 tests)
 
 | Module | What's tested |
 |--------|--------------|

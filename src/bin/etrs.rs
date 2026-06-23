@@ -303,14 +303,20 @@ async fn run_session(
                 .arg(&fake_cookie_hex)
                 .status();
 
+            let mut xauth_ok = false;
             match status {
                 Ok(st) if st.success() => {
-                    let _ = std::process::Command::new("xauth")
+                    let status2 = std::process::Command::new("xauth")
                         .arg("add")
                         .arg(format!("localhost:{d}"))
                         .arg("MIT-MAGIC-COOKIE-1")
                         .arg(&fake_cookie_hex)
                         .status();
+                    if let Ok(st2) = status2
+                        && st2.success()
+                    {
+                        xauth_ok = true;
+                    }
                 }
                 Ok(st) => {
                     vlog!(
@@ -331,7 +337,11 @@ async fn run_session(
             std::fs::remove_file(&socket_path).ok();
 
             let active_conn_clone = Arc::clone(&active_conn);
-            let fake_cookie_vec = fake_cookie.to_vec();
+            let fake_cookie_vec = if xauth_ok {
+                fake_cookie.to_vec()
+            } else {
+                Vec::new()
+            };
             let real_cookie_clone = Arc::clone(&x11_real_cookie);
 
             match tokio::net::UnixListener::bind(&socket_path) {
@@ -1595,25 +1605,55 @@ where
     let mut data_buf = vec![0u8; data_len_padded];
     stream.read_exact(&mut data_buf).await?;
 
-    let client_cookie = &data_buf[..data_len];
-    if client_cookie != fake_cookie {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "X11 auth cookie mismatch",
-        ));
-    }
-
-    if data_len == 16 && real_cookie.len() == 16 {
-        data_buf[..16].copy_from_slice(real_cookie);
-    } else {
-        let len = data_len.min(real_cookie.len());
-        data_buf[..len].copy_from_slice(&real_cookie[..len]);
+    if !fake_cookie.is_empty() {
+        if data_len < fake_cookie.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "X11 auth cookie too short",
+            ));
+        }
+        let client_cookie = &data_buf[..fake_cookie.len()];
+        if client_cookie != fake_cookie {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "X11 auth cookie mismatch",
+            ));
+        }
     }
 
     let mut setup_block = Vec::new();
-    setup_block.extend_from_slice(&header);
-    setup_block.extend_from_slice(&name_buf);
-    setup_block.extend_from_slice(&data_buf);
+    if real_cookie.is_empty() {
+        let mut new_header = header;
+        new_header[6] = 0;
+        new_header[7] = 0;
+        new_header[8] = 0;
+        new_header[9] = 0;
+        setup_block.extend_from_slice(&new_header);
+    } else {
+        let proto_name = b"MIT-MAGIC-COOKIE-1";
+        let name_len = proto_name.len();
+        let name_len_padded = (name_len + 3) & !3;
+        let mut new_name_buf = vec![0u8; name_len_padded];
+        new_name_buf[..name_len].copy_from_slice(proto_name);
+
+        let data_len = real_cookie.len();
+        let data_len_padded = (data_len + 3) & !3;
+        let mut new_data_buf = vec![0u8; data_len_padded];
+        new_data_buf[..data_len].copy_from_slice(real_cookie);
+
+        let mut new_header = header;
+        if is_little {
+            new_header[6..8].copy_from_slice(&(name_len as u16).to_le_bytes());
+            new_header[8..10].copy_from_slice(&(data_len as u16).to_le_bytes());
+        } else {
+            new_header[6..8].copy_from_slice(&(name_len as u16).to_be_bytes());
+            new_header[8..10].copy_from_slice(&(data_len as u16).to_be_bytes());
+        }
+
+        setup_block.extend_from_slice(&new_header);
+        setup_block.extend_from_slice(&new_name_buf);
+        setup_block.extend_from_slice(&new_data_buf);
+    }
 
     Ok((stream, setup_block))
 }
@@ -1841,5 +1881,90 @@ mod tests {
         }
         assert!(x11_enabled);
         assert_eq!(extra_env, vec!["KEY=VALUE", "OTHER=foo"]);
+    }
+
+    #[tokio::test]
+    async fn test_process_x11_setup_empty_real_cookie() {
+        let mut input = vec![0x6cu8, 0, 11, 0, 0, 0];
+        input.extend_from_slice(&(18u16.to_le_bytes()));
+        input.extend_from_slice(&(16u16.to_le_bytes()));
+        input.extend_from_slice(&[0, 0]);
+
+        let proto_name = b"MIT-MAGIC-COOKIE-1";
+        input.extend_from_slice(proto_name);
+        input.extend_from_slice(&[0, 0]);
+
+        let fake_cookie = [7u8; 16];
+        input.extend_from_slice(&fake_cookie);
+
+        let cursor = std::io::Cursor::new(input);
+        let (_, setup_block) = process_x11_setup(cursor, &fake_cookie, &[]).await.unwrap();
+
+        assert_eq!(setup_block.len(), 12);
+        assert_eq!(setup_block[0], 0x6c);
+        assert_eq!(setup_block[6], 0);
+        assert_eq!(setup_block[7], 0);
+        assert_eq!(setup_block[8], 0);
+        assert_eq!(setup_block[9], 0);
+    }
+
+    #[tokio::test]
+    async fn test_process_x11_setup_replace_cookie() {
+        let mut input = vec![0x6cu8, 0, 11, 0, 0, 0];
+        input.extend_from_slice(&(18u16.to_le_bytes()));
+        input.extend_from_slice(&(16u16.to_le_bytes()));
+        input.extend_from_slice(&[0, 0]);
+
+        let proto_name = b"MIT-MAGIC-COOKIE-1";
+        input.extend_from_slice(proto_name);
+        input.extend_from_slice(&[0, 0]);
+
+        let fake_cookie = [7u8; 16];
+        input.extend_from_slice(&fake_cookie);
+
+        let real_cookie = [9u8; 16];
+        let cursor = std::io::Cursor::new(input);
+        let (_, setup_block) = process_x11_setup(cursor, &fake_cookie, &real_cookie)
+            .await
+            .unwrap();
+
+        assert_eq!(setup_block[0], 0x6c);
+        let name_len = u16::from_le_bytes([setup_block[6], setup_block[7]]);
+        assert_eq!(name_len, 18);
+        let data_len = u16::from_le_bytes([setup_block[8], setup_block[9]]);
+        assert_eq!(data_len, 16);
+        assert_eq!(&setup_block[12..30], proto_name);
+        assert_eq!(&setup_block[32..48], &real_cookie);
+    }
+
+    #[tokio::test]
+    async fn test_process_x11_setup_skip_validation() {
+        let mut input = vec![0x6cu8, 0, 11, 0, 0, 0];
+        input.extend_from_slice(&(0u16.to_le_bytes()));
+        input.extend_from_slice(&(0u16.to_le_bytes()));
+        input.extend_from_slice(&[0, 0]);
+
+        let cursor = std::io::Cursor::new(input);
+        let (_, setup_block) = process_x11_setup(cursor, &[], &[]).await.unwrap();
+        assert_eq!(setup_block.len(), 12);
+    }
+
+    #[tokio::test]
+    async fn test_process_x11_setup_mismatch() {
+        let mut input = vec![0x6cu8, 0, 11, 0, 0, 0];
+        input.extend_from_slice(&(18u16.to_le_bytes()));
+        input.extend_from_slice(&(16u16.to_le_bytes()));
+        input.extend_from_slice(&[0, 0]);
+
+        let proto_name = b"MIT-MAGIC-COOKIE-1";
+        input.extend_from_slice(proto_name);
+        input.extend_from_slice(&[0, 0]);
+
+        let fake_cookie = [7u8; 16];
+        input.extend_from_slice(&[8u8; 16]);
+
+        let cursor = std::io::Cursor::new(input);
+        let res = process_x11_setup(cursor, &fake_cookie, &[]).await;
+        assert!(res.is_err());
     }
 }
