@@ -111,18 +111,18 @@ install-release: build-release install-man
 
 # ── Man pages ────────────────────────────────────────────────────────────────
 
-# Build man pages from man/*.md using pandoc
+# Build man pages from man/*.md using mandown
 man:
     #!/usr/bin/env bash
     set -euo pipefail
-    if ! command -v pandoc >/dev/null 2>&1; then
-        echo "ERROR: pandoc is required to build man pages" >&2
+    if ! command -v mandown >/dev/null 2>&1; then
+        echo "ERROR: mandown is required to build man pages (cargo install mandown)" >&2
         exit 1
     fi
     VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
     mkdir -p man/build
-    pandoc -s -t man --metadata=footer:"etr $VERSION" man/etr.1.md  -o man/build/etr.1
-    pandoc -s -t man --metadata=footer:"etr $VERSION" man/etrs.1.md -o man/build/etrs.1
+    mandown man/etr.1.md ETR 1  | sed "1s|.*|.TH \"ETR\" \"1\" \"\" \"etr $VERSION\" \"User Commands\"|"  > man/build/etr.1
+    mandown man/etrs.1.md ETRS 1 | sed "1s|.*|.TH \"ETRS\" \"1\" \"\" \"etr $VERSION\" \"User Commands\"|" > man/build/etrs.1
     echo "Built man/build/etr.1 and man/build/etrs.1 (version $VERSION)"
 
 # Install man pages to XDG local man directory (~/.local/share/man/man1)

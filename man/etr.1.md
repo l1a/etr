@@ -1,10 +1,3 @@
----
-title: ETR
-section: 1
-header: User Commands
-date: June 2026
----
-
 # NAME
 
 etr - Eternal Terminal client
