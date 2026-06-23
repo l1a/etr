@@ -112,6 +112,12 @@ SSH channel and pinned for subsequent QUIC connections.
     **[::]** socket, which accepts both IPv4 and IPv6 connections on all interfaces,
     instead of binding to loopback only.
 
+**-X**
+:   Enable X11 forwarding. Extracts the local X11 display cookie from the active display (via **xauth**) and securely forwards it to the server.
+
+**-Y**
+:   Enable trusted X11 forwarding. Treated identically to **-X**.
+
 **\-\-server-path** *PATH*
 :   Path to the **etrs** binary on the remote host. Defaults to **etrs**
     (relies on **PATH**), or the value of **server_path** in the config file.
@@ -160,6 +166,12 @@ forward = ["8080:localhost:80", "*:3000:localhost:3000"]
 
 # Default remote port forwards
 reverse_forward = ["9090:localhost:90"]
+
+# Enable X11 forwarding (default: false)
+x11 = false
+
+# Enable trusted X11 forwarding (default: false)
+x11_trusted = false
 ```
 
 # FILES

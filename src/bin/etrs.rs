@@ -137,6 +137,7 @@ fn main() -> io::Result<()> {
     // of an interactive shell.  Old clients close stdin immediately (zero iters).
     let mut extra_env: Vec<String> = Vec::new();
     let mut remote_command: Option<String> = None;
+    let mut x11_enabled = false;
     {
         use std::io::BufRead;
         let stdin = io::stdin();
@@ -145,6 +146,9 @@ fn main() -> io::Result<()> {
                 Ok(l) if l.is_empty() => break,
                 Ok(l) if l.starts_with("ETRCMD:") => {
                     remote_command = l.strip_prefix("ETRCMD:").map(str::to_string);
+                }
+                Ok(l) if l.starts_with("ETRX11:") => {
+                    x11_enabled = true;
                 }
                 Ok(l) => extra_env.push(l),
                 Err(_) => break,
@@ -219,6 +223,7 @@ fn main() -> io::Result<()> {
                 reconnect_timeout,
                 extra_env,
                 remote_command,
+                x11_enabled,
             )
             .await
         })
@@ -262,6 +267,7 @@ fn session_log_path() -> std::path::PathBuf {
 
 /// Run the session reconnect loop until the client cleanly disconnects or
 /// the reconnect window expires.
+#[allow(clippy::too_many_arguments)]
 async fn run_session(
     endpoint: quinn::Endpoint,
     session_id: [u8; 16],
@@ -270,6 +276,7 @@ async fn run_session(
     reconnect_timeout: Duration,
     extra_env: Vec<String>,
     remote_command: Option<String>,
+    x11_enabled: bool,
 ) -> io::Result<()> {
     vlog!(
         1,
@@ -277,6 +284,137 @@ async fn run_session(
         hex_encode(&session_id),
         endpoint.local_addr()?.port()
     );
+
+    let active_conn = Arc::new(Mutex::new(None));
+    let x11_real_cookie: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+    let mut _cleanup = None;
+    let mut display_num = None;
+
+    if x11_enabled {
+        if let Some(d) = find_free_display() {
+            display_num = Some(d);
+            let fake_cookie: [u8; 16] = rand::random();
+            let fake_cookie_hex = hex_encode(&fake_cookie);
+
+            let status = std::process::Command::new("xauth")
+                .arg("add")
+                .arg(format!("localhost/unix:{d}"))
+                .arg("MIT-MAGIC-COOKIE-1")
+                .arg(&fake_cookie_hex)
+                .status();
+
+            match status {
+                Ok(st) if st.success() => {
+                    let _ = std::process::Command::new("xauth")
+                        .arg("add")
+                        .arg(format!("localhost:{d}"))
+                        .arg("MIT-MAGIC-COOKIE-1")
+                        .arg(&fake_cookie_hex)
+                        .status();
+                }
+                Ok(st) => {
+                    vlog!(
+                        1,
+                        "[etrs] X11: warning: xauth add returned non-zero status: {st}"
+                    );
+                }
+                Err(e) => {
+                    vlog!(1, "[etrs] X11: warning: xauth command failed to run: {e}");
+                }
+            }
+
+            let socket_path = format!("/tmp/.X11-unix/X{d}");
+            std::fs::create_dir_all("/tmp/.X11-unix").ok();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions("/tmp/.X11-unix", std::fs::Permissions::from_mode(0o1777))
+                .ok();
+            std::fs::remove_file(&socket_path).ok();
+
+            let active_conn_clone = Arc::clone(&active_conn);
+            let fake_cookie_vec = fake_cookie.to_vec();
+            let real_cookie_clone = Arc::clone(&x11_real_cookie);
+
+            match tokio::net::UnixListener::bind(&socket_path) {
+                Ok(listener) => {
+                    let active_conn = Arc::clone(&active_conn_clone);
+                    let fake_cookie = fake_cookie_vec.clone();
+                    let real_cookie = Arc::clone(&real_cookie_clone);
+                    tokio::spawn(async move {
+                        while let Ok((stream, _)) = listener.accept().await {
+                            let active_conn = Arc::clone(&active_conn);
+                            let fake_cookie = fake_cookie.clone();
+                            let real_cookie = Arc::clone(&real_cookie);
+                            tokio::spawn(async move {
+                                let conn = {
+                                    let g = active_conn.lock().await;
+                                    g.clone()
+                                };
+                                let rc = {
+                                    let g = real_cookie.lock().await;
+                                    g.clone()
+                                };
+                                if let (Some(c), Some(rc_val)) = (conn, rc)
+                                    && let Ok((stream, setup_block)) =
+                                        process_x11_setup(stream, &fake_cookie, &rc_val).await
+                                {
+                                    forward_x11_connection(stream, setup_block, c).await;
+                                }
+                            });
+                        }
+                    });
+                }
+                Err(e) => {
+                    vlog!(
+                        1,
+                        "[etrs] X11: failed to bind Unix socket {socket_path}: {e}"
+                    );
+                }
+            }
+
+            let tcp_port = 6000 + d;
+            for bind_ip in &["127.0.0.1", "[::1]"] {
+                let bind_addr = format!("{bind_ip}:{tcp_port}");
+                match tokio::net::TcpListener::bind(&bind_addr).await {
+                    Ok(listener) => {
+                        let active_conn = Arc::clone(&active_conn_clone);
+                        let fake_cookie = fake_cookie_vec.clone();
+                        let real_cookie = Arc::clone(&real_cookie_clone);
+                        tokio::spawn(async move {
+                            while let Ok((stream, _)) = listener.accept().await {
+                                let _ = stream.set_nodelay(true);
+                                let active_conn = Arc::clone(&active_conn);
+                                let fake_cookie = fake_cookie.clone();
+                                let real_cookie = Arc::clone(&real_cookie);
+                                tokio::spawn(async move {
+                                    let conn = {
+                                        let g = active_conn.lock().await;
+                                        g.clone()
+                                    };
+                                    let rc = {
+                                        let g = real_cookie.lock().await;
+                                        g.clone()
+                                    };
+                                    if let (Some(c), Some(rc_val)) = (conn, rc)
+                                        && let Ok((stream, setup_block)) =
+                                            process_x11_setup(stream, &fake_cookie, &rc_val).await
+                                    {
+                                        forward_x11_connection(stream, setup_block, c).await;
+                                    }
+                                });
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        vlog!(1, "[etrs] X11: failed to bind TCP {bind_addr}: {e}");
+                    }
+                }
+            }
+
+            _cleanup = Some(X11Cleanup { display_num: d });
+        } else {
+            vlog!(1, "[etrs] X11: no free display numbers available");
+        }
+    }
 
     // ── PTY setup ────────────────────────────────────────────────────────────
     let pty_system = native_pty_system();
@@ -302,6 +440,9 @@ async fn run_session(
     } else {
         CommandBuilder::new_default_prog()
     };
+    if let Some(d) = display_num {
+        cmd.env("DISPLAY", format!("localhost:{d}.0"));
+    }
     cmd.env("TERM", &term);
     // Signal to shell startup scripts that this is an etr session, analogous
     // to SSH_CONNECTION / SSH_TTY set by OpenSSH.
@@ -401,7 +542,6 @@ async fn run_session(
         });
     }
 
-    let active_conn = Arc::new(Mutex::new(None));
     let active_reverse_listeners = Arc::new(Mutex::new(std::collections::HashSet::new()));
 
     // ── Reconnect loop ───────────────────────────────────────────────────────
@@ -501,6 +641,7 @@ async fn run_session(
                 Arc::clone(&active_conn),
                 Arc::clone(&active_reverse_listeners),
                 shell_exit_rx.clone(),
+                Arc::clone(&x11_real_cookie),
             ) => (r, false),
             _ = sigterm_conn.recv() => {
                 vlog!(1, "[etrs] SIGTERM during active session, closing connection");
@@ -557,6 +698,7 @@ async fn handle_connection(
     active_conn: Arc<Mutex<Option<quinn::Connection>>>,
     active_reverse_listeners: Arc<Mutex<std::collections::HashSet<String>>>,
     shell_exit_rx: tokio::sync::watch::Receiver<bool>,
+    x11_real_cookie: Arc<Mutex<Option<Vec<u8>>>>,
 ) -> bool {
     let peer = conn.remote_address();
     vlog!(
@@ -623,6 +765,11 @@ async fn handle_connection(
 
     vlog!(2, "[etrs] session verified peer={peer}");
     vlog!(2, "[etrs] {}", etr::quic::tls_info());
+
+    if session_open.x11_enabled {
+        let mut rc = x11_real_cookie.lock().await;
+        *rc = Some(session_open.x11_auth_cookie.clone());
+    }
 
     // Collect replays and build SessionAccept.
     let (replays, server_last) = {
@@ -1374,6 +1521,181 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
+fn find_free_display() -> Option<u16> {
+    for d in 10..100 {
+        let socket_path = format!("/tmp/.X11-unix/X{d}");
+        if std::path::Path::new(&socket_path).exists() {
+            continue;
+        }
+        let target_v4 = format!("127.0.0.1:{}", 6000 + d);
+        let target_v6 = format!("[::1]:{}", 6000 + d);
+        if std::net::TcpListener::bind(&target_v4).is_ok()
+            && std::net::TcpListener::bind(&target_v6).is_ok()
+        {
+            return Some(d);
+        }
+    }
+    None
+}
+
+struct X11Cleanup {
+    display_num: u16,
+}
+
+impl Drop for X11Cleanup {
+    fn drop(&mut self) {
+        let d = self.display_num;
+        let socket_path = format!("/tmp/.X11-unix/X{d}");
+        std::fs::remove_file(&socket_path).ok();
+        let _ = std::process::Command::new("xauth")
+            .arg("remove")
+            .arg(format!("localhost/unix:{d}"))
+            .status();
+        let _ = std::process::Command::new("xauth")
+            .arg("remove")
+            .arg(format!("localhost:{d}"))
+            .status();
+        vlog!(1, "[etrs] X11: cleaned up display {d}");
+    }
+}
+
+async fn process_x11_setup<S>(
+    mut stream: S,
+    fake_cookie: &[u8],
+    real_cookie: &[u8],
+) -> io::Result<(S, Vec<u8>)>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut header = [0u8; 12];
+    stream.read_exact(&mut header).await?;
+
+    let byte_order = header[0];
+    let is_little = byte_order == 0x6c;
+
+    let name_len = if is_little {
+        u16::from_le_bytes([header[6], header[7]])
+    } else {
+        u16::from_be_bytes([header[6], header[7]])
+    } as usize;
+
+    let data_len = if is_little {
+        u16::from_le_bytes([header[8], header[9]])
+    } else {
+        u16::from_be_bytes([header[8], header[9]])
+    } as usize;
+
+    let name_len_padded = (name_len + 3) & !3;
+    let data_len_padded = (data_len + 3) & !3;
+
+    let mut name_buf = vec![0u8; name_len_padded];
+    stream.read_exact(&mut name_buf).await?;
+
+    let mut data_buf = vec![0u8; data_len_padded];
+    stream.read_exact(&mut data_buf).await?;
+
+    let client_cookie = &data_buf[..data_len];
+    if client_cookie != fake_cookie {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "X11 auth cookie mismatch",
+        ));
+    }
+
+    if data_len == 16 && real_cookie.len() == 16 {
+        data_buf[..16].copy_from_slice(real_cookie);
+    } else {
+        let len = data_len.min(real_cookie.len());
+        data_buf[..len].copy_from_slice(&real_cookie[..len]);
+    }
+
+    let mut setup_block = Vec::new();
+    setup_block.extend_from_slice(&header);
+    setup_block.extend_from_slice(&name_buf);
+    setup_block.extend_from_slice(&data_buf);
+
+    Ok((stream, setup_block))
+}
+
+async fn forward_x11_connection<S>(stream: S, setup_block: Vec<u8>, conn: quinn::Connection)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut quic_send, quic_recv) = match conn.open_bi().await {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    if quic_send.write_all(&[TAG_FORWARD]).await.is_err() {
+        return;
+    }
+    let env = Envelope {
+        payload: Some(Payload::StreamOpen(StreamOpen {
+            stream_id: 0,
+            stream_type: etr::protocol::StreamType::X11 as i32,
+            remote_host: String::new(),
+            remote_port: 0,
+            forward_proto: ForwardProto::Tcp as i32,
+        })),
+    };
+    if quic::write_msg(&mut quic_send, &env).await.is_err() {
+        return;
+    }
+    if quic_send.write_all(&setup_block).await.is_err() {
+        return;
+    }
+    pipe_generic_quic(stream, quic_send, quic_recv).await;
+}
+
+async fn pipe_generic_quic<S>(
+    stream: S,
+    mut quic_send: quinn::SendStream,
+    mut quic_recv: quinn::RecvStream,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (mut r, mut w) = tokio::io::split(stream);
+
+    let mut t1 = tokio::spawn(async move {
+        let mut buf = vec![0u8; 256 * 1024];
+        loop {
+            match r.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if quic_send.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = quic_send.finish();
+    });
+
+    let mut t2 = tokio::spawn(async move {
+        let mut buf = vec![0u8; 256 * 1024];
+        loop {
+            match quic_recv.read(&mut buf).await {
+                Ok(None) | Err(_) => break,
+                Ok(Some(0)) => continue,
+                Ok(Some(n)) => {
+                    if w.write_all(&buf[..n]).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = w.shutdown().await;
+    });
+
+    tokio::select! {
+        _ = &mut t1 => {}
+        _ = &mut t2 => {}
+    }
+    t1.abort();
+    t2.abort();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1499,5 +1821,25 @@ mod tests {
             }
         }
         assert!(remote_command.is_none());
+    }
+
+    #[test]
+    fn test_etrx11_line_parsing() {
+        let lines: Vec<String> = vec![
+            "KEY=VALUE".to_string(),
+            "ETRX11:true".to_string(),
+            "OTHER=foo".to_string(),
+        ];
+        let mut x11_enabled = false;
+        let mut extra_env = Vec::new();
+        for l in lines {
+            if l.starts_with("ETRX11:") {
+                x11_enabled = true;
+            } else {
+                extra_env.push(l);
+            }
+        }
+        assert!(x11_enabled);
+        assert_eq!(extra_env, vec!["KEY=VALUE", "OTHER=foo"]);
     }
 }

@@ -23,6 +23,7 @@
 pub enum StreamType {
     Terminal = 0,
     PortForward = 1,
+    X11 = 2,
 }
 
 /// Transport protocol for a port-forward stream.
@@ -55,6 +56,15 @@ pub struct SessionOpen {
     /// instead of loopback only.  Corresponds to the client's -g / --gateway-ports flag.
     #[prost(bool, tag = "5")]
     pub gateway_ports: bool,
+    /// If true, X11 forwarding is requested by the client.
+    #[prost(bool, tag = "6")]
+    pub x11_enabled: bool,
+    /// X11 auth protocol name (e.g. "MIT-MAGIC-COOKIE-1").
+    #[prost(string, tag = "7")]
+    pub x11_auth_proto: String,
+    /// X11 auth cookie bytes.
+    #[prost(bytes = "vec", tag = "8")]
+    pub x11_auth_cookie: Vec<u8>,
 }
 
 /// Sent by the server in reply to [`SessionOpen`] once the session is verified.
@@ -182,6 +192,9 @@ mod tests {
                 last_received_seq: [(0u32, 7u64)].into(),
                 reverse_forwards: vec!["9090:localhost:90".to_string()],
                 gateway_ports: true,
+                x11_enabled: true,
+                x11_auth_proto: "MIT-MAGIC-COOKIE-1".to_string(),
+                x11_auth_cookie: vec![0xAB; 16],
             })),
         };
         let decoded = Envelope::decode(env.encode_to_vec().as_slice()).unwrap();
@@ -189,6 +202,9 @@ mod tests {
         // Verify gateway_ports survives the round trip.
         if let Some(Payload::SessionOpen(so)) = decoded.payload {
             assert!(so.gateway_ports);
+            assert!(so.x11_enabled);
+            assert_eq!(so.x11_auth_proto, "MIT-MAGIC-COOKIE-1");
+            assert_eq!(so.x11_auth_cookie, vec![0xAB; 16]);
             assert_eq!(so.reverse_forwards, vec!["9090:localhost:90"]);
         } else {
             panic!("expected SessionOpen payload");

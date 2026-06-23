@@ -9,7 +9,15 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.4.24 — Nushell zero-config completions autoloading
+## Current state: v0.5.0 — X11 forwarding support (-X and -Y)
+
+New in v0.5.0:
+- Secure X11 Forwarding: Client accepts `-X`/`-Y` flags, extracts X11 display details and the local cookie (via `xauth`), and passes them during bootstrap.
+- Dynamic Display Allocation: Server dynamically allocates a free display `$D` (checking unix socket `/tmp/.X11-unix/X$D` and loopback TCP ports `6000+$D`), spawns listeners on both Unix and TCP, and translates fake cookies back to real cookies.
+- Automated Cleanup: Sockets and `xauth` cookies on the server are cleaned up via RAII/Drop when the session exits.
+- Configuration Options: Client configuration now supports `x11` and `x11_trusted` flags under the `[client]` section in `config.toml`.
+
+## Previous: v0.4.24 — Nushell zero-config completions autoloading
 
 New in v0.4.24:
 - Changed the default Nushell completions directory (`NU_COMP`) in the `justfile` to `~/.config/nushell/autoload` (respecting `XDG_CONFIG_HOME` if set) to leverage Nushell's native autoload paths.
@@ -502,11 +510,7 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
 - ~~**UDP reply routing**~~ **Done**: Each unique local UDP sender (`peer_addr:peer_port`) now gets its own ephemeral socket on the server (`-L`) and client (`-R`), so replies from the remote target are routed back to the correct sender regardless of interleaving. Idle sender sockets are evicted after 30 s. This removes the last-sender-wins limitation for concurrent DNS/STUN/game-protocol clients.
 - ~~**`--env` e2e test**~~ **Done**: `just e2e-env-local` tests both `--env KEY=VALUE` (explicit set) and `--env KEY` (bare forward from local env) end-to-end through a live `etr localhost` session.
 - ~~**Concurrent UDP senders regression test**~~ **Done**: `just e2e-udp-concurrent` sends interleaved datagrams from two independent sockets through `-L` UDP forwarding and asserts each socket receives its own reply. Regression coverage for the v0.4.9 per-sender routing fix.
-- **X11 / Wayland forwarding**: `DISPLAY` and `WAYLAND_DISPLAY` are not forwarded
-  because there is no X11/Wayland channel implementation.  Adding this would require
-  an X11 proxy (like OpenSSH's `-X`/`-Y` mode) or a Wayland compositor proxy — a
-  meaningful feature, not a one-liner.  For now, GUI programs launched via
-  `etr host cmd` will fail if they need a display server.
+- ~~**X11 forwarding**~~ **Done**: X11 forwarding (`-X` and `-Y`) is implemented with dynamic display allocation, xauth cookie spoofing/rewriting, and automatic socket/cookie cleanup. Wayland forwarding and Wayland compositor proxying are out of scope.
 - **PQC key exchange**: ML-KEM was retired with the QUIC migration.  Can be re-added
   via `rustls-post-quantum` (X25519MLKEM768 hybrid) once it stabilises.
 - **macOS**: fully tested and working.  PTY session, reconnect, and port forwarding
@@ -538,16 +542,16 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
 
 ---
 
-## Test coverage (103 tests)
+## Test coverage (106 tests)
 
 | Module | What's tested |
 |--------|--------------|
 | `quic` | Cert generation, server/client config, write/read Envelope framing, write/read PTY chunk framing |
-| `protocol` | SessionOpen/Accept encode-decode (incl. `gateway_ports` and `reverse_forwards` round-trip), StreamOpen/Close, Heartbeat, Disconnect, UdpDatagram |
+| `protocol` | SessionOpen/Accept encode-decode (incl. `gateway_ports`, `reverse_forwards`, and `x11_enabled`/`x11_auth_proto`/`x11_auth_cookie` round-trip), StreamOpen/Close, Heartbeat, Disconnect, UdpDatagram |
 | `session/stream` | Acknowledge edge cases, replay from 0, initial seq values |
 | `session/mod` | Close/ack unknown stream, `last_received_map` semantics, collect_replays, `open_stream` idempotence |
-| `bin/etrs` | CLI defaults, verbose count, custom port, subcommand parsing, hex_decode, custom --log-path override |
+| `bin/etrs` | CLI defaults, verbose count, custom port, subcommand parsing, hex_decode, custom --log-path override, `ETRX11` bootstrap line parsing |
 | `login` | no-panic checks for record_login / record_logout with invalid fd |
 | `bin/etr` | CLI defaults, port parsing, target parsing, no --cipher flag, custom --log-path and --server-log-path overrides, config fallback for log paths |
-| `config` | TOML parse (full section, partial, empty), default values, `gateway_ports` / `forward` / `reverse_forward` config keys |
-| `forward` | `-L`/`-R` spec parsing: TCP/UDP/IPv6, explicit proto, bad port, empty host, Display; bind address parsing (explicit IP, `[::1]`, wildcard `*`); `get_bind_addresses` with and without gateway flag; `resolve_udp_target`: localhost prefers IPv6, explicit IPv4, unresolvable host |
+| `config` | TOML parse (full section, partial, empty), default values, `gateway_ports` / `forward` / `reverse_forward` / `x11` / `x11_trusted` config keys |
+| `forward` | `-L`/`-R` spec parsing: TCP/UDP/IPv6, explicit proto, bad port, empty host, Display; bind address parsing (explicit IP, `[::1]`, wildcard `*`); `get_bind_addresses` with and without gateway flag; `resolve_udp_target`: localhost prefers IPv6, explicit IPv4, unresolvable host; `X11Display` parsing |
