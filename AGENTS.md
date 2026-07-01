@@ -1,8 +1,73 @@
 # AI Agent Guidelines (AGENTS.md)
 
-Welcome! This file contains project-specific guidelines, constraints, and instructions for all AI assistants (Gemini, Claude, etc.) contributing to the **etr** project.
+Welcome! This file contains project-specific guidelines, constraints, and instructions for
+all AI assistants (Gemini, Claude, etc.) contributing to the **etr** project.
+
+This file has two parts:
+
+- **Part 1 — Portable Core**: rules that are identical across all of Ken's repos using this
+  pattern (currently `etr` and `retch`). If you change wording here, propagate the same
+  change to the Portable Core section in sibling repos so they stay in sync.
+- **Part 2 — Project-Specific**: rules that only make sense for `etr`.
 
 ---
+
+# Part 1 — Portable Core
+
+## 0. Global Mandates
+Before doing anything else in a session, read `~/AGENTS.md` (and any skill files it
+references) if it exists on the current machine. It carries standing mandates that
+apply across all of Ken's repos and are not repeated here — e.g. the chezmoi
+native-command hierarchy, the `[REASONING TRACE]` requirement, and language
+requirements. If `~/AGENTS.md` conflicts with this file on a repo-specific detail
+(e.g. a project's own branch-naming or checklist convention), this file wins for
+that detail; `~/AGENTS.md`'s cross-cutting mandates still apply.
+
+## 1. Source Control & Commit Workflow
+* **Branch Naming:** Always name new git branches using the prefix pattern `{feature,fix,chore,etc.}/<branch-name>`.
+* **Workflow Mandate:** You MUST create and switch to your feature/fix branch *before* starting any file modifications or executing commands to avoid working on `main` by mistake.
+* **Commit Summaries:** Write short, clear subjects (max 50 chars) in the imperative mood.
+* **AI Attribution:** Use `Assisted-By: <model name>` (no email address) as the trailer line in commits. Use the actual model name of the AI assistant that helped (e.g. `Gemini 3.5 Flash`, `Claude Sonnet 4.6`, `Claude Opus 4`, etc.).
+* **Constraint:** NEVER run background `git commit` or `git push` without explicit authorization.
+* **Mandate:** ALWAYS ask for explicit permission before submitting a Pull Request (PR) or performing a merge.
+* **Branch Cleanup:** Delete feature branches from the remote after they are merged. Periodically prune abandoned branches that were never PRed.
+
+## 2. Engineering Philosophy & Safety
+* **Cognitive Circuit Breaker:** Before modifying files or running commands, identify if target files are managed by `chezmoi` (except if located in `~/git` or `~/Sync/git`). If managed, prioritize chezmoi native commands.
+* **Absolute Accuracy:** Absolute accuracy is the primary metric. Speed is irrelevant.
+* **The Reasoning Trace:** Before implementing any multi-file change, you MUST output a `[REASONING TRACE]` covering Invariants, Subsystem Impact, and Edge-Cases.
+* **Empirical Validation:** Test changes locally (compilation, lints, formatting, and unit tests) before proposing a push. See Part 2 §4 for this project's full Pre-PR Checklist and automated gate.
+
+## 3. Cross-Machine Work Handoff (WIP.md)
+Any agent starting a session on a repository utilizing cross-machine sync MUST read `WIP.md` before doing anything else.
+* **Purpose:** `WIP.md` is a `.gitignored` file synced via Syncthing/Insync to carry context that cannot be inferred from git history alone (what is partially done, machine specs, active branch, next-step checklists, caveats).
+* **When to Update:**
+  * When switching to a new branch (clear old content, write new context).
+  * Before switching machines or ending a session.
+  * After pushing commits that change the state of the work.
+  * After a PR is merged (set `Active Branch: none (main is current)`).
+  * Whenever the next-step checklist changes.
+* **What to Include:**
+  1. **Machine**: OS, distro, and architecture of the last saved state (e.g. `Linux Fedora 44 x86_64`).
+  2. **Active branch name** and PR URL (if open).
+  3. **Latest commit hash** and message.
+  4. **What was implemented**: Concise description of new/modified files.
+  5. **Bugs fixed**: What went wrong and how it was resolved.
+  6. **Current CI state**: Passing/failing.
+  7. **Open tasks**: Checkbox list of remaining work.
+  8. **How to resume**: Exact shell commands to check out, build, and verify.
+  9. **Why this work**: Motivating context.
+* **What NOT to Include:** Full code diffs, large file contents, detailed architecture docs.
+
+## 4. Continuous Learning Loop
+At the conclusion of any task involving a specific skill:
+1. Did you encounter a failure, edge case, or nuance not currently documented in the skill?
+2. Did the user have to correct your workflow?
+3. If YES to either, you MUST automatically update the corresponding `SKILL.md` file with the new learning and synchronize the change before declaring the task complete.
+
+---
+
+# Part 2 — Project-Specific: etr
 
 ## 0. Start of session — required reading
 
@@ -11,14 +76,10 @@ record of current project state: architecture decisions, known gaps, working fea
 and design intent. Do not rely on git history or code inspection alone — NOTES.md
 captures context that is not in the code.
 
----
-
 ## 1. Project Overview
 `etr` is a Rust implementation of the C++ tool **Eternal Terminal (et)**. It is a remote
 shell that automatically reconnects without interrupting the session. See NOTES.md for
 full architecture and current status.
-
----
 
 ## 2. Core Developer Guidelines
 * **Safety First:** Avoid `unsafe` Rust unless absolutely necessary for low-level system integrations (like PTY allocation). If `unsafe` is used, it must be thoroughly documented with safety comments.
@@ -29,44 +90,49 @@ full architecture and current status.
   * Always document the code clearly as you go.
   * All new features must include unit or integration tests where applicable.
 
----
-
-## 3. Workflow & Source Control
-* **Branching:** Always create a new feature/fix branch before making modifications. Use the prefix pattern `{feature,fix,chore,etc.}/<branch-name>`.
-* **Commits:**
-  * Keep commit subject lines under 50 characters, in the imperative mood.
-  * Always append the AI attribution line as a trailer: `Assisted-By: <Model Name>` (e.g., `Assisted-By: Gemini 3.5 Flash`).
-* **PRs & Merges:** Never push to `main` directly or run background push/commit operations without explicit user confirmation.
-* **NOTES.md — update on every commit or push:** Before committing or pushing, update
-  `NOTES.md` to reflect any changes to architecture, known gaps, working features, or
-  design decisions made during the session. NOTES.md must stay current — a reader
-  picking up the project from NOTES.md alone should have an accurate picture.
-
----
+## 3. NOTES.md — update on every commit or push
+Before committing or pushing, update `NOTES.md` to reflect any changes to architecture,
+known gaps, working features, or design decisions made during the session. NOTES.md must
+stay current — a reader picking up the project from NOTES.md alone should have an
+accurate picture.
 
 ## 4. Pre-PR Checklist
 
 Before opening a pull request — and before each subsequent push to an open PR — you
-MUST verify every item below. Work through the list top-to-bottom; do not submit until
-all items are satisfied or explicitly marked N/A with a reason.
+MUST run `just pr`. It automates most of this checklist and hard-fails on the
+unconditional items; the rest is a manual checklist it prints for you to confirm. Do not
+run `gh pr create` until `just pr` reports the gate passed.
 
-### STOP — read this before marking anything N/A
+### STOP — read this before treating anything as optional
 
 Two items are **unconditional** — they apply to every PR without exception, including
-doc-only, test-only, and chore PRs.  There is no "this is just a small change" carve-out.
+doc-only, test-only, and chore PRs. There is no "this is just a small change" carve-out,
+and `just pr` will hard-fail the gate if either is missed:
 
-| Step | Command | Why unconditional |
-|------|---------|------------------|
-| **4.5 — `just man`** | `just man` | Verifies mandown still builds both man pages; the version header must match the bumped version. |
-| **4.10 — Version bump** | edit `Cargo.toml` | Every merged PR changes the codebase; the published version must reflect that. Use **patch** for fixes, tests, and doc improvements; **minor** for new user-visible features. |
+| Step | Why unconditional |
+|------|------------------|
+| **Man page regen (4.5)** | Verifies mandown still builds both man pages; the version header must match the bumped version. |
+| **Version bump (4.10)** | Every merged PR changes the codebase; the published version must reflect that. Use **patch** for fixes, tests, and doc improvements; **minor** for new user-visible features. |
 
 Rationalising either of these away — "it's only docs", "it's only tests", "no behaviour
-changed" — is incorrect.  If you find yourself about to skip 4.5 or 4.10, stop and do
+changed" — is incorrect. If you find yourself about to skip 4.5 or 4.10, stop and do
 them instead.
 
 NOTES.md (4.9) and the wiki (4.11) are also required on every PR. They must be updated
-**before** the PR is opened, not deferred.  AGENTS.md itself must be included in the
+**before** the PR is opened, not deferred. AGENTS.md itself must be included in the
 same PR as any change to the checklist — never pushed to `main` as a standalone commit.
+
+### 4.0 Automated gate — `just pr`
+Run `just pr` before opening a PR and before each subsequent push. It runs, in order,
+and hard-fails on the first problem:
+1. Confirms you are on a feature branch, not `main`.
+2. Confirms `Cargo.toml`'s version has been bumped past the last git tag.
+3. Confirms `NOTES.md` has a `## Current state: v<version>` header matching the bumped version.
+4. Regenerates man pages (`just man`) and fails if `mandown` errors out. `man/build/` is gitignored, so there is nothing to diff or commit here — this step only proves the man pages still build and the version header is current.
+5. Runs `cargo check` and fails if `Cargo.lock` changed but wasn't committed.
+6. Runs `just check` (`cargo fmt --check` + `cargo clippy --all-targets -D warnings`).
+7. Runs `cargo test`.
+8. Prints the manual checklist below (4.1–4.12 minus what's automated) and requires an explicit confirmation before printing "gate passed".
 
 ### 4.1 Code quality gate
 - [ ] `just check` passes — `cargo fmt --check` + `cargo clippy --all-targets -D warnings`
@@ -157,5 +223,10 @@ Clone `https://github.com/l1a/etr.wiki.git`, edit the relevant pages, and push:
 - [ ] Title is concise (≤ 70 chars), imperative mood.
 - [ ] Body summarises *what* changed and *why* (not just a commit list).
 - [ ] Test plan lists manual verification steps the reviewer can follow.
+
+## 5. Merging
+After a PR is merged, run `just merge-pr` to switch to `main`, pull, delete the local
+feature branch, and reset `WIP.md` (`Active Branch: none (main is current)`, latest
+commit updated).
 
 ---
