@@ -9,9 +9,20 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.5.2 — switch man page tooling from pandoc to mandown
+## Current state: v0.5.3 — merge AGENTS.md with retch, add just pr/merge-pr gate
 
-New in v0.5.2:
+New in v0.5.3:
+- `AGENTS.md` restructured into a Portable Core (shared, kept in sync with `retch`'s
+  AGENTS.md) plus a Part 2 project-specific section. Added WIP.md cross-machine
+  handoff workflow and branch-cleanup rule, adopted from `retch`.
+- Added `just pr` (automated Pre-PR gate: branch check, version-bump check, NOTES.md
+  header check, man page build, Cargo.lock check, fmt/clippy, tests, manual checklist)
+  and `just merge-pr` (squash-merge, reset WIP.md) recipes, mirroring `retch`'s Justfile.
+- Added `scripts/reset_wip.py` and gitignored `WIP.md`.
+
+## Previous: v0.5.2 — switch man page tooling from pandoc to mandown
+
+Previously in v0.5.2:
 - Man page build tooling replaced: `pandoc` → `mandown` (`cargo install mandown`).
   `just man` now invokes `mandown man/etr.1.md ETR 1` and patches the `.TH` line via
   sed to embed the version and "User Commands" header, matching prior pandoc output.

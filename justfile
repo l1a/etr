@@ -57,6 +57,92 @@ audit:
 check: fmt-check clippy
     @echo "All checks passed."
 
+# Pre-PR gate: run all automated checks and print manual checklist before opening a PR.
+# All items must pass before calling `gh pr create`. See AGENTS.md Part 2 §4.
+pr:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    BOLD='\033[1m'; GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
+    pass() { echo -e "${GREEN}[✓]${NC} $1"; }
+    fail() { echo -e "${RED}[✗]${NC} $1"; exit 1; }
+    info() { echo -e "${YELLOW}[→]${NC} $1"; }
+
+    echo -e "\n${BOLD}=== Pre-PR Gate ===${NC}\n"
+
+    # 1. Must be on a feature branch
+    BRANCH=$(git rev-parse --abbrev-ref HEAD)
+    [ "$BRANCH" = "main" ] && fail "On main — create a feature branch first"
+    pass "Feature branch: $BRANCH"
+
+    # 2. Version must be bumped past the last tag
+    CARGO_VER=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+    LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "none")
+    [ "$LAST_TAG" = "v$CARGO_VER" ] && fail "Version not bumped — Cargo.toml is still $CARGO_VER (matches last tag)"
+    pass "Version bumped: $CARGO_VER (last tag: $LAST_TAG)"
+
+    # 3. NOTES.md "Current state" header must match
+    grep -q "^## Current state: v$CARGO_VER" NOTES.md \
+        || fail "NOTES.md 'Current state' header not updated to v$CARGO_VER"
+    pass "NOTES.md Current state header: v$CARGO_VER"
+
+    # 4. Man pages must build cleanly (man/build/ is gitignored, so there is nothing to
+    #    diff — this just proves mandown still succeeds and the version header is live).
+    info "Building man pages..."
+    just man
+    pass "Man pages build cleanly"
+
+    # 5. cargo check — updates Cargo.lock; verify it was committed
+    info "Running cargo check..."
+    cargo check -q 2>&1
+    LOCK_DIRTY=$(git diff --name-only Cargo.lock)
+    [ -n "$LOCK_DIRTY" ] && fail "Cargo.lock was updated but not committed — stage and commit it first"
+    pass "Cargo.lock is current and committed"
+
+    # 6. fmt + clippy
+    info "Running just check..."
+    just check
+    pass "fmt + clippy passed"
+
+    # 7. Tests
+    info "Running cargo test..."
+    cargo test -q 2>&1
+    pass "All tests passed"
+
+    # Manual checklist
+    echo -e "\n${BOLD}Automated checks passed.${NC}\n"
+    echo -e "${BOLD}Manual checklist — confirm each before proceeding:${NC}"
+    echo "  [ ] etr --help / etrs --help reviewed and shell completions regenerate cleanly"
+    echo "  [ ] Config file docs updated (config.toml comments + NOTES.md example) if a config key changed"
+    echo "  [ ] PROTOCOL.md updated if the wire protocol changed"
+    echo "  [ ] README.md reviewed and updated (new features, install steps, platform notes)"
+    echo "  [ ] NOTES.md known-gaps section and test-coverage count updated"
+    echo "  [ ] GitHub wiki cloned and updated (etr.wiki.git — see AGENTS.md §4.11 for page list)"
+    echo ""
+    echo -n "All manual items confirmed? [y/N] "
+    read -r CONFIRM
+    [ "$CONFIRM" = "y" ] || [ "$CONFIRM" = "Y" ] \
+        || { echo -e "${RED}Aborted.${NC} Complete the checklist first."; exit 1; }
+
+    echo -e "\n${GREEN}Gate passed. You may now run: gh pr create${NC}\n"
+
+# Merge the active PR, switch to main, pull, delete the branch, and reset WIP.md (requires gh)
+merge-pr:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    BRANCH=$(git rev-parse --abbrev-ref HEAD)
+    if [ "$BRANCH" = "main" ]; then
+        echo "Error: You are already on main."
+        exit 1
+    fi
+    echo "Merging PR for branch $BRANCH..."
+    gh pr merge --squash --delete-branch
+    echo "Switching to main and pulling..."
+    git checkout main
+    git pull
+    echo "Deleting local branch $BRANCH..."
+    git branch -D "$BRANCH" 2>/dev/null || true
+    python3 scripts/reset_wip.py
+
 # Publish to crates.io (dry-run first; aborts if dry-run fails)
 publish:
     #!/usr/bin/env bash
