@@ -119,7 +119,7 @@ and hard-fails on the first problem:
 1. Confirms you are on a feature branch, not `main`.
 2. Confirms `Cargo.toml`'s version has been bumped past the last git tag.
 3. Confirms `NOTES.md` has a `## Current state: v<version>` header matching the bumped version.
-4. Regenerates man pages (`just man`) and fails if `man/build/` output differs from what's tracked — regenerate and commit first. (Note: `man/build/` is gitignored; this check is about the source `.md` files under `man/`, not the generated output.)
+4. Regenerates man pages (`just man`) and fails if `mandown` errors out. `man/build/` is gitignored, so there is nothing to diff or commit here — this step only proves the man pages still build and the version header is current.
 5. Runs `cargo check` and fails if `Cargo.lock` changed but wasn't committed.
 6. Runs `just check` (`cargo fmt --check` + `cargo clippy --all-targets -D warnings`).
 7. Runs `cargo test`.
