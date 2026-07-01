@@ -9,9 +9,15 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.5.4 — fix CLAUDE.md path, require reading ~/AGENTS.md
+## Current state: v0.5.5 — remove GEMINI.md, update exclude list
 
-New in v0.5.4:
+New in v0.5.5:
+- Removed redundant `GEMINI.md` file since the `agy` CLI reads `AGENTS.md` directly.
+- Updated `exclude` list in `Cargo.toml` to remove `GEMINI.md`.
+
+## Previous: v0.5.4 — fix CLAUDE.md path, require reading ~/AGENTS.md
+
+Previously in v0.5.4:
 - `CLAUDE.md` no longer hardcodes an absolute path to `AGENTS.md` (was broken on any
   clone not located at exactly `~/git/etr`); now a relative link.
 - `AGENTS.md` Portable Core gained a `0. Global Mandates` item requiring agents to

@@ -1,6 +1,6 @@
 [package]
 name = "etr"
-version = "0.5.4"
+version = "0.5.5"
 edition = "2024"
 description = "A Rust implementation of Eternal Terminal (et)"
 license = "GPL-3.0-only"
@@ -12,7 +12,6 @@ exclude = [
     ".clauderc",
     "AGENTS.md",
     "CLAUDE.md",
-    "GEMINI.md",
     "NOTES.md",
     "justfile",
     "scripts/",
