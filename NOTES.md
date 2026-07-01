@@ -9,9 +9,17 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.5.3 — merge AGENTS.md with retch, add just pr/merge-pr gate
+## Current state: v0.5.4 — fix CLAUDE.md path, require reading ~/AGENTS.md
 
-New in v0.5.3:
+New in v0.5.4:
+- `CLAUDE.md` no longer hardcodes an absolute path to `AGENTS.md` (was broken on any
+  clone not located at exactly `~/git/etr`); now a relative link.
+- `AGENTS.md` Portable Core gained a `0. Global Mandates` item requiring agents to
+  read `~/AGENTS.md` (global, cross-repo mandates) before doing anything else.
+
+## Previous: v0.5.3 — merge AGENTS.md with retch, add just pr/merge-pr gate
+
+Previously in v0.5.3:
 - `AGENTS.md` restructured into a Portable Core (shared, kept in sync with `retch`'s
   AGENTS.md) plus a Part 2 project-specific section. Added WIP.md cross-machine
   handoff workflow and branch-cleanup rule, adopted from `retch`.

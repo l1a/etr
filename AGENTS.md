@@ -14,6 +14,15 @@ This file has two parts:
 
 # Part 1 — Portable Core
 
+## 0. Global Mandates
+Before doing anything else in a session, read `~/AGENTS.md` (and any skill files it
+references) if it exists on the current machine. It carries standing mandates that
+apply across all of Ken's repos and are not repeated here — e.g. the chezmoi
+native-command hierarchy, the `[REASONING TRACE]` requirement, and language
+requirements. If `~/AGENTS.md` conflicts with this file on a repo-specific detail
+(e.g. a project's own branch-naming or checklist convention), this file wins for
+that detail; `~/AGENTS.md`'s cross-cutting mandates still apply.
+
 ## 1. Source Control & Commit Workflow
 * **Branch Naming:** Always name new git branches using the prefix pattern `{feature,fix,chore,etc.}/<branch-name>`.
 * **Workflow Mandate:** You MUST create and switch to your feature/fix branch *before* starting any file modifications or executing commands to avoid working on `main` by mistake.
