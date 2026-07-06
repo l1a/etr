@@ -9,9 +9,36 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.5.5 — remove GEMINI.md, update exclude list
+## Current state: v0.6.0 — Windows support for the etr client
 
-New in v0.5.5:
+New in v0.6.0:
+- `etr` (the client) now builds and runs on Windows: interactive PTY sessions
+  (via `crossterm` raw mode + `portable-pty`/ConPTY) and `-L`/`-R` TCP/UDP port
+  forwarding both work. Verified live against a real Unix `etrs` host — remote
+  command execution and `-L` local port forwarding both confirmed working from
+  a native Windows console (PowerShell/conhost; Git Bash/mintty does not
+  present a real Win32 console to `crossterm`, so raw-mode output does not
+  render there).
+- Terminal resize: Windows has no `SIGWINCH`, so the client polls
+  `crossterm::terminal::size()` every 250 ms instead of waiting on a signal.
+- X11 forwarding (`-X`/`-Y`) is out of scope for Windows (no Unix domain
+  sockets) and is rejected at startup with a clear error rather than failing
+  to build.
+- `etrs` (the server) remains Unix-only by design — it daemonizes itself via
+  `fork`/`setsid` and has no Windows equivalent — but the crate now builds on
+  Windows: `etrs`'s CLI parsing and `--completions` still work, and attempting
+  to actually run a session prints a clear error instead of failing to
+  compile. Run `etrs` on the remote Unix host and connect with the Windows
+  `etr` client over SSH.
+- Fixed a real (pre-existing) portability bug in `src/login.rs`: the non-Linux
+  stub used `std::os::unix::io::RawFd`, which doesn't exist on Windows even
+  though the doc comment claimed the stub covered "other platforms".
+- Test count: 110 (unchanged — no new tests added; existing suite verified to
+  still pass on Windows).
+
+## Previous: v0.5.5 — remove GEMINI.md, update exclude list
+
+Previously in v0.5.5:
 - Removed redundant `GEMINI.md` file since the `agy` CLI reads `AGENTS.md` directly.
 - Updated `exclude` list in `Cargo.toml` to remove `GEMINI.md`.
 
@@ -557,6 +584,12 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
   all pass.  Test harness fixes applied: `ps -o ppid=` replaces Linux-only
   `/proc/$$/status`; reconnect test stops the etrs daemon (not the etr client)
   because stopping a PTY-attached process on macOS triggers a SIGHUP that kills it.
+- ~~**Windows client support**~~ **Done**: `etr` (client only) builds, and interactive
+  sessions + `-L`/`-R` forwarding are verified working live against a real Unix
+  `etrs` host. X11 forwarding is unsupported on Windows (rejected at startup).
+  `etrs` (server) is still Unix-only by design (fork/setsid daemonization has no
+  Windows equivalent) — it now builds on Windows for CLI/`--completions`
+  purposes only and errors clearly if you try to actually run a session with it.
 - ~~**Shell completions for `etrs`**~~ **Done**: `etrs --completions <shell>` generates completions for bash, zsh, fish, elvish, PowerShell, and nushell via `clap_complete`/`clap_complete_nushell`, mirroring the existing `etr --completions` support.
 - ~~**utmp address field incorrect for IPv4 connections**~~ **Done**: `peer.ip().to_canonical()` in `src/bin/etrs.rs` unwraps IPv4-mapped IPv6 addresses (`::ffff:127.0.0.1` → `127.0.0.1`) before passing to `utempter_add_record`, so `last` and friends see a plain IPv4 dotted-quad.
 - ~~**Stale utmp entry on unclean exit**~~ **Done**: `etrs` now listens for SIGTERM and SIGHUP in the reconnect loop and calls `record_logout` before exiting, so `who`/`last` entries are cleaned up even when the session is killed rather than ended by the shell exiting.

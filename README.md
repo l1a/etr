@@ -176,7 +176,11 @@ x11_trusted = false                  # enable trusted X11 forwarding
 
 ## Limitations
 
-- Linux and macOS supported
+- The `etrs` server runs on Linux and macOS only (it daemonizes itself via `fork`/`setsid`)
+- The `etr` client also builds and runs on Windows (interactive sessions and `-L`/`-R` port
+  forwarding work; X11 forwarding (`-X`/`-Y`) is not supported on Windows). Run the client
+  from a native console (PowerShell/Windows Terminal) — terminals that don't provide a real
+  Win32 console (e.g. Git Bash/mintty) won't render raw-mode output correctly.
 - macOS binaries (`macos-aarch64`) are published on each release
 - Sessions are not persistent across client reboots — the session ID and passkey are in-memory only
 - Post-quantum key exchange (ML-KEM) is not yet implemented; standard TLS 1.3 uses X25519 ECDH
