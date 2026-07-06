@@ -10,35 +10,75 @@ permissions:
 
 jobs:
   build:
-    name: Build (${{ matrix.os }})
+    name: Build (${{ matrix.suffix }})
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         include:
+          # etrs (the server) is Unix-only by design (fork/setsid daemonization),
+          # so Unix builds ship both binaries; Windows builds ship the etr client only.
           - os: ubuntu-latest
-            artifact: release-linux
+            artifact: release-linux-x86_64
             suffix: linux-x86_64
+            bins: both
+          - os: ubuntu-24.04-arm
+            artifact: release-linux-aarch64
+            suffix: linux-aarch64
+            bins: both
           - os: macos-latest
             artifact: release-macos
             suffix: macos-aarch64
+            bins: both
+          - os: windows-latest
+            artifact: release-windows-x86_64
+            suffix: windows-x86_64
+            bins: client
+          - os: windows-latest
+            artifact: release-windows-aarch64
+            suffix: windows-aarch64
+            bins: client
+            target: aarch64-pc-windows-msvc
     steps:
       - name: Checkout Code
         uses: actions/checkout@v6
 
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Cache Cargo Dependencies
         uses: Swatinem/rust-cache@v2
 
       - name: Build release binaries
-        run: cargo build --release
+        shell: bash
+        run: |
+          if [ "${{ matrix.bins }}" = "client" ]; then
+            BINS="--bin etr"
+          else
+            BINS=""
+          fi
+          if [ -n "${{ matrix.target }}" ]; then
+            cargo build --release --target ${{ matrix.target }} $BINS
+          else
+            cargo build --release $BINS
+          fi
 
       - name: Package release assets
+        shell: bash
         run: |
           mkdir -p dist
-          cp target/release/etr  dist/etr-${{ matrix.suffix }}
-          cp target/release/etrs dist/etrs-${{ matrix.suffix }}
+          if [ -n "${{ matrix.target }}" ]; then
+            OUT="target/${{ matrix.target }}/release"
+          else
+            OUT="target/release"
+          fi
+          EXT=""
+          [[ "${{ matrix.os }}" == windows-* ]] && EXT=".exe"
+          cp "$OUT/etr$EXT" "dist/etr-${{ matrix.suffix }}$EXT"
+          if [ "${{ matrix.bins }}" != "client" ]; then
+            cp "$OUT/etrs$EXT" "dist/etrs-${{ matrix.suffix }}$EXT"
+          fi
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7

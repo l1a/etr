@@ -33,6 +33,16 @@ New in v0.6.0:
 - Fixed a real (pre-existing) portability bug in `src/login.rs`: the non-Linux
   stub used `std::os::unix::io::RawFd`, which doesn't exist on Windows even
   though the doc comment claimed the stub covered "other platforms".
+- CI (`.github/workflows/ci.yml`): the lints job now also runs on
+  `windows-latest` (in addition to `ubuntu-latest`) so clippy/fmt cover the
+  `#[cfg(windows)]`/`#[cfg(not(unix))]` code paths, and the test matrix gained
+  `windows-latest` alongside `ubuntu-latest`/`macos-latest`.
+- Release (`.github/workflows/release.yml`): now also builds `linux-aarch64`
+  (native `ubuntu-24.04-arm` runner, both `etr`+`etrs`), `windows-x86_64`
+  (`etr` client only), and `windows-aarch64` (`etr` client only,
+  cross-compiled to `aarch64-pc-windows-msvc` from the x86_64 Windows
+  runner). Windows release assets ship the client only since `etrs` doesn't
+  run there.
 - Test count: 110 (unchanged — no new tests added; existing suite verified to
   still pass on Windows).
 

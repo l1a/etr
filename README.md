@@ -181,7 +181,8 @@ x11_trusted = false                  # enable trusted X11 forwarding
   forwarding work; X11 forwarding (`-X`/`-Y`) is not supported on Windows). Run the client
   from a native console (PowerShell/Windows Terminal) — terminals that don't provide a real
   Win32 console (e.g. Git Bash/mintty) won't render raw-mode output correctly.
-- macOS binaries (`macos-aarch64`) are published on each release
+- Prebuilt binaries published on each release: `etr`+`etrs` for Linux (`x86_64`, `aarch64`)
+  and macOS (`aarch64`); `etr` client only for Windows (`x86_64`, `aarch64`)
 - Sessions are not persistent across client reboots — the session ID and passkey are in-memory only
 - Post-quantum key exchange (ML-KEM) is not yet implemented; standard TLS 1.3 uses X25519 ECDH
 
