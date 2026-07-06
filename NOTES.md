@@ -9,9 +9,25 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.6.0 — Windows support for the etr client
+## Current state: v0.6.1 — fix release build on linux-aarch64
 
-New in v0.6.0:
+New in v0.6.1:
+- The `v0.6.0` tag's release build failed on the new `linux-aarch64` target:
+  `build.rs` only checked the `x86_64-linux-gnu` multiarch path when locating
+  `libutempter`, so it silently skipped linking on `aarch64-linux-gnu` and the
+  link failed with `undefined reference to utempter_add_record`. `build.rs`
+  now scans all `/usr/lib/*/` multiarch directories instead of hardcoding one
+  triplet. CI and release workflows also now explicitly
+  `apt-get install libutempter0` on Linux runners rather than relying on it
+  being preinstalled on the runner image.
+- Release build matrix now uses `fail-fast: false` so one target's failure
+  doesn't cancel/hide the results of the others.
+- The `v0.6.0` tag was never published as a release (the build failed before
+  the release job ran); `v0.6.1` supersedes it.
+
+## Previous: v0.6.0 — Windows support for the etr client
+
+Previously in v0.6.0:
 - `etr` (the client) now builds and runs on Windows: interactive PTY sessions
   (via `crossterm` raw mode + `portable-pty`/ConPTY) and `-L`/`-R` TCP/UDP port
   forwarding both work. Verified live against a real Unix `etrs` host — remote

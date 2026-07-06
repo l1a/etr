@@ -4,15 +4,25 @@ fn main() {
         // Link against libutempter for utmp/wtmp registration.
         // Prefer the unversioned .so (present when libutempter-devel is installed);
         // fall back to the versioned runtime library by passing its full path.
-        let candidates = [
-            "/usr/lib64/libutempter.so",
-            "/usr/lib/libutempter.so",
-            "/usr/lib/x86_64-linux-gnu/libutempter.so",
-            "/usr/lib64/libutempter.so.0",
-            "/usr/lib/libutempter.so.0",
-            "/usr/lib/x86_64-linux-gnu/libutempter.so.0",
+        let mut candidates = vec![
+            "/usr/lib64/libutempter.so".to_string(),
+            "/usr/lib64/libutempter.so.0".to_string(),
+            "/usr/lib/libutempter.so".to_string(),
+            "/usr/lib/libutempter.so.0".to_string(),
         ];
-        for path in candidates {
+        // Debian/Ubuntu multiarch paths are keyed by the arch triplet
+        // (x86_64-linux-gnu, aarch64-linux-gnu, ...) — scan /usr/lib/*/ rather
+        // than hardcoding one triplet so this works on any Linux architecture.
+        if let Ok(entries) = std::fs::read_dir("/usr/lib") {
+            for entry in entries.flatten() {
+                let dir = entry.path();
+                if dir.is_dir() {
+                    candidates.push(dir.join("libutempter.so").display().to_string());
+                    candidates.push(dir.join("libutempter.so.0").display().to_string());
+                }
+            }
+        }
+        for path in &candidates {
             if std::path::Path::new(path).exists() {
                 println!("cargo:rustc-link-arg={path}");
                 return;
