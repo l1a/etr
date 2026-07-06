@@ -133,11 +133,12 @@ fn main() -> io::Result<()> {
 
 #[cfg(not(unix))]
 fn run_server(_cli: Cli, _reconnect_timeout: Duration) -> io::Result<()> {
-    Err(io::Error::other(
+    eprintln!(
         "etrs (the etr server) only runs on Unix (Linux/macOS): it relies on \
          fork/setsid and Unix domain sockets for X11 forwarding. Run etrs on the \
-         remote Unix host and connect to it with the etr client over SSH.",
-    ))
+         remote Unix host and connect to it with the etr client over SSH."
+    );
+    std::process::exit(1);
 }
 
 #[cfg(unix)]
