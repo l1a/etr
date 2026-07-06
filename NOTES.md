@@ -9,9 +9,24 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.6.1 — fix release build on linux-aarch64
+## Current state: v0.6.2 — CI mirrors release's target matrix
 
-New in v0.6.1:
+New in v0.6.2:
+- `ci.yml`'s `lints` and `test` matrices gained `ubuntu-24.04-arm` (the same
+  native runner `release.yml` uses for `linux-aarch64`), and a new
+  `cross-build-check` job build-checks the `windows-aarch64`
+  (`aarch64-pc-windows-msvc`) cross-compile target on every PR. Motivation:
+  the `v0.6.0` release build failure (`libutempter` link error on
+  `linux-aarch64`, fixed in v0.6.1) only surfaced when the release tag was
+  pushed, because CI never exercised that runner/architecture. CI's build
+  matrix should mirror release's target matrix so architecture-specific
+  breakage is caught at the PR stage, not at tag time. `windows-aarch64` can
+  only be build-checked (not test-run) since no ARM64 Windows CI runner
+  exists to execute the resulting binary.
+
+## Previous: v0.6.1 — fix release build on linux-aarch64
+
+Previously in v0.6.1:
 - The `v0.6.0` tag's release build failed on the new `linux-aarch64` target:
   `build.rs` only checked the `x86_64-linux-gnu` multiarch path when locating
   `libutempter`, so it silently skipped linking on `aarch64-linux-gnu` and the
