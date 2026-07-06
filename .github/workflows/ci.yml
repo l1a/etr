@@ -21,9 +21,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        # ubuntu covers the #[cfg(unix)] code paths, windows covers the
-        # #[cfg(windows)]/#[cfg(not(unix))] ones (etr client + etrs stub).
-        os: [ubuntu-latest, windows-latest]
+        # Mirrors release.yml's native-runner targets so cfg(unix)/cfg(windows)
+        # and architecture-specific issues (e.g. libutempter multiarch paths)
+        # are caught here, not only when a release tag is pushed.
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest]
     steps:
       - name: Checkout Code
         uses: actions/checkout@v6
@@ -51,7 +52,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
     steps:
       - name: Checkout Code
         uses: actions/checkout@v6
@@ -68,6 +69,28 @@ jobs:
 
       - name: Run Tests
         run: cargo test --all-targets --all-features
+
+  # release.yml also cross-compiles windows-aarch64 from windows-latest, but no
+  # ARM64 Windows runner exists to actually run tests on it — so this only
+  # verifies the build (and thus link) succeeds, mirroring release.yml exactly,
+  # rather than tests passing.
+  cross-build-check:
+    name: Build check (windows-aarch64)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v6
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-pc-windows-msvc
+
+      - name: Cache Cargo Dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build etr client for windows-aarch64
+        run: cargo build --release --target aarch64-pc-windows-msvc --bin etr
 
   audit:
     name: Security Audit
