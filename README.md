@@ -1,5 +1,7 @@
 # etr
 
+<img src="assets/logos/etr-logo-256.png" alt="etr logo" width="128" height="128">
+
 A Rust reimplementation of [Eternal Terminal](https://eternalterminal.dev/) (`et`) — a remote shell that automatically reconnects without interrupting your session.
 
 Unlike SSH, when your network drops, `etr` keeps the remote shell alive and transparently reconnects when connectivity returns. Like mosh, no server daemon needs to be pre-installed or running: `etr` bootstraps a per-session server process via SSH, then hands off to a persistent [QUIC](https://www.rfc-editor.org/rfc/rfc9000) connection.
@@ -157,6 +159,20 @@ etrs --completions fish > ~/.config/fish/completions/etrs.fish
 # nushell
 etr --completions nushell | save completions-etr.nu
 etrs --completions nushell | save completions-etrs.nu
+```
+
+## Desktop entry (Linux)
+
+Each Linux release includes an optional `etr.desktop` template and `etr-icon-256.png`
+for those who want an app-menu launcher. Edit the `Exec=` line to your target host,
+then install:
+
+```bash
+mkdir -p ~/.local/share/icons/hicolor/256x256/apps
+cp etr-icon-256.png ~/.local/share/icons/hicolor/256x256/apps/etr.png
+cp etr.desktop ~/.local/share/applications/etr.desktop
+# then edit ~/.local/share/applications/etr.desktop: Exec=etr user@host
+gtk-update-icon-cache ~/.local/share/icons/hicolor 2>/dev/null || true
 ```
 
 ## Configuration

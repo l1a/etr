@@ -9,7 +9,30 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.6.2 — CI mirrors release's target matrix
+## Current state: v0.6.3 — project logo
+
+New in v0.6.3:
+- Added `assets/logos/etr-logo.svg` (source) plus rendered `etr-logo-256.png`,
+  `etr-logo-512.png`, and a multi-resolution `etr-logo.ico` (256/128/64/48/32/16px).
+- `etr.exe` on Windows now carries the logo as its PE icon resource (shown in
+  Explorer/taskbar): `windows/etr.rc` references `assets/logos/etr-logo.ico`
+  and is compiled/linked by `build.rs` via the `embed-resource` crate
+  (Windows-only build-dependency). Uses `manifest_optional()` since the icon
+  is cosmetic — a missing resource compiler must not fail the build.
+  `etrs.exe` gets the same resource since both binaries share one `build.rs`.
+- README.md now displays the logo under the title. Linux/macOS CLI binaries
+  have no equivalent "exe icon" resource slot, so no automatic packaging
+  change was made there; the README image is the cross-platform display
+  point.
+- `assets/linux/etr.desktop`: an optional freedesktop `.desktop` launcher
+  template (`Exec=etr`, user edits in the host before installing). The
+  `linux-x86_64` release job now also copies this plus `etr-icon-256.png`
+  into the release dist alongside the binaries, for users who want an
+  app-menu entry. Not installed automatically by `just install` — manual
+  opt-in only, documented in README's new "Desktop entry (Linux)" section.
+- Test count: unchanged (110) — no testable logic, only assets/build script.
+
+## Previous: v0.6.2 — CI mirrors release's target matrix
 
 New in v0.6.2:
 - `ci.yml`'s `lints` and `test` matrices gained `ubuntu-24.04-arm` (the same
