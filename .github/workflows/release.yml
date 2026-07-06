@@ -13,6 +13,7 @@ jobs:
     name: Build (${{ matrix.suffix }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           # etrs (the server) is Unix-only by design (fork/setsid daemonization),
@@ -49,6 +50,10 @@ jobs:
 
       - name: Cache Cargo Dependencies
         uses: Swatinem/rust-cache@v2
+
+      - name: Install libutempter (Linux only)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libutempter0
 
       - name: Build release binaries
         shell: bash
