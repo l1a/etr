@@ -1,20 +1,33 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+//
+// etrs only runs on Unix (Linux/macOS): it daemonizes itself via fork/setsid and
+// uses Unix domain sockets for X11 forwarding. On Windows, main() parses the CLI
+// (so `--completions`/`--help` still work) but refuses to actually run a session;
+// use the Windows `etr` client to connect to an `etrs` running on a Unix host.
+#![cfg_attr(windows, allow(dead_code))]
 use clap::{ArgAction, CommandFactory, Parser, ValueEnum};
 use clap_complete::Shell;
 use clap_complete_nushell::Nushell;
+#[cfg(unix)]
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-use std::io::{self, Read, Write};
+use std::io::{self};
+#[cfg(unix)]
+use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::io::{FromRawFd, IntoRawFd};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 
 use etr::config::Config;
+#[cfg(unix)]
 use etr::login;
-use etr::protocol::{
-    Disconnect, Envelope, ForwardProto, Payload, SessionAccept, StreamOpen, UdpDatagram,
-};
-use etr::quic::{self, TAG_CONTROL, TAG_FORWARD, TAG_PTY};
+#[cfg(unix)]
+use etr::protocol::{Disconnect, SessionAccept};
+use etr::protocol::{Envelope, ForwardProto, Payload, StreamOpen, UdpDatagram};
+use etr::quic::{self, TAG_FORWARD};
+#[cfg(unix)]
+use etr::quic::{TAG_CONTROL, TAG_PTY};
 use etr::session::SessionState;
 
 static VERBOSITY: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
@@ -115,6 +128,21 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
+    run_server(cli, reconnect_timeout)
+}
+
+#[cfg(not(unix))]
+fn run_server(_cli: Cli, _reconnect_timeout: Duration) -> io::Result<()> {
+    eprintln!(
+        "etrs (the etr server) only runs on Unix (Linux/macOS): it relies on \
+         fork/setsid and Unix domain sockets for X11 forwarding. Run etrs on the \
+         remote Unix host and connect to it with the etr client over SSH."
+    );
+    std::process::exit(1);
+}
+
+#[cfg(unix)]
+fn run_server(cli: Cli, reconnect_timeout: Duration) -> io::Result<()> {
     // Read session bootstrap line from SSH stdin: SESSION_ID_HEX/PASSKEY/TERM
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
@@ -229,6 +257,7 @@ fn main() -> io::Result<()> {
         })
 }
 
+#[cfg(unix)]
 fn detach_stdio(log_path: &std::path::Path) -> io::Result<()> {
     use nix::unistd::{dup2_stderr, dup2_stdin, dup2_stdout};
 
@@ -267,6 +296,7 @@ fn session_log_path() -> std::path::PathBuf {
 
 /// Run the session reconnect loop until the client cleanly disconnects or
 /// the reconnect window expires.
+#[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 async fn run_session(
     endpoint: quinn::Endpoint,
@@ -694,6 +724,7 @@ type PtyTx = Arc<std::sync::Mutex<Option<mpsc::Sender<(u64, Vec<u8>)>>>>;
 type CtrlTx = Arc<std::sync::Mutex<Option<mpsc::Sender<Envelope>>>>;
 
 /// Handle one QUIC connection.  Returns `true` on clean Disconnect.
+#[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     conn: quinn::Connection,

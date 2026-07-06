@@ -10,7 +10,9 @@ use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 
 use etr::config::Config;
-use etr::forward::{ForwardSpec, X11Display, get_xauth_cookie};
+use etr::forward::ForwardSpec;
+#[cfg(unix)]
+use etr::forward::{X11Display, get_xauth_cookie};
 use etr::protocol::{
     Envelope, ForwardProto, Heartbeat, Payload, SessionOpen, StreamOpen, TerminalResize,
     UdpDatagram,
@@ -400,8 +402,17 @@ async fn main() -> io::Result<()> {
 
     let session = Arc::new(Mutex::new(SessionState::new(session_id, passkey.clone())));
 
+    #[cfg(windows)]
+    if x11_enabled {
+        eprintln!("[etr] error: X11 forwarding (-X/-Y) is not supported on Windows");
+        std::process::exit(1);
+    }
+
+    #[cfg_attr(windows, allow(unused_mut))]
     let mut x11_auth_proto = String::new();
+    #[cfg_attr(windows, allow(unused_mut))]
     let mut x11_auth_cookie = Vec::new();
+    #[cfg(unix)]
     if x11_enabled {
         match std::env::var("DISPLAY") {
             Ok(disp) => match get_xauth_cookie(&disp) {
@@ -1017,6 +1028,7 @@ async fn run_session(
     // Use a channel so ctrl_send isn't shared across tasks.
     let (resize_tx, mut resize_rx) = mpsc::channel::<TerminalResize>(4);
 
+    #[cfg(unix)]
     let mut sigwinch_task = tokio::spawn(async move {
         use tokio::signal::unix::{SignalKind, signal};
         if let Ok(mut sigwinch) = signal(SignalKind::window_change()) {
@@ -1027,6 +1039,25 @@ async fn run_session(
                         cols: cols as u32,
                     });
                 }
+            }
+        }
+    });
+
+    // Windows has no SIGWINCH; poll the console size instead of waiting on a signal.
+    #[cfg(windows)]
+    let mut sigwinch_task = tokio::spawn(async move {
+        let mut last = crossterm::terminal::size().ok();
+        loop {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            if let Ok(size) = crossterm::terminal::size()
+                && Some(size) != last
+            {
+                last = Some(size);
+                let (cols, rows) = size;
+                let _ = resize_tx.try_send(TerminalResize {
+                    rows: rows as u32,
+                    cols: cols as u32,
+                });
             }
         }
     });
@@ -1112,31 +1143,38 @@ async fn run_session(
                     _ => return,
                 };
                 if so.stream_type == etr::protocol::StreamType::X11 as i32 {
-                    let local_display = match std::env::var("DISPLAY") {
-                        Ok(d) => d,
-                        Err(_) => {
-                            vlog!(
-                                verbose,
-                                1,
-                                "[etr] X11: local DISPLAY env var not set, rejecting stream"
-                            );
-                            let _ = quic_send.finish();
-                            return;
-                        }
-                    };
-                    match connect_local_x11(&local_display, verbose).await {
-                        Ok(stream) => {
-                            run_x11_connection_quic(stream, quic_send, quic_recv).await;
-                        }
-                        Err(e) => {
-                            vlog!(
-                                verbose,
-                                1,
-                                "[etr] X11: failed to connect to local display {local_display}: {e}"
-                            );
-                            let _ = quic_send.finish();
+                    #[cfg(unix)]
+                    {
+                        let local_display = match std::env::var("DISPLAY") {
+                            Ok(d) => d,
+                            Err(_) => {
+                                vlog!(
+                                    verbose,
+                                    1,
+                                    "[etr] X11: local DISPLAY env var not set, rejecting stream"
+                                );
+                                let _ = quic_send.finish();
+                                return;
+                            }
+                        };
+                        match connect_local_x11(&local_display, verbose).await {
+                            Ok(stream) => {
+                                run_x11_connection_quic(stream, quic_send, quic_recv).await;
+                            }
+                            Err(e) => {
+                                vlog!(
+                                    verbose,
+                                    1,
+                                    "[etr] X11: failed to connect to local display {local_display}: {e}"
+                                );
+                                let _ = quic_send.finish();
+                            }
                         }
                     }
+                    // X11 forwarding is unsupported on Windows; -X/-Y is rejected at
+                    // startup, so the server should never open an X11 stream here.
+                    #[cfg(windows)]
+                    let _ = quic_send.finish();
                     return;
                 }
                 let proto = ForwardProto::try_from(so.forward_proto).unwrap_or(ForwardProto::Tcp);
@@ -1610,11 +1648,13 @@ async fn run_udp_forward_client_socket(
     dgram_out.abort();
 }
 
+#[cfg(unix)]
 enum X11Stream {
     Unix(tokio::net::UnixStream),
     Tcp(tokio::net::TcpStream),
 }
 
+#[cfg(unix)]
 async fn connect_local_x11(display_str: &str, verbose: u8) -> io::Result<X11Stream> {
     let display = X11Display::parse(display_str)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
@@ -1648,6 +1688,7 @@ async fn connect_local_x11(display_str: &str, verbose: u8) -> io::Result<X11Stre
     }
 }
 
+#[cfg(unix)]
 async fn run_x11_connection_quic(
     stream: X11Stream,
     mut quic_send: quinn::SendStream,

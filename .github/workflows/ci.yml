@@ -17,8 +17,13 @@ permissions:
 
 jobs:
   lints:
-    name: Formatting and Clippy Lints
-    runs-on: ubuntu-latest
+    name: Formatting and Clippy Lints (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        # ubuntu covers the #[cfg(unix)] code paths, windows covers the
+        # #[cfg(windows)]/#[cfg(not(unix))] ones (etr client + etrs stub).
+        os: [ubuntu-latest, windows-latest]
     steps:
       - name: Checkout Code
         uses: actions/checkout@v6
@@ -42,7 +47,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - name: Checkout Code
         uses: actions/checkout@v6

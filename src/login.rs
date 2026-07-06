@@ -44,13 +44,13 @@ mod imp {
 
 #[cfg(not(target_os = "linux"))]
 mod imp {
-    use std::os::unix::io::RawFd;
+    /// No-op on non-Linux platforms (utempter is Linux-only). Takes a plain
+    /// `i32` rather than `RawFd` since that alias is unix-only and this stub
+    /// must also compile on Windows.
+    pub fn record_login(_master_fd: i32, _remote_addr: &str) {}
 
     /// No-op on non-Linux platforms (utempter is Linux-only).
-    pub fn record_login(_master_fd: RawFd, _remote_addr: &str) {}
-
-    /// No-op on non-Linux platforms (utempter is Linux-only).
-    pub fn record_logout(_master_fd: RawFd) {}
+    pub fn record_logout(_master_fd: i32) {}
 }
 
 pub use imp::{record_login, record_logout};
