@@ -85,6 +85,12 @@ jobs:
             cp "$OUT/etrs$EXT" "dist/etrs-${{ matrix.suffix }}$EXT"
           fi
 
+      - name: Add desktop entry and icon (linux-x86_64 only)
+        if: matrix.suffix == 'linux-x86_64'
+        run: |
+          cp assets/linux/etr.desktop dist/etr.desktop
+          cp assets/logos/etr-logo-256.png dist/etr-icon-256.png
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
