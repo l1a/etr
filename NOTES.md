@@ -31,6 +31,10 @@ New in v0.6.3:
   app-menu entry. Not installed automatically by `just install` — manual
   opt-in only, documented in README's new "Desktop entry (Linux)" section.
 - Test count: unchanged (110) — no testable logic, only assets/build script.
+- Bumped `crossbeam-epoch` 0.9.18→0.9.20 (dev-dependency only, pulled in via
+  `criterion`'s `rayon` chain for benches) to fix RUSTSEC-2026-0204, a
+  pre-existing advisory unrelated to the logo work that was tripping the CI
+  Security Audit check.
 
 ## Previous: v0.6.2 — CI mirrors release's target matrix
 
