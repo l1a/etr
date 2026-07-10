@@ -9,7 +9,51 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.6.3 — project logo
+## Current state: v0.6.4 — Windows Backspace fix
+
+New in v0.6.4:
+- **Windows client Backspace fixed.** The Windows console delivers legacy key
+  codes to raw byte reads (Backspace → `0x08`), whereas a Unix PTY expects the
+  xterm convention `0x7f` (DEL) to match the default `stty erase`. The client
+  now enables virtual-terminal console modes after raw mode
+  (`ENABLE_VIRTUAL_TERMINAL_INPUT` on stdin, `ENABLE_VIRTUAL_TERMINAL_PROCESSING`
+  on stdout) via a new Windows-only `windows-sys` dependency, so it emits the
+  xterm byte sequences the remote expects and renders the remote's ANSI output.
+  No-op on Unix. Verified live (Windows `etr` → Unix `etrs`): Backspace now
+  erases correctly.
+- Bumped `anyhow` 1.0.102→1.0.103 to clear RUSTSEC-2026-0190 (an unsoundness
+  advisory against a pre-existing transitive dep). (`crossbeam-epoch` was
+  already bumped to 0.9.20 in v0.6.3 for RUSTSEC-2026-0204.)
+- Test count: 110 (unchanged).
+
+### Known issue — Windows: first line of input not echoed until Enter
+
+When connecting from a Windows `etr` client to a Unix host, the shell prompt
+renders correctly, but the **first line** the user types is not echoed until
+Enter is pressed (after which the whole line appears and runs, and the session
+behaves normally thereafter). This does **not** occur linux→linux and is not
+shell-specific (reproduced with `zsh`+`zellij`+`starship` and with
+`bash --norc`).
+
+Diagnosis: `-vvv` logs show the keystrokes reach the server, but the Windows
+client sends the first line as a single batched chunk (with the trailing Enter)
+rather than per-keystroke, so the remote PTY echoes the whole line only on
+submission. The fault is in the Windows client input path
+(`std::io::stdin().read()`), which does not deliver bytes per-keystroke at
+session start; a large contributor is the shell's startup terminal-probing,
+which — with VT-input mode on — the Windows console auto-answers with a ~7 KB
+burst (256-color palette, size, mode) plus mouse-motion events that
+back-pressure/batch the reader.
+
+Two fixes were attempted and **reverted** (neither is in this release): (1)
+deferring the server-side PTY reader until the first client connection — no
+effect, since the input path (not output) is at fault; (2) reading discrete key
+events via `crossterm` and translating to bytes on the client — eliminated the
+batching but caused the console's terminal-query auto-responses to be echoed
+back as visible garbage (`]4;N;rgb:…`). Tracked in
+[GitHub issue #54](https://github.com/l1a/etr/issues/54).
+
+## Previous: v0.6.3 — project logo
 
 New in v0.6.3:
 - Added `assets/logos/etr-logo.svg` (source) plus rendered `etr-logo-256.png`,

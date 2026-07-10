@@ -28,6 +28,47 @@ static IN_RAW_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 /// prevents false triggers from `~` in shell paths or git refs.
 const ESCAPE_CHAR: u8 = b'~';
 
+/// Put the console into virtual-terminal mode.
+///
+/// On Windows the console, by default, hands raw byte reads the legacy key
+/// codes (Backspace → `0x08`, no ESC sequences for arrows/function keys) and
+/// does not interpret ANSI output.  A Unix PTY on the far end expects the
+/// xterm conventions instead — notably Backspace → `0x7f` (DEL) — so without
+/// this the remote `stty erase` (DEL) never matches what we send and Backspace
+/// misbehaves.  Enabling `ENABLE_VIRTUAL_TERMINAL_INPUT` makes the console
+/// translate keys into the same VT byte sequences a real terminal emits, and
+/// `ENABLE_VIRTUAL_TERMINAL_PROCESSING` makes it render the remote's ANSI
+/// output.  Call this after raw mode is enabled, on every (re)connect.
+///
+/// No-op on Unix, where the terminal already speaks VT natively.
+#[cfg(windows)]
+fn enable_vt_console() {
+    use windows_sys::Win32::System::Console::{
+        CONSOLE_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+        GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleMode,
+    };
+    // SAFETY: standard Win32 console calls.  `GetStdHandle` returns a process
+    // std handle; `GetConsoleMode` fails (returns 0) for non-console handles
+    // (e.g. redirected stdio), so we only call `SetConsoleMode` on a handle it
+    // confirmed is a console.  All pointers point to locals that outlive the call.
+    unsafe {
+        let h_in = GetStdHandle(STD_INPUT_HANDLE);
+        let mut mode: CONSOLE_MODE = 0;
+        if GetConsoleMode(h_in, &mut mode) != 0 {
+            SetConsoleMode(h_in, mode | ENABLE_VIRTUAL_TERMINAL_INPUT);
+        }
+        let h_out = GetStdHandle(STD_OUTPUT_HANDLE);
+        let mut out_mode: CONSOLE_MODE = 0;
+        if GetConsoleMode(h_out, &mut out_mode) != 0 {
+            SetConsoleMode(h_out, out_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        }
+    }
+}
+
+/// No-op on Unix: the terminal already delivers VT key sequences and renders ANSI.
+#[cfg(not(windows))]
+fn enable_vt_console() {}
+
 macro_rules! vlog {
     ($verbose:expr, $level:expr, $($arg:tt)*) => {
         if $verbose >= $level {
@@ -760,6 +801,10 @@ async fn run_connection_loop(
         vlog!(verbose, 2, "[etr] {}", quic::tls_info());
 
         enable_raw_mode().unwrap();
+        // On Windows, raw mode alone still leaves the console emitting legacy key
+        // codes (Backspace → 0x08) and not rendering ANSI; switch it to VT mode so
+        // we speak the same conventions as the remote Unix PTY.  No-op on Unix.
+        enable_vt_console();
         IN_RAW_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
         in_raw = true;
         let result = tokio::select! {

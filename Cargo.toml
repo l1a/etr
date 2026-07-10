@@ -1,6 +1,6 @@
 [package]
 name = "etr"
-version = "0.6.3"
+version = "0.6.4"
 edition = "2024"
 description = "A Rust implementation of Eternal Terminal (et)"
 license = "GPL-3.0-only"
@@ -35,6 +35,14 @@ dirs = "6"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 toml = "1"
+
+# Windows-only: put the console into virtual-terminal mode so the client speaks
+# the same key/ANSI byte conventions a Unix PTY expects (Backspace → DEL, etc.).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+] }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["async_tokio"] }
