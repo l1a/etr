@@ -9,9 +9,9 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.6.3 — Windows Backspace fix + advisory bumps
+## Current state: v0.6.4 — Windows Backspace fix
 
-New in v0.6.3:
+New in v0.6.4:
 - **Windows client Backspace fixed.** The Windows console delivers legacy key
   codes to raw byte reads (Backspace → `0x08`), whereas a Unix PTY expects the
   xterm convention `0x7f` (DEL) to match the default `stty erase`. The client
@@ -21,10 +21,9 @@ New in v0.6.3:
   xterm byte sequences the remote expects and renders the remote's ANSI output.
   No-op on Unix. Verified live (Windows `etr` → Unix `etrs`): Backspace now
   erases correctly.
-- Cleared two RustSec advisories against pre-existing transitive deps (neither
-  introduced here): `crossbeam-epoch` 0.9.18→0.9.20 (RUSTSEC-2026-0204, dev-only
-  via `criterion`, not in the shipped binaries) and `anyhow` 1.0.102→1.0.103
-  (RUSTSEC-2026-0190 unsoundness).
+- Bumped `anyhow` 1.0.102→1.0.103 to clear RUSTSEC-2026-0190 (an unsoundness
+  advisory against a pre-existing transitive dep). (`crossbeam-epoch` was
+  already bumped to 0.9.20 in v0.6.3 for RUSTSEC-2026-0204.)
 - Test count: 110 (unchanged).
 
 ### Known issue — Windows: first line of input not echoed until Enter
@@ -53,6 +52,33 @@ events via `crossterm` and translating to bytes on the client — eliminated the
 batching but caused the console's terminal-query auto-responses to be echoed
 back as visible garbage (`]4;N;rgb:…`). Tracked in
 [GitHub issue #54](https://github.com/l1a/etr/issues/54).
+
+## Previous: v0.6.3 — project logo
+
+New in v0.6.3:
+- Added `assets/logos/etr-logo.svg` (source) plus rendered `etr-logo-256.png`,
+  `etr-logo-512.png`, and a multi-resolution `etr-logo.ico` (256/128/64/48/32/16px).
+- `etr.exe` on Windows now carries the logo as its PE icon resource (shown in
+  Explorer/taskbar): `windows/etr.rc` references `assets/logos/etr-logo.ico`
+  and is compiled/linked by `build.rs` via the `embed-resource` crate
+  (Windows-only build-dependency). Uses `manifest_optional()` since the icon
+  is cosmetic — a missing resource compiler must not fail the build.
+  `etrs.exe` gets the same resource since both binaries share one `build.rs`.
+- README.md now displays the logo under the title. Linux/macOS CLI binaries
+  have no equivalent "exe icon" resource slot, so no automatic packaging
+  change was made there; the README image is the cross-platform display
+  point.
+- `assets/linux/etr.desktop`: an optional freedesktop `.desktop` launcher
+  template (`Exec=etr`, user edits in the host before installing). The
+  `linux-x86_64` release job now also copies this plus `etr-icon-256.png`
+  into the release dist alongside the binaries, for users who want an
+  app-menu entry. Not installed automatically by `just install` — manual
+  opt-in only, documented in README's new "Desktop entry (Linux)" section.
+- Test count: unchanged (110) — no testable logic, only assets/build script.
+- Bumped `crossbeam-epoch` 0.9.18→0.9.20 (dev-dependency only, pulled in via
+  `criterion`'s `rayon` chain for benches) to fix RUSTSEC-2026-0204, a
+  pre-existing advisory unrelated to the logo work that was tripping the CI
+  Security Audit check.
 
 ## Previous: v0.6.2 — CI mirrors release's target matrix
 

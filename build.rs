@@ -1,4 +1,13 @@
 fn main() {
+    #[cfg(target_os = "windows")]
+    {
+        // Embed the etr logo as the .exe icon resource (Explorer/taskbar).
+        // Cosmetic only — don't fail the build if no resource compiler is available.
+        embed_resource::compile("windows/etr.rc", embed_resource::NONE)
+            .manifest_optional()
+            .unwrap();
+    }
+
     #[cfg(target_os = "linux")]
     {
         // Link against libutempter for utmp/wtmp registration.

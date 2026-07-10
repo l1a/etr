@@ -1,0 +1,10 @@
+<svg width="680" height="680" viewBox="0 0 680 680" xmlns="http://www.w3.org/2000/svg" role="img">
+<title>etr logo</title>
+<desc>A dark rounded square badge containing a teal terminal prompt chevron and cursor underscore, with a small broadcast signal icon in the upper right representing automatic reconnection.</desc>
+<rect x="140" y="140" width="400" height="400" rx="56" fill="#10212b" stroke="#1c323d" stroke-width="2"/>
+<path d="M386.8,214.3 Q430,160 473.2,214.3" fill="none" stroke="#4FD8C4" stroke-width="9" stroke-linecap="round" opacity="0.5"/>
+<path d="M405.57,221.11 Q430,190 454.43,221.11" fill="none" stroke="#4FD8C4" stroke-width="9" stroke-linecap="round" opacity="0.8"/>
+<circle cx="430" cy="230" r="9" fill="#4FD8C4"/>
+<polyline points="240,260 300,340 240,420" fill="none" stroke="#4FD8C4" stroke-width="30" stroke-linecap="round" stroke-linejoin="round"/>
+<rect x="316" y="396" width="96" height="24" rx="12" fill="#EDEFF1"/>
+</svg>

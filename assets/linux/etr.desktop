@@ -1,0 +1,10 @@
+# Template launcher — edit the Exec= line below to your target host
+# (e.g. `Exec=etr user@host`) before installing.
+[Desktop Entry]
+Type=Application
+Name=etr
+Comment=Reconnecting remote shell (Rust reimplementation of Eternal Terminal)
+Exec=etr
+Icon=etr
+Terminal=true
+Categories=Network;RemoteAccess;
