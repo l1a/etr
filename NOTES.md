@@ -9,7 +9,36 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.6.2 — CI mirrors release's target matrix
+## Current state: v0.6.3 — Windows terminal fidelity (backspace + initial prompt)
+
+New in v0.6.3 — two fixes for connecting to a Unix `etrs` from a Windows `etr`
+client (both were invisible over plain `ssh` from the same machine):
+- **Backspace behaved like a stray/delete key.** The Windows console delivers
+  legacy key codes to raw byte reads — Backspace as `0x08` (`^H`), no ESC
+  sequences for arrows/function keys — whereas a Unix PTY expects the xterm
+  conventions, notably Backspace → `0x7f` (DEL) to match the default
+  `stty erase`. The client now switches the console into virtual-terminal mode
+  after enabling raw mode (`ENABLE_VIRTUAL_TERMINAL_INPUT` on stdin,
+  `ENABLE_VIRTUAL_TERMINAL_PROCESSING` on stdout, via `windows-sys`), so it
+  emits the same key bytes a real terminal does and renders the remote's ANSI
+  output. No-op on Unix. New Windows-only dependency: `windows-sys` (Console).
+- **Blank screen until the first Enter.** `etrs` spawned the shell and started
+  reading its PTY at session start — before any client connected. The shell's
+  initial prompt could be produced in the window between the server snapshotting
+  replay data and installing the live PTY channel, so on the first connection it
+  was recorded to history but neither replayed nor sent; pressing Enter forced a
+  fresh prompt. The PTY *reader* task is now started lazily on the first
+  connection, after the client's PTY channel is live, so the prompt is delivered
+  immediately (mirrors how SSH only emits shell output once the channel exists).
+  Replay-on-reconnect is unchanged (the reader persists across reconnects). One
+  consequence: a shell/command producing more than the kernel PTY buffer before
+  the first client attaches will block on write until connect (~1 RTT) —
+  bounded, and analogous to SSH channel flow control.
+- Test count: 110 (unchanged; the fixes are in integration paths — the client
+  console setup is Windows-runtime behaviour and the reader deferral is covered
+  by the `e2e-local`/`e2e-cmd-local` live tests rather than unit tests).
+
+## Previous: v0.6.2 — CI mirrors release's target matrix
 
 New in v0.6.2:
 - `ci.yml`'s `lints` and `test` matrices gained `ubuntu-24.04-arm` (the same

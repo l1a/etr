@@ -502,7 +502,7 @@ async fn run_session(
     let mut child = pair.slave.spawn_command(cmd).map_err(io::Error::other)?;
 
     let master_fd = pair.master.as_raw_fd();
-    let mut pty_reader = pair.master.try_clone_reader().map_err(io::Error::other)?;
+    let pty_reader = pair.master.try_clone_reader().map_err(io::Error::other)?;
     let mut pty_writer = pair.master.take_writer().map_err(io::Error::other)?;
     let master = Arc::new(Mutex::new(pair.master));
 
@@ -525,33 +525,14 @@ async fn run_session(
     // outbound_ctrl_tx: current connection's control envelope channel.
     let outbound_ctrl_tx: CtrlTx = Arc::new(std::sync::Mutex::new(None));
 
-    // PTY reader: forwards PTY output into the session and the active connection.
-    {
-        let outbound_pty_tx = Arc::clone(&outbound_pty_tx);
-        let session_state = Arc::clone(&session_state);
-        tokio::task::spawn_blocking(move || {
-            let mut buf = [0u8; 4096];
-            loop {
-                match pty_reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        let data = buf[..n].to_vec();
-                        let seq = {
-                            let mut s = session_state.blocking_lock();
-                            let st = s.stream_mut(0).expect("stream 0 always exists");
-                            let seq = st.next_out_seq;
-                            st.next_out_seq += 1;
-                            st.record_send(seq, data.clone());
-                            seq
-                        };
-                        if let Some(tx) = outbound_pty_tx.lock().unwrap().clone() {
-                            let _ = tx.blocking_send((seq, data));
-                        }
-                    }
-                }
-            }
-        });
-    }
+    // The PTY reader (which forwards shell output to the client and records it
+    // for replay) is NOT started here.  It is handed to the first client
+    // connection and started only once the client's PTY channel is live — see
+    // `handle_connection`.  Starting it eagerly meant the shell's initial prompt
+    // could be produced before anything was listening: it was recorded to
+    // history but neither replayed nor sent on that first connection, so the
+    // user saw a blank screen until they pressed Enter to force a fresh prompt.
+    let pty_reader_holder: PtyReaderHolder = Arc::new(std::sync::Mutex::new(Some(pty_reader)));
 
     // Shell-exit signal: set to true when the child shell exits.
     let (shell_exit_tx, shell_exit_rx) = tokio::sync::watch::channel(false);
@@ -682,6 +663,7 @@ async fn run_session(
                 Arc::clone(&active_reverse_listeners),
                 shell_exit_rx.clone(),
                 Arc::clone(&x11_real_cookie),
+                Arc::clone(&pty_reader_holder),
             ) => (r, false),
             _ = sigterm_conn.recv() => {
                 vlog!(1, "[etrs] SIGTERM during active session, closing connection");
@@ -722,6 +704,11 @@ async fn run_session(
 
 type PtyTx = Arc<std::sync::Mutex<Option<mpsc::Sender<(u64, Vec<u8>)>>>>;
 type CtrlTx = Arc<std::sync::Mutex<Option<mpsc::Sender<Envelope>>>>;
+/// One-shot hand-off of the PTY master reader to the first connection that
+/// establishes a live PTY channel.  `Some` until the reader task is started;
+/// `None` thereafter (the running task persists across reconnects).
+#[cfg(unix)]
+type PtyReaderHolder = Arc<std::sync::Mutex<Option<Box<dyn std::io::Read + Send>>>>;
 
 /// Handle one QUIC connection.  Returns `true` on clean Disconnect.
 #[cfg(unix)]
@@ -740,6 +727,7 @@ async fn handle_connection(
     active_reverse_listeners: Arc<Mutex<std::collections::HashSet<String>>>,
     shell_exit_rx: tokio::sync::watch::Receiver<bool>,
     x11_real_cookie: Arc<Mutex<Option<Vec<u8>>>>,
+    pty_reader_holder: PtyReaderHolder,
 ) -> bool {
     let peer = conn.remote_address();
     vlog!(
@@ -964,6 +952,40 @@ async fn handle_connection(
             }
         }
     });
+
+    // ── PTY master reader (started once, on the first connection) ─────────
+    // Deferred to here — after `outbound_pty_tx` is installed and the PTY send
+    // stream is live — so the shell's very first output (its prompt) is
+    // delivered on this connection instead of being produced before any
+    // listener exists.  `take()` ensures it starts exactly once; the running
+    // task persists across reconnects and picks up each new `outbound_pty_tx`
+    // via the shared holder, so replay-on-reconnect is unchanged.
+    if let Some(mut pty_reader) = pty_reader_holder.lock().unwrap().take() {
+        let outbound_pty_tx = Arc::clone(&outbound_pty_tx);
+        let session_state = Arc::clone(&session_state);
+        tokio::task::spawn_blocking(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match pty_reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let data = buf[..n].to_vec();
+                        let seq = {
+                            let mut s = session_state.blocking_lock();
+                            let st = s.stream_mut(0).expect("stream 0 always exists");
+                            let seq = st.next_out_seq;
+                            st.next_out_seq += 1;
+                            st.record_send(seq, data.clone());
+                            seq
+                        };
+                        if let Some(tx) = outbound_pty_tx.lock().unwrap().clone() {
+                            let _ = tx.blocking_send((seq, data));
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     // ── PTY input reader: QUIC PTY recv stream → pty_in_tx ───────────────
     let session_r = Arc::clone(&session_state);
