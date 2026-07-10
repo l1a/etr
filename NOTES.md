@@ -37,6 +37,11 @@ client (both were invisible over plain `ssh` from the same machine):
 - Test count: 110 (unchanged; the fixes are in integration paths — the client
   console setup is Windows-runtime behaviour and the reader deferral is covered
   by the `e2e-local`/`e2e-cmd-local` live tests rather than unit tests).
+- Also cleared two RustSec advisories published while this work was in flight
+  (both against pre-existing transitive deps, neither introduced here):
+  `crossbeam-epoch` 0.9.18→0.9.20 (RUSTSEC-2026-0204, dev-only via `criterion`;
+  not in the shipped binaries) and `anyhow` 1.0.102→1.0.103 (RUSTSEC-2026-0190
+  unsoundness warning).
 
 ## Previous: v0.6.2 — CI mirrors release's target matrix
 
