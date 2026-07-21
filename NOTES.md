@@ -46,6 +46,20 @@ New in v0.6.5 (two independent Windows parity fixes):
   cover the critical modes and never move the cursor on the safe path / never
   clear scrollback).
 
+**Live verification (Windows → WSL Fedora 44 etrs, 2026-07-21):** a full
+Windows→Unix session was exercised end-to-end with the rebuilt v0.6.5 client:
+the remote zsh/starship prompt rendered with correct ANSI, a command typed into
+the PTY round-tripped (executed remotely, output returned), and on clean shell
+exit the client emitted exactly the 70-byte cursor-safe `TERM_RESET_MODES` with
+no screen reset — confirming fix #2 in the live byte stream. The console-side
+input-VT translation of fix #1 (the `ReadFile` path) can only be exercised with
+real interactive console keystrokes and so must be confirmed by hand:
+zellij keybindings should work without `^g` and the first typed line should echo
+per-keystroke. Note (adjacent, pre-existing): running `etr host 'cmd'` with
+redirected/`</dev/null` stdin ends the session on stdin EOF before the command's
+output arrives (`run_session` treats `stdin_task` completing as session end);
+interactive console stdin never EOFs so this does not affect normal use.
+
 ### ~~Known issue — Windows: first line of input not echoed until Enter~~ (fixed in v0.6.5)
 
 Fixed by the `ReadFile`-based input path above: reading the console handle
