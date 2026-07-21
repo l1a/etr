@@ -748,6 +748,15 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
 
 ## Known gaps / next steps
 
+- **Remote command truncated with redirected stdin**: `etr host 'cmd'` with
+  `</dev/null` or a pipe on stdin ends the session as soon as stdin hits EOF,
+  because `run_session`'s `tokio::select!` treats `stdin_task` completing as
+  session end — so a fast command's output can be lost before it is relayed.
+  Interactive console stdin never EOFs, so normal interactive use is unaffected.
+  ssh keeps reading command output after stdin EOF; matching that would mean
+  half-closing the stdin path (stop sending) while continuing to drain PTY
+  output until the server disconnects. Discovered during the v0.6.5 Windows
+  input/terminal-restore work; pre-existing, not part of that fix.
 - ~~**`utmp`/`wtmp` registration**~~ **Done**: `etrs` writes `USER_PROCESS` to utmp
   and wtmp on connect, and `DEAD_PROCESS` on clean shell exit, via `libutempter`
   (`src/login.rs`).  `libutempter` delegates to the setgid-utmp helper
