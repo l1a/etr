@@ -9,7 +9,107 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.6.4 — Windows Backspace fix
+## Current state: v0.6.5 — Windows input path + terminal restore on exit
+
+New in v0.6.5 (four independent Windows parity fixes):
+
+- **Special characters no longer "eaten".** The client's stdin reader previously
+  used `std::io::stdin().read()`, which on Windows goes through Rust std's
+  `ReadConsoleW` shim (UTF-16→UTF-8 + internal line cooking). That shim **drops
+  bytes that aren't clean UTF-8**, which is what made special characters
+  disappear (e.g. zellij keybindings not registering, needing `^g`). The reader
+  now reads the console input handle directly with `ReadFile` (new `read_stdin`,
+  Windows path). With `ENABLE_VIRTUAL_TERMINAL_INPUT` already on, `ReadFile`
+  returns the same VT byte stream a Unix terminal emits — no UTF-8 mangling.
+  `enable_vt_console` also now sets the console **input codepage to UTF-8
+  (65001)** (saved and restored on exit) so typed multi-byte characters reach
+  the remote as UTF-8, matching what the std path produced. No-op on Unix.
+- **First line of input now echoes as typed (issue #54).** The single stdin
+  reader thread is spawned before the QUIC connect, but raw + VT-input mode is
+  only enabled *after* the connect. On Windows a `ReadFile` issued while the
+  console is still in cooked/line mode stays line-buffered for that whole read,
+  so the first line was held client-side until Enter (the reported "no echo
+  until first Enter"; the `ReadFile` change above did **not** fix this on its
+  own — it is a timing problem, not a read-mechanism one). The Windows reader
+  now waits on a one-shot signal fired immediately after the first
+  `enable_raw_mode` + `enable_vt_console`, so its very first read happens in raw
+  + VT mode and is per-keystroke. Unix has no such coupling (and never showed the
+  bug), so its reader is ungated and starts immediately as before.
+- **Local terminal is restored on exit.** A remote full-screen app
+  (zellij/vim/less) puts the *local* terminal into alternate-screen,
+  mouse-reporting, bracketed-paste, hidden-cursor, application-keypad and
+  scroll-region modes via escapes we relay. On a hard drop (remote reboot) or a
+  forced `~.` the remote never sends its cleanup, so those modes were left set:
+  the mouse wheel spewed escape sequences and the terminal was unusable.
+  `disable_raw_mode` only restores console line/echo flags, not these
+  emulator modes. The client now emits an explicit VT reset (`restore_terminal`)
+  on every final-exit path. It is split in two: a **cursor-safe** part
+  (`TERM_RESET_MODES` — disable mouse/paste/app-keys, show cursor, reset SGR)
+  emitted on every exit, and a **screen-restoring** part (`TERM_RESET_SCREEN` —
+  leave alternate screen, reset scroll region; both move the cursor to home)
+  emitted **only** on unclean exits (`~.`, abandoned hard drop, remote command
+  whose TUI may still be up). Clean shell exits skip the screen reset so the
+  cursor is left untouched. Cross-platform (Unix terminals honour the same
+  resets); deliberately avoids a full RIS so scrollback is preserved.
+- **Local shell's Enter works again after etr exits.** `enable_vt_console` sets
+  `ENABLE_VIRTUAL_TERMINAL_INPUT` on the console, but crossterm's
+  `disable_raw_mode` only ORs the line/echo/processed-input bits back — it never
+  clears that VT-input flag. So after etr exited, the console was left with
+  VT-input still enabled, and the *local* shell echoed typed characters but did
+  not accept Enter (the VT-translated Enter wasn't recognised as line
+  submission). etr now captures the console's exact original input/output modes
+  and input codepage once (`capture_console_originals`, before raw mode is first
+  enabled) and restores them verbatim on exit (`restore_console_state`), which
+  clears the leftover VT-input flag. Pre-existing since VT-input was introduced
+  in v0.6.4. No-op on Unix (crossterm fully restores termios there).
+- Test count: 110 → 112 (two regression tests asserting the reset sequences
+  cover the critical modes and never move the cursor on the safe path / never
+  clear scrollback).
+
+**Live verification (Windows → WSL Fedora 44 etrs, 2026-07-21):** both fixes were
+verified end-to-end against a real Unix `etrs`, driving the rebuilt v0.6.5 client
+with *synthesized real console key events* (`WriteConsoleInputW` into the
+client's own console — the same INPUT_RECORDs a physical keyboard produces):
+
+- *Fix #1 (input not eaten, per-keystroke):* An isolated harness confirmed the
+  exact path `read_stdin` uses (console in raw + `ENABLE_VIRTUAL_TERMINAL_INPUT`,
+  read via `ReadFile`) delivers every key intact and unbatched: `a`, **Ctrl+G →
+  `0x07`**, Up-arrow → `ESC [ A`, a rapid 5-key burst, and `é` → UTF-8 `c3 a9`.
+  A full-composition harness then injected keystrokes into a live `etr` session;
+  the remote `zsh-syntax-highlighting` re-coloured the command **character by
+  character** as it arrived (proof of per-keystroke delivery, not batching) and
+  the typed command executed and round-tripped. This is the root cause of the
+  "characters eaten / zellij needs `^g`" report.
+- *First-line echo (#54):* A/B harness that types the first line and snapshots
+  the client's stdout **before** sending Enter. Pre-fix binary: the typed
+  command is absent from the snapshot (held client-side until Enter). With the
+  reader gate: the command appears in the pre-Enter snapshot, echoed back
+  per-keystroke (remote syntax-highlighting recolours char-by-char) — first line
+  now echoes as typed.
+- *Fix #2 (terminal restore):* On clean shell exit the client emitted exactly the
+  70-byte cursor-safe `TERM_RESET_MODES` (no cursor-moving screen reset),
+  confirmed in the live output byte stream.
+- *Console-mode restore:* A harness recorded the console input mode before
+  launching etr and again after etr exited via `~.`. Result: the mode was
+  restored byte-identical (`0x01f7` → `0x01f7`) and `ENABLE_VIRTUAL_TERMINAL_INPUT`
+  was not left set — the local shell's line input (Enter) works after exit.
+
+Note (adjacent, pre-existing, out of scope): running `etr host 'cmd'` with
+redirected/`</dev/null` stdin ends the session on stdin EOF before the command's
+output arrives (`run_session` treats `stdin_task` completing as session end);
+interactive console stdin never EOFs so this does not affect normal use.
+
+### ~~Known issue — Windows: first line of input not echoed until Enter~~ (fixed in v0.6.5)
+
+Fixed in v0.6.5 by gating the Windows stdin reader until raw + VT-input mode is
+enabled (see the "First line of input now echoes as typed" bullet above). The
+`ReadFile`-based input path was necessary but **not sufficient** on its own — the
+first line was line-buffered because the first read was *issued* before raw mode,
+which is a timing problem the reader gate solves. Verified with an A/B harness
+that snapshots the client's stdout before Enter is sent. Tracked in
+[GitHub issue #54](https://github.com/l1a/etr/issues/54).
+
+## Previous: v0.6.4 — Windows Backspace fix
 
 New in v0.6.4:
 - **Windows client Backspace fixed.** The Windows console delivers legacy key
@@ -26,7 +126,11 @@ New in v0.6.4:
   already bumped to 0.9.20 in v0.6.3 for RUSTSEC-2026-0204.)
 - Test count: 110 (unchanged).
 
-### Known issue — Windows: first line of input not echoed until Enter
+### Known issue (as of v0.6.4; resolved in v0.6.5) — Windows: first line of input not echoed until Enter
+
+Resolved in v0.6.5 by reading the console input handle directly with `ReadFile`
+instead of `std::io::stdin().read()` (see the v0.6.5 section above). The
+historical diagnosis is kept below for context.
 
 When connecting from a Windows `etr` client to a Unix host, the shell prompt
 renders correctly, but the **first line** the user types is not echoed until
@@ -677,6 +781,37 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
 
 ## Known gaps / next steps
 
+- **Clean shell `exit` sometimes reconnects instead of quitting**: when the
+  remote shell exits, `etrs` should send a clean `Disconnect` so `etr` exits and
+  restores the terminal. Observed on Windows→WSL that this races: sometimes the
+  QUIC connection closes before the `Disconnect` envelope is delivered, so `etr`
+  sees a stream error and enters the reconnect loop *forever* (terminal stays in
+  raw/VT mode until the user types `~.`). This is the likely remaining cause of
+  "after a controlled shutdown the local terminal is unusable" — `restore_terminal`
+  never runs until `~.`. Server-side fix (needs `etrs` rebuild): ensure the
+  `Disconnect` is flushed/acked before the endpoint is dropped on shell exit (cf.
+  the v0.4.22 "wait briefly for pending client" handling, which covers the
+  no-client-yet case but not delivery on an active connection). A client-side
+  mitigation is not really possible: without the `Disconnect` signal the client
+  cannot distinguish "server rebooted (reconnect)" from "shell exited (quit)".
+- **`just` recipes unusable from native Windows shells**: the `justfile` recipes
+  use `#!/usr/bin/env bash` shebangs, so on Windows `just` tries to translate the
+  interpreter path with `cygpath`. From PowerShell/nushell (no Git-Bash `cygpath`
+  on PATH) recipes like `just install` fail with "could not find `cygpath`
+  executable". Workaround for the client build/install on Windows:
+  `cargo install --path . --bin etr --force` (or `cargo build --release --bin etr`
+  then copy `target\release\etr.exe` to `~/.cargo/bin`). A real fix would make the
+  common recipes cross-shell — e.g. plain (non-shebang) recipes that shell out to
+  `cargo` directly, or documenting that `just` needs Git Bash on PATH on Windows.
+- **Remote command truncated with redirected stdin**: `etr host 'cmd'` with
+  `</dev/null` or a pipe on stdin ends the session as soon as stdin hits EOF,
+  because `run_session`'s `tokio::select!` treats `stdin_task` completing as
+  session end — so a fast command's output can be lost before it is relayed.
+  Interactive console stdin never EOFs, so normal interactive use is unaffected.
+  ssh keeps reading command output after stdin EOF; matching that would mean
+  half-closing the stdin path (stop sending) while continuing to drain PTY
+  output until the server disconnects. Discovered during the v0.6.5 Windows
+  input/terminal-restore work; pre-existing, not part of that fix.
 - ~~**`utmp`/`wtmp` registration**~~ **Done**: `etrs` writes `USER_PROCESS` to utmp
   and wtmp on connect, and `DEAD_PROCESS` on clean shell exit, via `libutempter`
   (`src/login.rs`).  `libutempter` delegates to the setgid-utmp helper
@@ -727,7 +862,7 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
 
 ---
 
-## Test coverage (110 tests)
+## Test coverage (112 tests)
 
 | Module | What's tested |
 |--------|--------------|
@@ -737,6 +872,6 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
 | `session/mod` | Close/ack unknown stream, `last_received_map` semantics, collect_replays, `open_stream` idempotence |
 | `bin/etrs` | CLI defaults, verbose count, custom port, subcommand parsing, hex_decode, custom --log-path override, `ETRX11` bootstrap line parsing |
 | `login` | no-panic checks for record_login / record_logout with invalid fd |
-| `bin/etr` | CLI defaults, port parsing, target parsing, no --cipher flag, custom --log-path and --server-log-path overrides, config fallback for log paths |
+| `bin/etr` | CLI defaults, port parsing, target parsing, no --cipher flag, custom --log-path and --server-log-path overrides, config fallback for log paths, terminal-restore sequences (cursor-safe modes cover mouse/paste/cursor and never move the cursor; screen reset leaves alt-screen without clearing scrollback) |
 | `config` | TOML parse (full section, partial, empty), default values, `gateway_ports` / `forward` / `reverse_forward` / `x11` / `x11_trusted` config keys |
 | `forward` | `-L`/`-R` spec parsing: TCP/UDP/IPv6, explicit proto, bad port, empty host, Display; bind address parsing (explicit IP, `[::1]`, wildcard `*`); `get_bind_addresses` with and without gateway flag; `resolve_udp_target`: localhost prefers IPv6, explicit IPv4, unresolvable host; `X11Display` parsing |

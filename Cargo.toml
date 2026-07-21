@@ -1,6 +1,6 @@
 [package]
 name = "etr"
-version = "0.6.4"
+version = "0.6.5"
 edition = "2024"
 description = "A Rust implementation of Eternal Terminal (et)"
 license = "GPL-3.0-only"
@@ -37,11 +37,14 @@ serde = { version = "1", features = ["derive"] }
 toml = "1"
 
 # Windows-only: put the console into virtual-terminal mode so the client speaks
-# the same key/ANSI byte conventions a Unix PTY expects (Backspace → DEL, etc.).
+# the same key/ANSI byte conventions a Unix PTY expects (Backspace → DEL, etc.),
+# and read the console input handle directly with `ReadFile`
+# (Win32_Storage_FileSystem) to get an unbatched, per-keystroke VT byte stream.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Console",
+    "Win32_Storage_FileSystem",
 ] }
 
 [dev-dependencies]
