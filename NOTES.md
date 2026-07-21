@@ -9,7 +9,51 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.6.4 — Windows Backspace fix
+## Current state: v0.6.5 — Windows input path + terminal restore on exit
+
+New in v0.6.5 (two independent Windows parity fixes):
+
+- **Special characters no longer "eaten"; input is now per-keystroke.** The
+  client's stdin reader previously used `std::io::stdin().read()`, which on
+  Windows goes through Rust std's `ReadConsoleW` shim (UTF-16→UTF-8 + internal
+  line cooking). Even in raw mode that shim **batches** input and **drops bytes
+  that aren't clean UTF-8**, which is what made special characters disappear
+  (e.g. zellij keybindings not registering, needing `^g`) and caused the
+  first-line-not-echoed bug (#54). The reader now reads the console input handle
+  directly with `ReadFile` (new `read_stdin`, Windows path). With
+  `ENABLE_VIRTUAL_TERMINAL_INPUT` already on, `ReadFile` returns the same
+  per-keystroke VT byte stream a Unix terminal emits — no batching, no UTF-8
+  mangling. `enable_vt_console` also now sets the console **input codepage to
+  UTF-8 (65001)** (saved and restored on exit) so typed multi-byte characters
+  reach the remote as UTF-8, matching what the std path produced. No-op on Unix.
+- **Local terminal is restored on exit.** A remote full-screen app
+  (zellij/vim/less) puts the *local* terminal into alternate-screen,
+  mouse-reporting, bracketed-paste, hidden-cursor, application-keypad and
+  scroll-region modes via escapes we relay. On a hard drop (remote reboot) or a
+  forced `~.` the remote never sends its cleanup, so those modes were left set:
+  the mouse wheel spewed escape sequences and the terminal was unusable.
+  `disable_raw_mode` only restores console line/echo flags, not these
+  emulator modes. The client now emits an explicit VT reset (`restore_terminal`)
+  on every final-exit path. It is split in two: a **cursor-safe** part
+  (`TERM_RESET_MODES` — disable mouse/paste/app-keys, show cursor, reset SGR)
+  emitted on every exit, and a **screen-restoring** part (`TERM_RESET_SCREEN` —
+  leave alternate screen, reset scroll region; both move the cursor to home)
+  emitted **only** on unclean exits (`~.`, abandoned hard drop, remote command
+  whose TUI may still be up). Clean shell exits skip the screen reset so the
+  cursor is left untouched. Cross-platform (Unix terminals honour the same
+  resets); deliberately avoids a full RIS so scrollback is preserved.
+- Test count: 110 → 112 (two regression tests asserting the reset sequences
+  cover the critical modes and never move the cursor on the safe path / never
+  clear scrollback).
+
+### ~~Known issue — Windows: first line of input not echoed until Enter~~ (fixed in v0.6.5)
+
+Fixed by the `ReadFile`-based input path above: reading the console handle
+directly delivers bytes per-keystroke, so the first line echoes as it is typed
+rather than only on Enter. Tracked in
+[GitHub issue #54](https://github.com/l1a/etr/issues/54).
+
+## Previous: v0.6.4 — Windows Backspace fix
 
 New in v0.6.4:
 - **Windows client Backspace fixed.** The Windows console delivers legacy key
@@ -26,7 +70,11 @@ New in v0.6.4:
   already bumped to 0.9.20 in v0.6.3 for RUSTSEC-2026-0204.)
 - Test count: 110 (unchanged).
 
-### Known issue — Windows: first line of input not echoed until Enter
+### Known issue (as of v0.6.4; resolved in v0.6.5) — Windows: first line of input not echoed until Enter
+
+Resolved in v0.6.5 by reading the console input handle directly with `ReadFile`
+instead of `std::io::stdin().read()` (see the v0.6.5 section above). The
+historical diagnosis is kept below for context.
 
 When connecting from a Windows `etr` client to a Unix host, the shell prompt
 renders correctly, but the **first line** the user types is not echoed until
@@ -727,7 +775,7 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
 
 ---
 
-## Test coverage (110 tests)
+## Test coverage (112 tests)
 
 | Module | What's tested |
 |--------|--------------|
@@ -737,6 +785,6 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
 | `session/mod` | Close/ack unknown stream, `last_received_map` semantics, collect_replays, `open_stream` idempotence |
 | `bin/etrs` | CLI defaults, verbose count, custom port, subcommand parsing, hex_decode, custom --log-path override, `ETRX11` bootstrap line parsing |
 | `login` | no-panic checks for record_login / record_logout with invalid fd |
-| `bin/etr` | CLI defaults, port parsing, target parsing, no --cipher flag, custom --log-path and --server-log-path overrides, config fallback for log paths |
+| `bin/etr` | CLI defaults, port parsing, target parsing, no --cipher flag, custom --log-path and --server-log-path overrides, config fallback for log paths, terminal-restore sequences (cursor-safe modes cover mouse/paste/cursor and never move the cursor; screen reset leaves alt-screen without clearing scrollback) |
 | `config` | TOML parse (full section, partial, empty), default values, `gateway_ports` / `forward` / `reverse_forward` / `x11` / `x11_trusted` config keys |
 | `forward` | `-L`/`-R` spec parsing: TCP/UDP/IPv6, explicit proto, bad port, empty host, Display; bind address parsing (explicit IP, `[::1]`, wildcard `*`); `get_bind_addresses` with and without gateway flag; `resolve_udp_target`: localhost prefers IPv6, explicit IPv4, unresolvable host; `X11Display` parsing |

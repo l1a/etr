@@ -23,6 +23,34 @@ use etr::session::SessionState;
 static LOG_FILE: std::sync::OnceLock<std::sync::Mutex<std::fs::File>> = std::sync::OnceLock::new();
 static IN_RAW_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The console input codepage in effect before we switched it to UTF-8, saved so
+/// it can be restored on exit.  0 means "not yet captured".  Windows-only.
+#[cfg(windows)]
+static ORIG_INPUT_CP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Cursor-safe VT resets emitted on *every* session exit.
+///
+/// A remote full-screen program (zellij, vim, less, …) switches the *local*
+/// terminal into mouse-reporting, bracketed-paste, application-cursor-key,
+/// application-keypad and hidden-cursor modes via escape sequences we relay to
+/// stdout.  If the session dies before that program emits its own cleanup — a
+/// hard drop (remote reboot) or a forced `~.` — those modes stay set and the
+/// terminal is left unusable (mouse wheel spews escape sequences, cursor
+/// hidden).  These are terminal-*emulator* modes, not console line/echo flags,
+/// so `disable_raw_mode` does not undo them; we emit the resets ourselves.
+///
+/// Every reset here is idempotent *and* leaves the cursor where it is, so it is
+/// safe to send even on a clean exit where nothing was left set.
+const TERM_RESET_MODES: &[u8] = b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?1l\x1b>\x1b[?7h\x1b[?25h\x1b[0m";
+
+/// Screen-restoring VT resets: leave the alternate screen buffer and reset the
+/// scrolling region.  Both move the cursor to home per the VT spec, so these are
+/// emitted *only* when the session ended uncleanly (hard drop / forced `~.`) and
+/// a full-screen app may still hold the alternate screen — never on a clean exit
+/// where the remote app already switched back (re-emitting them would reposition
+/// the cursor).  Deliberately avoids a full RIS (`\x1bc`) so scrollback is kept.
+const TERM_RESET_SCREEN: &[u8] = b"\x1b[?1049l\x1b[r";
+
 /// Escape character for the client: `~` (0x7E), SSH-style.  Type it at the
 /// start of a line followed by `.` to force-disconnect.  The line-start guard
 /// prevents false triggers from `~` in shell paths or git refs.
@@ -43,10 +71,18 @@ const ESCAPE_CHAR: u8 = b'~';
 /// No-op on Unix, where the terminal already speaks VT natively.
 #[cfg(windows)]
 fn enable_vt_console() {
+    use std::sync::atomic::Ordering;
     use windows_sys::Win32::System::Console::{
         CONSOLE_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
-        GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleMode,
+        GetConsoleCP, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        SetConsoleCP, SetConsoleMode,
     };
+    // The UTF-8 codepage.  We read the console input handle directly with
+    // `ReadFile` (see `read_stdin`), which returns typed characters encoded in
+    // the console *input* codepage.  Set it to UTF-8 so multi-byte input reaches
+    // the remote as the UTF-8 the Unix PTY expects, rather than the legacy
+    // OEM/ANSI codepage.
+    const CP_UTF8: u32 = 65001;
     // SAFETY: standard Win32 console calls.  `GetStdHandle` returns a process
     // std handle; `GetConsoleMode` fails (returns 0) for non-console handles
     // (e.g. redirected stdio), so we only call `SetConsoleMode` on a handle it
@@ -56,6 +92,14 @@ fn enable_vt_console() {
         let mut mode: CONSOLE_MODE = 0;
         if GetConsoleMode(h_in, &mut mode) != 0 {
             SetConsoleMode(h_in, mode | ENABLE_VIRTUAL_TERMINAL_INPUT);
+            // Capture the original input codepage exactly once (before we change
+            // it), so reconnects — which call this again — don't overwrite the
+            // saved value with our own UTF-8 setting.
+            let cp = GetConsoleCP();
+            if cp != 0 {
+                let _ = ORIG_INPUT_CP.compare_exchange(0, cp, Ordering::Relaxed, Ordering::Relaxed);
+            }
+            SetConsoleCP(CP_UTF8);
         }
         let h_out = GetStdHandle(STD_OUTPUT_HANDLE);
         let mut out_mode: CONSOLE_MODE = 0;
@@ -68,6 +112,95 @@ fn enable_vt_console() {
 /// No-op on Unix: the terminal already delivers VT key sequences and renders ANSI.
 #[cfg(not(windows))]
 fn enable_vt_console() {}
+
+/// Restore the console input codepage saved by `enable_vt_console`.  No-op on
+/// Unix and if the codepage was never changed.
+#[cfg(windows)]
+fn restore_console_cp() {
+    use std::sync::atomic::Ordering;
+    use windows_sys::Win32::System::Console::SetConsoleCP;
+    let cp = ORIG_INPUT_CP.load(Ordering::Relaxed);
+    if cp != 0 {
+        // SAFETY: `SetConsoleCP` takes a codepage id by value; `cp` is the value
+        // `GetConsoleCP` returned earlier, so it is a valid codepage.
+        unsafe {
+            SetConsoleCP(cp);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn restore_console_cp() {}
+
+/// Read a chunk of stdin bytes into `buf`, returning the number read (0 = EOF).
+///
+/// On Unix this is a plain `stdin().read`.  On Windows it reads the console
+/// input handle directly with `ReadFile`, bypassing Rust std's `ReadConsoleW`
+/// shim: with `ENABLE_VIRTUAL_TERMINAL_INPUT` on (set by `enable_vt_console`)
+/// the console hands `ReadFile` the same per-keystroke VT byte stream a Unix
+/// terminal emits.  The std shim instead batches input and drops bytes that
+/// aren't valid UTF-8, which manifested as "special characters eaten" and the
+/// "first line not echoed until Enter" bug (#54).
+#[cfg(not(windows))]
+fn read_stdin(buf: &mut [u8]) -> io::Result<usize> {
+    use std::io::Read;
+    std::io::stdin().read(buf)
+}
+
+#[cfg(windows)]
+fn read_stdin(buf: &mut [u8]) -> io::Result<usize> {
+    use windows_sys::Win32::Storage::FileSystem::ReadFile;
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE};
+    // SAFETY: `GetStdHandle` returns the process stdin handle, valid for the
+    // process lifetime.  `ReadFile` writes at most `buf.len()` bytes into `buf`
+    // and reports the count via `read`; both pointers reference locals/`buf`
+    // that outlive the call.  A null overlapped pointer requests a synchronous
+    // read, which is correct for the (synchronous) console handle.
+    unsafe {
+        let h = GetStdHandle(STD_INPUT_HANDLE);
+        let mut read: u32 = 0;
+        let ok = ReadFile(
+            h,
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+            &mut read,
+            std::ptr::null_mut(),
+        );
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(read as usize)
+    }
+}
+
+/// Return the local terminal to a sane state after a session ends for good
+/// (clean exit, `~.`, or a hard drop we give up on).  Emits the VT resets while
+/// output VT processing is still enabled, restores the console input codepage,
+/// then drops raw mode.
+///
+/// `reset_screen` should be `true` only for unclean endings (forced `~.`, a hard
+/// drop we abandon, a remote command whose TUI may still be up): it additionally
+/// leaves the alternate screen and resets the scroll region ([`TERM_RESET_SCREEN`]),
+/// which move the cursor.  On a clean exit pass `false` so the cursor is left
+/// untouched, since the remote already restored the screen.
+///
+/// Must only be called when raw/VT mode was actually entered — otherwise the
+/// escape bytes would print literally on a console without VT processing enabled.
+fn restore_terminal(reset_screen: bool) {
+    IN_RAW_MODE.store(false, std::sync::atomic::Ordering::Relaxed);
+    {
+        let mut out = io::stdout();
+        // Leave the alternate screen first (back to the normal buffer), then
+        // reset the cursor-safe modes on the buffer the user will actually see.
+        if reset_screen {
+            let _ = out.write_all(TERM_RESET_SCREEN);
+        }
+        let _ = out.write_all(TERM_RESET_MODES);
+        let _ = out.flush();
+    }
+    restore_console_cp();
+    let _ = disable_raw_mode();
+}
 
 macro_rules! vlog {
     ($verbose:expr, $level:expr, $($arg:tt)*) => {
@@ -659,13 +792,12 @@ async fn run_connection_loop(
     let (escape_tx, escape_rx) = tokio::sync::watch::channel(false);
 
     let _stdin_reader = tokio::task::spawn_blocking(move || {
-        use std::io::Read;
         let mut buf = [0u8; 1024];
         // `~` is common in shell input, so only recognise it at line-start
         // (mirrors ssh ~. behaviour).
         let mut at_line_start = true;
         let mut escape_pending = false;
-        while let Ok(n) = std::io::stdin().read(&mut buf) {
+        while let Ok(n) = read_stdin(&mut buf) {
             if n == 0 {
                 break;
             }
@@ -733,13 +865,13 @@ async fn run_connection_loop(
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(2)) => {}
                 Ok(_) = escape_rx.wait_for(|&v| v) => {
+                    // Only restore (emit the VT reset) if we ever entered raw/VT
+                    // mode — otherwise the escape bytes would print literally.
+                    // Unclean ending: reset the screen too.
                     if in_raw {
-                        IN_RAW_MODE.store(false, std::sync::atomic::Ordering::Relaxed);
-                        let _ = disable_raw_mode();
-                        eprint!("\r\n[etr] Disconnected (~.).\r\n");
-                    } else {
-                        eprintln!("[etr] Disconnected (~.).");
+                        restore_terminal(true);
                     }
+                    eprintln!("[etr] Disconnected (~.).");
                     return Ok(());
                 }
             }
@@ -787,12 +919,9 @@ async fn run_connection_loop(
             },
             Ok(_) = escape_rx.wait_for(|&v| v) => {
                 if in_raw {
-                    IN_RAW_MODE.store(false, std::sync::atomic::Ordering::Relaxed);
-                    let _ = disable_raw_mode();
-                    eprint!("\r\n[etr] Disconnected (~.).\r\n");
-                } else {
-                    eprintln!("[etr] Disconnected (~.).");
+                    restore_terminal(true);
                 }
+                eprintln!("[etr] Disconnected (~.).");
                 return Ok(());
             }
         };
@@ -823,34 +952,33 @@ async fn run_connection_loop(
                 verbose,
             ) => r,
             Ok(_) = escape_rx.wait_for(|&v| v) => {
-                IN_RAW_MODE.store(false, std::sync::atomic::Ordering::Relaxed);
-                let _ = disable_raw_mode();
-                eprint!("\r\n[etr] Disconnected (~.).\r\n");
+                restore_terminal(true);
+                eprintln!("[etr] Disconnected (~.).");
                 std::process::exit(0);
             }
         };
 
         match result {
             Ok(_) => {
-                IN_RAW_MODE.store(false, std::sync::atomic::Ordering::Relaxed);
-                let _ = disable_raw_mode();
+                // Clean exit: the remote shell already restored the screen, so
+                // don't touch the cursor — just reset emulator modes.
+                restore_terminal(false);
                 vlog!(verbose, 1, "[etr] Connection closed cleanly.");
                 std::process::exit(0);
             }
             Err(e) if e.kind() == io::ErrorKind::ConnectionAborted => {
-                IN_RAW_MODE.store(false, std::sync::atomic::Ordering::Relaxed);
-                let _ = disable_raw_mode();
+                restore_terminal(false);
                 vlog!(verbose, 1, "[etr] Connection closed cleanly.");
                 std::process::exit(0);
             }
             Err(e) => {
                 // For remote commands: exit rather than reconnect.  The command
                 // has finished (or the server is gone), so there is nothing to
-                // reconnect to.  Restore the terminal before printing.
+                // reconnect to.  A full-screen command (btop, …) may have been
+                // left holding the alternate screen, so reset it too.
                 if has_remote_command {
-                    IN_RAW_MODE.store(false, std::sync::atomic::Ordering::Relaxed);
-                    let _ = disable_raw_mode();
-                    eprintln!("\n[etr] Session ended: {e}");
+                    restore_terminal(true);
+                    eprintln!("[etr] Session ended: {e}");
                     std::process::exit(1);
                 }
                 // Keep raw mode ON during reconnect so ~. fires immediately.
@@ -1912,6 +2040,44 @@ mod tests {
     fn test_escape_char_value() {
         // SSH-style tilde escape; verify the constant is `~`.
         assert_eq!(ESCAPE_CHAR, b'~');
+    }
+
+    #[test]
+    fn test_term_reset_modes_covers_critical_modes() {
+        // Regression guard: the cursor-safe reset emitted on every session exit
+        // must undo the emulator modes a remote full-screen app leaves set, or
+        // the local terminal is unusable after a hard drop / `~.` quit.  Bytes
+        // are checked so an accidental edit that drops one is caught.
+        let seq = TERM_RESET_MODES;
+        let contains = |needle: &[u8]| seq.windows(needle.len()).any(|w| w == needle);
+        // Disable every mouse-reporting mode (mouse wheel spewing escapes).
+        assert!(contains(b"\x1b[?1000l"));
+        assert!(contains(b"\x1b[?1002l"));
+        assert!(contains(b"\x1b[?1003l"));
+        assert!(contains(b"\x1b[?1006l"));
+        // Disable bracketed paste.
+        assert!(contains(b"\x1b[?2004l"));
+        // Show the cursor again.
+        assert!(contains(b"\x1b[?25h"));
+        // Reset SGR attributes.
+        assert!(seq.ends_with(b"\x1b[0m"));
+        // The cursor-safe reset must NOT move the cursor: no alternate-screen
+        // switch (`?1049l`), no scroll-region reset (`\x1b[r`), no full RIS.
+        assert!(!contains(b"\x1b[?1049l"));
+        assert!(!contains(b"\x1b[r"));
+        assert!(!contains(b"\x1bc"));
+    }
+
+    #[test]
+    fn test_term_reset_screen_leaves_alt_screen() {
+        // The screen-restoring reset (unclean exits only) must leave the
+        // alternate screen and reset the scroll region, but never clear
+        // scrollback with a full RIS.
+        let seq = TERM_RESET_SCREEN;
+        let contains = |needle: &[u8]| seq.windows(needle.len()).any(|w| w == needle);
+        assert!(contains(b"\x1b[?1049l"));
+        assert!(contains(b"\x1b[r"));
+        assert!(!contains(b"\x1bc"));
     }
 
     #[test]
