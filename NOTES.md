@@ -748,6 +748,15 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
 
 ## Known gaps / next steps
 
+- **`just` recipes unusable from native Windows shells**: the `justfile` recipes
+  use `#!/usr/bin/env bash` shebangs, so on Windows `just` tries to translate the
+  interpreter path with `cygpath`. From PowerShell/nushell (no Git-Bash `cygpath`
+  on PATH) recipes like `just install` fail with "could not find `cygpath`
+  executable". Workaround for the client build/install on Windows:
+  `cargo install --path . --bin etr --force` (or `cargo build --release --bin etr`
+  then copy `target\release\etr.exe` to `~/.cargo/bin`). A real fix would make the
+  common recipes cross-shell — e.g. plain (non-shebang) recipes that shell out to
+  `cargo` directly, or documenting that `just` needs Git Bash on PATH on Windows.
 - **Remote command truncated with redirected stdin**: `etr host 'cmd'` with
   `</dev/null` or a pipe on stdin ends the session as soon as stdin hits EOF,
   because `run_session`'s `tokio::select!` treats `stdin_task` completing as
