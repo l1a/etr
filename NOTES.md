@@ -46,16 +46,25 @@ New in v0.6.5 (two independent Windows parity fixes):
   cover the critical modes and never move the cursor on the safe path / never
   clear scrollback).
 
-**Live verification (Windows → WSL Fedora 44 etrs, 2026-07-21):** a full
-Windows→Unix session was exercised end-to-end with the rebuilt v0.6.5 client:
-the remote zsh/starship prompt rendered with correct ANSI, a command typed into
-the PTY round-tripped (executed remotely, output returned), and on clean shell
-exit the client emitted exactly the 70-byte cursor-safe `TERM_RESET_MODES` with
-no screen reset — confirming fix #2 in the live byte stream. The console-side
-input-VT translation of fix #1 (the `ReadFile` path) can only be exercised with
-real interactive console keystrokes and so must be confirmed by hand:
-zellij keybindings should work without `^g` and the first typed line should echo
-per-keystroke. Note (adjacent, pre-existing): running `etr host 'cmd'` with
+**Live verification (Windows → WSL Fedora 44 etrs, 2026-07-21):** both fixes were
+verified end-to-end against a real Unix `etrs`, driving the rebuilt v0.6.5 client
+with *synthesized real console key events* (`WriteConsoleInputW` into the
+client's own console — the same INPUT_RECORDs a physical keyboard produces):
+
+- *Fix #1 (input not eaten, per-keystroke):* An isolated harness confirmed the
+  exact path `read_stdin` uses (console in raw + `ENABLE_VIRTUAL_TERMINAL_INPUT`,
+  read via `ReadFile`) delivers every key intact and unbatched: `a`, **Ctrl+G →
+  `0x07`**, Up-arrow → `ESC [ A`, a rapid 5-key burst, and `é` → UTF-8 `c3 a9`.
+  A full-composition harness then injected keystrokes into a live `etr` session;
+  the remote `zsh-syntax-highlighting` re-coloured the command **character by
+  character** as it arrived (proof of per-keystroke delivery, not batching) and
+  the typed command executed and round-tripped. This is the root cause of the
+  "characters eaten / zellij needs `^g`" report.
+- *Fix #2 (terminal restore):* On clean shell exit the client emitted exactly the
+  70-byte cursor-safe `TERM_RESET_MODES` (no cursor-moving screen reset),
+  confirmed in the live output byte stream.
+
+Note (adjacent, pre-existing, out of scope): running `etr host 'cmd'` with
 redirected/`</dev/null` stdin ends the session on stdin EOF before the command's
 output arrives (`run_session` treats `stdin_task` completing as session end);
 interactive console stdin never EOFs so this does not affect normal use.
