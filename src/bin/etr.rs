@@ -23,8 +23,20 @@ use etr::session::SessionState;
 static LOG_FILE: std::sync::OnceLock<std::sync::Mutex<std::fs::File>> = std::sync::OnceLock::new();
 static IN_RAW_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// The console input codepage in effect before we switched it to UTF-8, saved so
-/// it can be restored on exit.  0 means "not yet captured".  Windows-only.
+// The console input/output modes and input codepage in effect before etr
+// touched anything, captured once by `capture_console_originals` so they can be
+// restored verbatim on exit.  Restoring the exact modes is essential: crossterm's
+// `disable_raw_mode` only ORs the line/echo/processed-input bits back, so the
+// `ENABLE_VIRTUAL_TERMINAL_INPUT` we add in `enable_vt_console` would otherwise
+// be left set — which breaks the *local* shell's Enter handling after etr exits.
+#[cfg(windows)]
+static CONSOLE_CAPTURED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(windows)]
+static ORIG_INPUT_MODE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+#[cfg(windows)]
+static OUTPUT_CAPTURED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(windows)]
+static ORIG_OUTPUT_MODE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 #[cfg(windows)]
 static ORIG_INPUT_CP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -71,11 +83,10 @@ const ESCAPE_CHAR: u8 = b'~';
 /// No-op on Unix, where the terminal already speaks VT natively.
 #[cfg(windows)]
 fn enable_vt_console() {
-    use std::sync::atomic::Ordering;
     use windows_sys::Win32::System::Console::{
         CONSOLE_MODE, ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
-        GetConsoleCP, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
-        SetConsoleCP, SetConsoleMode,
+        GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleCP,
+        SetConsoleMode,
     };
     // The UTF-8 codepage.  We read the console input handle directly with
     // `ReadFile` (see `read_stdin`), which returns typed characters encoded in
@@ -92,13 +103,6 @@ fn enable_vt_console() {
         let mut mode: CONSOLE_MODE = 0;
         if GetConsoleMode(h_in, &mut mode) != 0 {
             SetConsoleMode(h_in, mode | ENABLE_VIRTUAL_TERMINAL_INPUT);
-            // Capture the original input codepage exactly once (before we change
-            // it), so reconnects — which call this again — don't overwrite the
-            // saved value with our own UTF-8 setting.
-            let cp = GetConsoleCP();
-            if cp != 0 {
-                let _ = ORIG_INPUT_CP.compare_exchange(0, cp, Ordering::Relaxed, Ordering::Relaxed);
-            }
             SetConsoleCP(CP_UTF8);
         }
         let h_out = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -113,24 +117,78 @@ fn enable_vt_console() {
 #[cfg(not(windows))]
 fn enable_vt_console() {}
 
-/// Restore the console input codepage saved by `enable_vt_console`.  No-op on
-/// Unix and if the codepage was never changed.
+/// Capture the console's original input/output modes and input codepage exactly
+/// once, before etr changes any of them, so they can be restored verbatim on
+/// exit.  Must be called before the first `enable_raw_mode`/`enable_vt_console`.
+/// No-op on Unix (crossterm's `disable_raw_mode` fully restores termios there).
 #[cfg(windows)]
-fn restore_console_cp() {
+fn capture_console_originals() {
     use std::sync::atomic::Ordering;
-    use windows_sys::Win32::System::Console::SetConsoleCP;
-    let cp = ORIG_INPUT_CP.load(Ordering::Relaxed);
-    if cp != 0 {
-        // SAFETY: `SetConsoleCP` takes a codepage id by value; `cp` is the value
-        // `GetConsoleCP` returned earlier, so it is a valid codepage.
-        unsafe {
+    use windows_sys::Win32::System::Console::{
+        CONSOLE_MODE, GetConsoleCP, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE,
+        STD_OUTPUT_HANDLE,
+    };
+    if CONSOLE_CAPTURED.load(Ordering::Relaxed) {
+        return;
+    }
+    // SAFETY: standard Win32 console queries.  `GetConsoleMode` fails (returns 0)
+    // for non-console handles, in which case we capture nothing and restore is a
+    // no-op.  All pointers reference locals that outlive the call.
+    unsafe {
+        let h_in = GetStdHandle(STD_INPUT_HANDLE);
+        let mut mode: CONSOLE_MODE = 0;
+        if GetConsoleMode(h_in, &mut mode) == 0 {
+            return; // no real console (e.g. redirected stdin); nothing to restore
+        }
+        ORIG_INPUT_MODE.store(mode, Ordering::Relaxed);
+        let cp = GetConsoleCP();
+        if cp != 0 {
+            ORIG_INPUT_CP.store(cp, Ordering::Relaxed);
+        }
+        let h_out = GetStdHandle(STD_OUTPUT_HANDLE);
+        let mut out_mode: CONSOLE_MODE = 0;
+        if GetConsoleMode(h_out, &mut out_mode) != 0 {
+            ORIG_OUTPUT_MODE.store(out_mode, Ordering::Relaxed);
+            OUTPUT_CAPTURED.store(true, Ordering::Relaxed);
+        }
+        CONSOLE_CAPTURED.store(true, Ordering::Relaxed);
+    }
+}
+
+#[cfg(not(windows))]
+fn capture_console_originals() {}
+
+/// Restore the console modes and input codepage captured by
+/// `capture_console_originals`.  This is what actually clears the
+/// `ENABLE_VIRTUAL_TERMINAL_INPUT` flag `enable_vt_console` set — crossterm's
+/// `disable_raw_mode` does not — so the *local* shell's line input (Enter) works
+/// again after etr exits.  No-op on Unix and if nothing was captured.
+#[cfg(windows)]
+fn restore_console_state() {
+    use std::sync::atomic::Ordering;
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleCP, SetConsoleMode,
+    };
+    if !CONSOLE_CAPTURED.load(Ordering::Relaxed) {
+        return;
+    }
+    // SAFETY: restoring modes/codepage captured earlier from the same handles.
+    unsafe {
+        let h_in = GetStdHandle(STD_INPUT_HANDLE);
+        SetConsoleMode(h_in, ORIG_INPUT_MODE.load(Ordering::Relaxed));
+        let cp = ORIG_INPUT_CP.load(Ordering::Relaxed);
+        if cp != 0 {
             SetConsoleCP(cp);
+        }
+        if OUTPUT_CAPTURED.load(Ordering::Relaxed) {
+            let h_out = GetStdHandle(STD_OUTPUT_HANDLE);
+            SetConsoleMode(h_out, ORIG_OUTPUT_MODE.load(Ordering::Relaxed));
         }
     }
 }
 
 #[cfg(not(windows))]
-fn restore_console_cp() {}
+fn restore_console_state() {}
 
 /// Read a chunk of stdin bytes into `buf`, returning the number read (0 = EOF).
 ///
@@ -175,8 +233,9 @@ fn read_stdin(buf: &mut [u8]) -> io::Result<usize> {
 
 /// Return the local terminal to a sane state after a session ends for good
 /// (clean exit, `~.`, or a hard drop we give up on).  Emits the VT resets while
-/// output VT processing is still enabled, restores the console input codepage,
-/// then drops raw mode.
+/// output VT processing is still enabled, drops raw mode, then restores the
+/// console's exact original modes + codepage (which is what clears the
+/// `ENABLE_VIRTUAL_TERMINAL_INPUT` flag so the local shell's Enter works again).
 ///
 /// `reset_screen` should be `true` only for unclean endings (forced `~.`, a hard
 /// drop we abandon, a remote command whose TUI may still be up): it additionally
@@ -198,8 +257,12 @@ fn restore_terminal(reset_screen: bool) {
         let _ = out.write_all(TERM_RESET_MODES);
         let _ = out.flush();
     }
-    restore_console_cp();
+    // Drop crossterm's raw mode first (keeps its internal state consistent), then
+    // restore the exact original console modes — the latter wins, and crucially
+    // clears ENABLE_VIRTUAL_TERMINAL_INPUT, which crossterm's disable_raw_mode
+    // leaves set.
     let _ = disable_raw_mode();
+    restore_console_state();
 }
 
 macro_rules! vlog {
@@ -757,6 +820,10 @@ async fn run_connection_loop(
     x11_auth_cookie: Vec<u8>,
     verbose: u8,
 ) -> io::Result<()> {
+    // Snapshot the console's original modes/codepage before anything (raw mode,
+    // VT-input) changes them, so `restore_terminal` can put it back exactly.
+    capture_console_originals();
+
     let host = if let Some(idx) = target.find('@') {
         &target[idx + 1..]
     } else {

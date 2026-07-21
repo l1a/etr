@@ -11,7 +11,7 @@ and TLS 1.3 built-in.
 
 ## Current state: v0.6.5 — Windows input path + terminal restore on exit
 
-New in v0.6.5 (three independent Windows parity fixes):
+New in v0.6.5 (four independent Windows parity fixes):
 
 - **Special characters no longer "eaten".** The client's stdin reader previously
   used `std::io::stdin().read()`, which on Windows goes through Rust std's
@@ -51,6 +51,17 @@ New in v0.6.5 (three independent Windows parity fixes):
   whose TUI may still be up). Clean shell exits skip the screen reset so the
   cursor is left untouched. Cross-platform (Unix terminals honour the same
   resets); deliberately avoids a full RIS so scrollback is preserved.
+- **Local shell's Enter works again after etr exits.** `enable_vt_console` sets
+  `ENABLE_VIRTUAL_TERMINAL_INPUT` on the console, but crossterm's
+  `disable_raw_mode` only ORs the line/echo/processed-input bits back — it never
+  clears that VT-input flag. So after etr exited, the console was left with
+  VT-input still enabled, and the *local* shell echoed typed characters but did
+  not accept Enter (the VT-translated Enter wasn't recognised as line
+  submission). etr now captures the console's exact original input/output modes
+  and input codepage once (`capture_console_originals`, before raw mode is first
+  enabled) and restores them verbatim on exit (`restore_console_state`), which
+  clears the leftover VT-input flag. Pre-existing since VT-input was introduced
+  in v0.6.4. No-op on Unix (crossterm fully restores termios there).
 - Test count: 110 → 112 (two regression tests asserting the reset sequences
   cover the critical modes and never move the cursor on the safe path / never
   clear scrollback).
@@ -78,6 +89,10 @@ client's own console — the same INPUT_RECORDs a physical keyboard produces):
 - *Fix #2 (terminal restore):* On clean shell exit the client emitted exactly the
   70-byte cursor-safe `TERM_RESET_MODES` (no cursor-moving screen reset),
   confirmed in the live output byte stream.
+- *Console-mode restore:* A harness recorded the console input mode before
+  launching etr and again after etr exited via `~.`. Result: the mode was
+  restored byte-identical (`0x01f7` → `0x01f7`) and `ENABLE_VIRTUAL_TERMINAL_INPUT`
+  was not left set — the local shell's line input (Enter) works after exit.
 
 Note (adjacent, pre-existing, out of scope): running `etr host 'cmd'` with
 redirected/`</dev/null` stdin ends the session on stdin EOF before the command's
@@ -766,6 +781,19 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
 
 ## Known gaps / next steps
 
+- **Clean shell `exit` sometimes reconnects instead of quitting**: when the
+  remote shell exits, `etrs` should send a clean `Disconnect` so `etr` exits and
+  restores the terminal. Observed on Windows→WSL that this races: sometimes the
+  QUIC connection closes before the `Disconnect` envelope is delivered, so `etr`
+  sees a stream error and enters the reconnect loop *forever* (terminal stays in
+  raw/VT mode until the user types `~.`). This is the likely remaining cause of
+  "after a controlled shutdown the local terminal is unusable" — `restore_terminal`
+  never runs until `~.`. Server-side fix (needs `etrs` rebuild): ensure the
+  `Disconnect` is flushed/acked before the endpoint is dropped on shell exit (cf.
+  the v0.4.22 "wait briefly for pending client" handling, which covers the
+  no-client-yet case but not delivery on an active connection). A client-side
+  mitigation is not really possible: without the `Disconnect` signal the client
+  cannot distinguish "server rebooted (reconnect)" from "shell exited (quit)".
 - **`just` recipes unusable from native Windows shells**: the `justfile` recipes
   use `#!/usr/bin/env bash` shebangs, so on Windows `just` tries to translate the
   interpreter path with `cygpath`. From PowerShell/nushell (no Git-Bash `cygpath`
