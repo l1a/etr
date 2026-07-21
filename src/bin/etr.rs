@@ -791,7 +791,21 @@ async fn run_connection_loop(
     // ~. triggers this to exit the reconnect loop.
     let (escape_tx, escape_rx) = tokio::sync::watch::channel(false);
 
+    // Windows only: the reader must not issue its first `ReadFile` until raw +
+    // VT-input mode is enabled.  A `ReadFile` issued while the console is still
+    // in cooked/line mode stays line-buffered for that whole read, so the first
+    // line would be held until Enter (issue #54 — "first line not echoed until
+    // Enter").  Raw mode is enabled per-connect (after the QUIC handshake), so
+    // we gate the reader on a one-shot signal fired right after the first
+    // `enable_raw_mode` + `enable_vt_console`.  Unix has no such coupling (and
+    // never exhibited the bug), so its reader starts immediately as before.
+    #[cfg(windows)]
+    let (raw_ready_tx, raw_ready_rx) = std::sync::mpsc::channel::<()>();
+
     let _stdin_reader = tokio::task::spawn_blocking(move || {
+        // Wait until the console is in raw + VT-input mode before the first read.
+        #[cfg(windows)]
+        let _ = raw_ready_rx.recv();
         let mut buf = [0u8; 1024];
         // `~` is common in shell input, so only recognise it at line-start
         // (mirrors ssh ~. behaviour).
@@ -851,6 +865,10 @@ async fn run_connection_loop(
     // Track whether the terminal is currently in raw mode so reconnect messages
     // can use \r\n (raw) vs \n (cooked) and so we don't over-call disable_raw_mode.
     let mut in_raw = false;
+    // Windows only: fired once, right after raw + VT mode is first enabled, to
+    // release the gated stdin reader (see the reader spawn above).
+    #[cfg(windows)]
+    let mut raw_ready_tx = Some(raw_ready_tx);
 
     'reconnect: loop {
         if !first {
@@ -936,6 +954,12 @@ async fn run_connection_loop(
         enable_vt_console();
         IN_RAW_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
         in_raw = true;
+        // Release the stdin reader now that raw + VT mode is active, so its first
+        // read is per-keystroke rather than a line-buffered cooked read (#54).
+        #[cfg(windows)]
+        if let Some(tx) = raw_ready_tx.take() {
+            let _ = tx.send(());
+        }
         let result = tokio::select! {
             r = run_session(
                 conn,

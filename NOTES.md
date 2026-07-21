@@ -11,21 +11,30 @@ and TLS 1.3 built-in.
 
 ## Current state: v0.6.5 — Windows input path + terminal restore on exit
 
-New in v0.6.5 (two independent Windows parity fixes):
+New in v0.6.5 (three independent Windows parity fixes):
 
-- **Special characters no longer "eaten"; input is now per-keystroke.** The
-  client's stdin reader previously used `std::io::stdin().read()`, which on
-  Windows goes through Rust std's `ReadConsoleW` shim (UTF-16→UTF-8 + internal
-  line cooking). Even in raw mode that shim **batches** input and **drops bytes
-  that aren't clean UTF-8**, which is what made special characters disappear
-  (e.g. zellij keybindings not registering, needing `^g`) and caused the
-  first-line-not-echoed bug (#54). The reader now reads the console input handle
-  directly with `ReadFile` (new `read_stdin`, Windows path). With
-  `ENABLE_VIRTUAL_TERMINAL_INPUT` already on, `ReadFile` returns the same
-  per-keystroke VT byte stream a Unix terminal emits — no batching, no UTF-8
-  mangling. `enable_vt_console` also now sets the console **input codepage to
-  UTF-8 (65001)** (saved and restored on exit) so typed multi-byte characters
-  reach the remote as UTF-8, matching what the std path produced. No-op on Unix.
+- **Special characters no longer "eaten".** The client's stdin reader previously
+  used `std::io::stdin().read()`, which on Windows goes through Rust std's
+  `ReadConsoleW` shim (UTF-16→UTF-8 + internal line cooking). That shim **drops
+  bytes that aren't clean UTF-8**, which is what made special characters
+  disappear (e.g. zellij keybindings not registering, needing `^g`). The reader
+  now reads the console input handle directly with `ReadFile` (new `read_stdin`,
+  Windows path). With `ENABLE_VIRTUAL_TERMINAL_INPUT` already on, `ReadFile`
+  returns the same VT byte stream a Unix terminal emits — no UTF-8 mangling.
+  `enable_vt_console` also now sets the console **input codepage to UTF-8
+  (65001)** (saved and restored on exit) so typed multi-byte characters reach
+  the remote as UTF-8, matching what the std path produced. No-op on Unix.
+- **First line of input now echoes as typed (issue #54).** The single stdin
+  reader thread is spawned before the QUIC connect, but raw + VT-input mode is
+  only enabled *after* the connect. On Windows a `ReadFile` issued while the
+  console is still in cooked/line mode stays line-buffered for that whole read,
+  so the first line was held client-side until Enter (the reported "no echo
+  until first Enter"; the `ReadFile` change above did **not** fix this on its
+  own — it is a timing problem, not a read-mechanism one). The Windows reader
+  now waits on a one-shot signal fired immediately after the first
+  `enable_raw_mode` + `enable_vt_console`, so its very first read happens in raw
+  + VT mode and is per-keystroke. Unix has no such coupling (and never showed the
+  bug), so its reader is ungated and starts immediately as before.
 - **Local terminal is restored on exit.** A remote full-screen app
   (zellij/vim/less) puts the *local* terminal into alternate-screen,
   mouse-reporting, bracketed-paste, hidden-cursor, application-keypad and
@@ -60,6 +69,12 @@ client's own console — the same INPUT_RECORDs a physical keyboard produces):
   character** as it arrived (proof of per-keystroke delivery, not batching) and
   the typed command executed and round-tripped. This is the root cause of the
   "characters eaten / zellij needs `^g`" report.
+- *First-line echo (#54):* A/B harness that types the first line and snapshots
+  the client's stdout **before** sending Enter. Pre-fix binary: the typed
+  command is absent from the snapshot (held client-side until Enter). With the
+  reader gate: the command appears in the pre-Enter snapshot, echoed back
+  per-keystroke (remote syntax-highlighting recolours char-by-char) — first line
+  now echoes as typed.
 - *Fix #2 (terminal restore):* On clean shell exit the client emitted exactly the
   70-byte cursor-safe `TERM_RESET_MODES` (no cursor-moving screen reset),
   confirmed in the live output byte stream.
@@ -71,9 +86,12 @@ interactive console stdin never EOFs so this does not affect normal use.
 
 ### ~~Known issue — Windows: first line of input not echoed until Enter~~ (fixed in v0.6.5)
 
-Fixed by the `ReadFile`-based input path above: reading the console handle
-directly delivers bytes per-keystroke, so the first line echoes as it is typed
-rather than only on Enter. Tracked in
+Fixed in v0.6.5 by gating the Windows stdin reader until raw + VT-input mode is
+enabled (see the "First line of input now echoes as typed" bullet above). The
+`ReadFile`-based input path was necessary but **not sufficient** on its own — the
+first line was line-buffered because the first read was *issued* before raw mode,
+which is a timing problem the reader gate solves. Verified with an A/B harness
+that snapshots the client's stdout before Enter is sent. Tracked in
 [GitHub issue #54](https://github.com/l1a/etr/issues/54).
 
 ## Previous: v0.6.4 — Windows Backspace fix
