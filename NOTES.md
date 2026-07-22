@@ -781,19 +781,21 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
 
 ## Known gaps / next steps
 
-- **Clean shell `exit` sometimes reconnects instead of quitting**: when the
-  remote shell exits, `etrs` should send a clean `Disconnect` so `etr` exits and
-  restores the terminal. Observed on Windows→WSL that this races: sometimes the
-  QUIC connection closes before the `Disconnect` envelope is delivered, so `etr`
-  sees a stream error and enters the reconnect loop *forever* (terminal stays in
-  raw/VT mode until the user types `~.`). This is the likely remaining cause of
-  "after a controlled shutdown the local terminal is unusable" — `restore_terminal`
-  never runs until `~.`. Server-side fix (needs `etrs` rebuild): ensure the
-  `Disconnect` is flushed/acked before the endpoint is dropped on shell exit (cf.
-  the v0.4.22 "wait briefly for pending client" handling, which covers the
-  no-client-yet case but not delivery on an active connection). A client-side
-  mitigation is not really possible: without the `Disconnect` signal the client
-  cannot distinguish "server rebooted (reconnect)" from "shell exited (quit)".
+- **Clean shell `exit` reconnecting instead of quitting (observed once,
+  unreproduced — mechanism unconfirmed)**: a single Windows→WSL observation
+  showed `etr` entering the reconnect loop after the remote shell exited, rather
+  than quitting on a clean `Disconnect`. A follow-up investigation could **not
+  reproduce** it in 24 controlled trials (including a 300 ms delay injected to
+  widen the suspected race window). The initial teardown-race hypothesis was
+  **disproven**: `pty_writer_task` does not finish on PTY-EOF (the PTY feeder in
+  `handle_connection` keeps the channel sender alive), so `ctrl_writer_task` is
+  not aborted before delivering the `Disconnect`; on clean exit the connection
+  stays alive and the client exits cleanly. If this recurs, it is more likely a
+  real-network timing artifact (the live connection dropping mid-delivery and the
+  reconnect missing `etrs`'s 1 s pending-client window) — a different mechanism.
+  Do not attempt a fix without first capturing `etr -vvv` and `etrs` logs from an
+  actual occurrence to identify the real cause. Note the terminal is restored
+  correctly on `~.` regardless (client-side, v0.6.5).
 - **`just` recipes unusable from native Windows shells**: the `justfile` recipes
   use `#!/usr/bin/env bash` shebangs, so on Windows `just` tries to translate the
   interpreter path with `cygpath`. From PowerShell/nushell (no Git-Bash `cygpath`
