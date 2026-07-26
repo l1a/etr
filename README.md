@@ -48,6 +48,16 @@ cargo install etr
 
 Both `etr` (client) and `etrs` (server) are installed. The server must be reachable in PATH on the remote host (true automatically when both machines use `cargo install`).
 
+### Arch Linux (AUR)
+
+Prebuilt binaries are packaged as [`etr-terminal-bin`](https://aur.archlinux.org/packages/etr-terminal-bin) (x86_64 and aarch64):
+
+```bash
+paru -S etr-terminal-bin   # or: yay -S etr-terminal-bin
+```
+
+(The AUR packages named `etr`/`etr-bin` are an unrelated traceroute tool.)
+
 ## Build from source
 
 ```bash

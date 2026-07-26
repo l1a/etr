@@ -1,6 +1,6 @@
 [package]
 name = "etr"
-version = "0.6.5"
+version = "0.7.0"
 edition = "2024"
 description = "A Rust implementation of Eternal Terminal (et)"
 license = "GPL-3.0-only"
@@ -15,6 +15,7 @@ exclude = [
     "NOTES.md",
     "justfile",
     "scripts/",
+    "packaging/",
     ".github/",
 ]
 

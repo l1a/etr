@@ -160,6 +160,67 @@ publish:
     echo "==> Dry-run passed. Publishing to crates.io..."
     cargo publish
     echo "==> Published $(grep '^version' Cargo.toml | head -1 | sed 's/.*\"\(.*\)\"/\1/') to crates.io."
+    echo "==> Publishing AUR package..."
+    just publish-aur
+
+# Publish/update the AUR package (etr-terminal-bin) from the current version's GitHub release
+publish-aur:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+    AUR_PKG="etr-terminal-bin"
+    AUR_REMOTE="ssh://aur@aur.archlinux.org/${AUR_PKG}.git"
+    BASE_URL="https://github.com/l1a/etr/releases/download/v${VERSION}"
+    ASSETS=(etr-linux-x86_64 etrs-linux-x86_64 etr-linux-aarch64 etrs-linux-aarch64)
+
+    # The AUR package points at GitHub release assets, so the v$VERSION release
+    # must be fully built before this can run (tag → release.yml → here).
+    echo "==> Verifying GitHub release v${VERSION} assets exist..."
+    for a in "${ASSETS[@]}"; do
+        if ! curl -fsIL "${BASE_URL}/${a}" >/dev/null 2>&1; then
+            echo "ERROR: ${BASE_URL}/${a} not found." >&2
+            echo "The v${VERSION} GitHub release must exist before publishing to the AUR:" >&2
+            echo "  git tag v${VERSION} && git push origin v${VERSION}" >&2
+            echo "then wait for the Release workflow to finish and re-run: just publish-aur" >&2
+            exit 1
+        fi
+    done
+
+    WORK=$(mktemp -d)
+    trap 'rm -rf "$WORK"' EXIT
+
+    echo "==> Downloading release assets and computing sha256 checksums..."
+    declare -A SHA
+    for a in "${ASSETS[@]}"; do
+        curl -fsSL -o "${WORK}/${a}" "${BASE_URL}/${a}"
+        SHA[$a]=$(sha256sum "${WORK}/${a}" | cut -d' ' -f1)
+        echo "    ${a}  ${SHA[$a]}"
+    done
+
+    # Render PKGBUILD and .SRCINFO from the same templates with the same
+    # substitutions so the two can never disagree.
+    render() {
+        sed -e "s/@VERSION@/${VERSION}/g" \
+            -e "s/@SHA_ETR_X86_64@/${SHA[etr-linux-x86_64]}/g" \
+            -e "s/@SHA_ETRS_X86_64@/${SHA[etrs-linux-x86_64]}/g" \
+            -e "s/@SHA_ETR_AARCH64@/${SHA[etr-linux-aarch64]}/g" \
+            -e "s/@SHA_ETRS_AARCH64@/${SHA[etrs-linux-aarch64]}/g" \
+            "$1"
+    }
+
+    echo "==> Cloning ${AUR_REMOTE}..."
+    git clone "${AUR_REMOTE}" "${WORK}/aur"
+    render "{{justfile_directory()}}/packaging/aur/PKGBUILD.in" > "${WORK}/aur/PKGBUILD"
+    render "{{justfile_directory()}}/packaging/aur/SRCINFO.in"  > "${WORK}/aur/.SRCINFO"
+
+    if [ -z "$(git -C "${WORK}/aur" status --porcelain)" ]; then
+        echo "==> AUR package already up to date (v${VERSION}); nothing to push."
+        exit 0
+    fi
+    git -C "${WORK}/aur" add PKGBUILD .SRCINFO
+    git -C "${WORK}/aur" commit -m "Update to v${VERSION}"
+    git -C "${WORK}/aur" push
+    echo "==> Published ${AUR_PKG} v${VERSION} to the AUR."
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 

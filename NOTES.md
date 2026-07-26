@@ -9,7 +9,35 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.6.5 — Windows input path + terminal restore on exit
+## Current state: v0.7.0 — AUR publishing (etr-terminal-bin)
+
+New in v0.7.0:
+
+- **AUR package `etr-terminal-bin`** (x86_64 + aarch64): installs the prebuilt
+  `etr` and `etrs` binaries from the GitHub release assets. The AUR names
+  `etr` and `etr-bin` were already taken by an unrelated ECMP-traceroute tool
+  that also installs `/usr/bin/etr`, so the package is named
+  `etr-terminal-bin` and declares `conflicts=('etr' 'etr-bin')` — and
+  deliberately does **not** declare `provides=('etr')`, since that would
+  wrongly satisfy dependencies on the other tool.
+- **`just publish-aur`**: renders `packaging/aur/PKGBUILD.in` and
+  `packaging/aur/SRCINFO.in` (single source of truth; `.SRCINFO` is never
+  hand-written), computing sha256 checksums from the *actual downloaded*
+  GitHub release assets for the current `Cargo.toml` version, then clones
+  `ssh://aur@aur.archlinux.org/etr-terminal-bin.git`, commits, and pushes.
+  Hard-fails with instructions if the release assets don't exist yet
+  (publish ordering: tag → release.yml → crates.io → AUR); exits cleanly
+  without an empty commit if the AUR repo already matches. Requires an SSH
+  key registered with an AUR account that owns/co-maintains the package.
+- **`just publish` now ends by invoking `just publish-aur`**, so a normal
+  release publishes crates.io and the AUR in one step. If the AUR step fails
+  (e.g. release build not finished), crates.io publication is unaffected —
+  re-run `just publish-aur` alone.
+- `packaging/` added to the crates.io `exclude` list; README gained an
+  "Arch Linux (AUR)" install section.
+- No Rust code changes; test count unchanged (112).
+
+## Previous: v0.6.5 — Windows input path + terminal restore on exit
 
 New in v0.6.5 (four independent Windows parity fixes):
 
