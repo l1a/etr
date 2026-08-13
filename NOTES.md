@@ -9,7 +9,34 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.7.2 — a gate that can be answered, tracked hooks, LF enforcement, no auto-review
+## Current state: v0.7.3 — merge-pr is gated on CI, and the gate triad is checked
+
+New in v0.7.3 (tooling only; no Rust change, 112 tests unchanged).
+
+- **`just merge-pr` had no CI gate at all.** It went from the branch check straight to
+  `gh pr merge --squash --delete-branch`, with no inspection of the status rollup. `gh pr merge`
+  will happily merge a red PR when the repository has no branch protection, and "wait for the
+  checks to settle" is not "wait for them to pass" — so **every merge in this repo has been
+  ungated**, safe only because whoever merged happened to look at CI first.
+- `rusticprofile` added this gate in its `v0.1.5` after a PR went in with a leg red, and extended it
+  in `0.2.1` after an **empty** rollup passed vacuously, reporting green over a commit CI had never
+  seen. Neither reached here — the same cross-repo staleness that left the nushell completion path
+  wrong for months, this time on the recipe that performs the irreversible act.
+- **Three refusals now:** a failing check; an **empty** rollup, because "nothing ran" is not
+  "everything passed" and the failure arm cannot distinguish them; and checks still running, rather
+  than racing them. The empty state is compared as a **string** rather than through `jq -e length`,
+  because `gh --jq` is gh's built-in jq while an external `jq` is not on a default Windows PATH —
+  and a gate that silently degrades where its dependency is missing is the thing being fixed.
+- **`scripts/gate_conformance.py` (template v3) is vendored and run by `standard-check`**, which
+  `just check` depends on, so these guards cannot quietly vanish again. It asserts nine of them
+  across `pr`, `open-pr` and `merge-pr`, **with comments stripped first** — a comment explaining a
+  guard must not satisfy the check for a recipe that lost it.
+- **Structural, not behavioural, and it says so.** It proves a guard is present, not that it works.
+  The install helpers are pure functions their self-test can call; these recipes run the suite, push
+  branches and merge PRs, so executing them from `check` would be slow and occasionally destructive.
+- **Verified by running it, safely:** on a branch with no PR the rollup is empty, so `merge-pr`
+  refuses and exits *before* reaching `gh pr merge` — testing the gate without merging anything.
+
 
 New in v0.7.2 (tooling and repo hygiene only; no Rust change, 112 tests unchanged). Closes the
 four items v0.7.1 recorded as found-but-not-fixed.
