@@ -1,14 +1,36 @@
 name: Claude Code Review
 
+# Automatic review on every pull request is OFF. Run it deliberately instead:
+#
+#     gh workflow run claude-code-review.yml --ref <branch>
+#
+# WHY. The token behind this action has failed before in a way that is worse than useless:
+# in rusticprofile it went from 19 consecutive green runs to failing every run in ~490 ms on
+# turn 1 at $0.00, posting no findings. A rejection before any tokens are billed is a
+# credential or quota problem, not a verdict on the code -- but left on `pull_request` it
+# becomes a red check on every future PR for a reason unrelated to that PR, which trains
+# everyone to merge over failing checks. That is worse than having no automated review, and
+# this repo has already spent effort on the opposite failure: a review job going GREEN
+# without reviewing anything.
+#
+# A check that cannot be believed in either direction is not a check.
+#
+# The `pull_request` trigger is kept commented immediately below rather than deleted, so
+# restoring it is uncommenting two lines. Diagnostics if it is failing: `gh secret list`
+# shows when CLAUDE_CODE_OAUTH_TOKEN was last set; `claude setup-token` mints a new one.
+#
+# NOTE: `claude.yml` (the @claude mention workflow) is untouched and shares the same secret,
+# so mentions fail the same way if the token is bad.
 on:
-  pull_request:
-    types: [opened, synchronize, ready_for_review, reopened]
-    # Optional: Only run on specific file changes
-    # paths:
-    #   - "src/**/*.ts"
-    #   - "src/**/*.tsx"
-    #   - "src/**/*.js"
-    #   - "src/**/*.jsx"
+  # pull_request:
+  #   types: [opened, synchronize, ready_for_review, reopened]
+  # Optional: Only run on specific file changes
+  # paths:
+  #   - "src/**/*.ts"
+  #   - "src/**/*.tsx"
+  #   - "src/**/*.js"
+  #   - "src/**/*.jsx"
+  workflow_dispatch:
 
 jobs:
   claude-review:

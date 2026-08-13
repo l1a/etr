@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Pre-push hook: runs `just check` before any push.
+#
+# Mirrors CI's check step so formatting, clippy and standard-check failures are caught
+# locally rather than after a push. This is a REAL git hook rather than editor or agent
+# configuration on purpose: it fires for a human, for Claude Code, for Gemini CLI and for
+# anything else that runs `git push`, because it is git plumbing. Anything under `.claude/`
+# binds one vendor's tool and is invisible to every other — see AGENTS.md Part 1 §4.
+#
+# To skip for a single push:  GIT_NO_CHECK=1 git push ...
+# To disable permanently:     remove .git/hooks/pre-push
+#
+# Install with: just install-hooks
+
+set -euo pipefail
+
+if [ "${GIT_NO_CHECK:-0}" = "1" ]; then
+    exit 0
+fi
+
+# Absent `just` must not block a push. The hook is a convenience for contributors who have
+# the toolchain; refusing the push for someone who does not would make the repo unusable
+# rather than safer.
+if ! command -v just >/dev/null 2>&1; then
+    exit 0
+fi
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+echo "[check] Running just check..."
+# NOTE: lowercase `justfile` in this repo — the sibling repos use `Justfile`, and a
+# hardcoded capital-J path silently finds nothing here.
+if ! just --justfile "$REPO_ROOT/justfile" check; then
+    echo ""
+    echo "[check] Failed. Run 'just check' for details; 'cargo fmt' fixes formatting."
+    exit 1
+fi
+
+echo "[check] All checks passed."
