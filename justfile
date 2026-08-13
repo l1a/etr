@@ -7,14 +7,90 @@ ETR_REL    := justfile_directory() + "/target/release/etr"
 ETRS_REL   := justfile_directory() + "/target/release/etrs"
 STRESS_BIN := justfile_directory() + "/tools/stress/target/release/stress_tool"
 INSTALL    := home_directory() + "/.cargo/bin"
+
+# ===== PROJECT — the only part of the install family this repo owns =====
+#
+# etr is the TWO-BINARY case the shared standard exists for: the COMMON block below is
+# written against these, so it stays byte-identical to the siblings that ship one binary.
+BINS      := "etr etrs"
+MAN_PAGES := "man/build/etr.1 man/build/etrs.1"
+
+# Do NOT edit inside the markers. Edit templates/justfile-common.just and the two vendored
+# helpers, bump their versions, and propagate to the siblings in their own PRs.
+# `just standard-check` runs the helpers' self-tests and `just check` depends on it.
+# >>> COMMON (template v2)
+# The interpreter is resolved ONCE per line, and a missing one is a hard error. The
+# `python3 … 2>/dev/null || python …` idiom is deliberately NOT used: it retries on ANY
+# failure, so a real error inside the script gets re-run and reported as if the
+# interpreter were the problem.
+PY := `command -v python3 || command -v python || echo PYTHON-NOT-FOUND`
+
+# Install from this checkout: binary, man page(s) and completions.
+#
+# The dependencies are the point. `cargo install` alone replaces the binary and leaves the
+# man page and completions at whatever version last ran their recipe — measured on a host
+# whose page was ELEVEN releases stale with nothing reporting it.
+install: install-man install-completions
+    cargo install --path .
+
+# Install a RELEASED tag: binary, man page(s) and completions, all three FROM THAT TAG.
+#
+# **It deliberately does NOT depend on `install-man`/`install-completions`**, because those
+# work from the checkout. Reusing them would pair a tag's binary with the worktree's man
+# page and completions — on a checkout one release ahead, a v0.2.22 binary with a v0.2.23
+# page. Mismatched artefacts that each look fine is the failure class this standard exists
+# to remove, so the three sources are made to agree: binary from the tag, completions from
+# THE INSTALLED BINARY (`--from-path`), man page from the tag (`--from-tag`).
+#
+# Never `--path`: on a Syncthing-shared checkout that builds from a directory other
+# machines write into. Takes a bare version and normalises a leading `v`.
+install-tag VERSION:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    V="{{VERSION}}"; V="${V#v}"
+    [ -n "$V" ] || { echo "error: install-tag needs a version, e.g. just install-tag 0.2.22" >&2; exit 1; }
+    git rev-parse -q --verify "refs/tags/v${V}" >/dev/null || {
+        echo "error: tag v${V} is not in this clone. Run: git fetch --tags" >&2; exit 1; }
+    REPO=$(git config --get remote.origin.url)
+    echo "Installing from tag v${V} of ${REPO}"
+    cargo install --git "$REPO" --tag "v${V}" --locked --force
+    # POST-CONDITION: cargo prints a replacement line, but only a version query proves which
+    # binary is on PATH now.
+    for b in {{BINS}}; do
+        command -v "$b" >/dev/null 2>&1 || { echo "error: $b is not on PATH after install" >&2; exit 1; }
+        echo "  $b -> $("$b" --version)"
+    done
+    "{{PY}}" scripts/install_man.py {{MAN_PAGES}} --from-tag "v${V}"
+    "{{PY}}" scripts/install_completions.py {{BINS}} --from-path
+
+# Install the man page(s) to the XDG man directory.
+install-man: man
+    @"{{PY}}" scripts/install_man.py {{MAN_PAGES}}
+
+# Generate and install shell completions for every binary.
+#
+# Python rather than a just recipe, which is retch's finding and the more portable
+# mechanism: no `sh`, no `cygpath`, no coreutils, nothing from Git's `usr\bin` on Windows.
+# A `bash` shebang recipe cannot run on Windows without `cygpath` at all, and even a plain
+# `sh` recipe still needs an `sh` on PATH.
+install-completions: build
+    @"{{PY}}" scripts/install_completions.py {{BINS}}
+
+# Prove the vendored helpers still behave the way the standard requires.
+#
+# **This runs the helpers' own self-tests rather than diffing text**, and that is the whole
+# point: three separate repositories cannot diff each other's files, but each can prove its
+# copy still behaves correctly — which is the property that was actually violated when two
+# repos quietly shipped the pre-fix nushell path for months. A text diff would also have
+# passed happily on a repo that had never adopted the standard at all.
+standard-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [ "{{PY}}" != "PYTHON-NOT-FOUND" ] || { echo "error: no python3/python on PATH" >&2; exit 1; }
+    "{{PY}}" scripts/install_completions.py --self-test
+    "{{PY}}" scripts/install_man.py --self-test
+# <<< COMMON
 LOG_FILE   := `echo "${XDG_STATE_HOME:-$HOME/.local/state}/etr/etrs.log"`
-MAN_DIR    := `echo "${XDG_DATA_HOME:-$HOME/.local/share}/man"`
-BASH_COMP  := `echo "${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions"`
-ZSH_COMP   := `echo "${XDG_DATA_HOME:-$HOME/.local/share}/zsh/site-functions"`
-FISH_COMP  := `echo "${XDG_CONFIG_HOME:-$HOME/.config}/fish/completions"`
-ELVISH_COMP := `echo "${XDG_CONFIG_HOME:-$HOME/.config}/elvish/lib"`
-NU_COMP    := `echo "${XDG_CONFIG_HOME:-$HOME/.config}/nushell/autoload"`
-PS_COMP    := `echo "${XDG_CONFIG_HOME:-$HOME/.config}/powershell"`
 TMUX_SESS  := "etr_test"
 
 # List available recipes
@@ -54,7 +130,7 @@ audit:
     cargo audit
 
 # Run all static checks: fmt + clippy (suitable as a pre-push gate)
-check: fmt-check clippy
+check: fmt-check clippy standard-check
     @echo "All checks passed."
 
 # Pre-PR gate: run all automated checks and print manual checklist before opening a PR.
@@ -238,24 +314,6 @@ build-stress:
 
 # ── Install ───────────────────────────────────────────────────────────────────
 
-# Install debug binaries to ~/.cargo/bin (no sudo)
-install: build
-    #!/usr/bin/env bash
-    set -euo pipefail
-    mkdir -p "{{INSTALL}}"
-    cp "{{ETRS_BIN}}" "{{INSTALL}}/etrs"
-    cp "{{ETR_BIN}}"  "{{INSTALL}}/etr"
-    echo "Installed etrs and etr (debug) to {{INSTALL}}"
-
-# Install release binaries to ~/.cargo/bin and man pages to XDG man dir
-install-release: build-release install-man
-    #!/usr/bin/env bash
-    set -euo pipefail
-    mkdir -p "{{INSTALL}}"
-    cp "{{ETRS_REL}}" "{{INSTALL}}/etrs"
-    cp "{{ETR_REL}}"  "{{INSTALL}}/etr"
-    echo "Installed etrs and etr (release) to {{INSTALL}}"
-
 # ── Man pages ────────────────────────────────────────────────────────────────
 
 # Build man pages from man/*.md using mandown
@@ -271,40 +329,6 @@ man:
     mandown man/etr.1.md ETR 1  | sed "1s|.*|.TH \"ETR\" \"1\" \"\" \"etr $VERSION\" \"User Commands\"|"  > man/build/etr.1
     mandown man/etrs.1.md ETRS 1 | sed "1s|.*|.TH \"ETRS\" \"1\" \"\" \"etr $VERSION\" \"User Commands\"|" > man/build/etrs.1
     echo "Built man/build/etr.1 and man/build/etrs.1 (version $VERSION)"
-
-# Install man pages to XDG local man directory (~/.local/share/man/man1)
-install-man: man
-    #!/usr/bin/env bash
-    set -euo pipefail
-    mkdir -p "{{MAN_DIR}}/man1"
-    cp man/build/etr.1  "{{MAN_DIR}}/man1/etr.1"
-    cp man/build/etrs.1 "{{MAN_DIR}}/man1/etrs.1"
-    echo "Installed etr.1 and etrs.1 to {{MAN_DIR}}/man1"
-    echo "Tip: add {{MAN_DIR}} to MANPATH if not already present"
-
-# Install shell completions for etr and etrs (bash, zsh, fish, elvish, nushell, powershell)
-install-completions: build
-    #!/usr/bin/env bash
-    set -euo pipefail
-    mkdir -p "{{BASH_COMP}}" "{{ZSH_COMP}}" "{{FISH_COMP}}" "{{ELVISH_COMP}}" "{{NU_COMP}}" "{{PS_COMP}}"
-    for bin in etr etrs; do
-        BIN="{{justfile_directory()}}/target/debug/${bin}"
-        "$BIN" --completions bash        > "{{BASH_COMP}}/${bin}"
-        "$BIN" --completions zsh         > "{{ZSH_COMP}}/_${bin}"
-        "$BIN" --completions fish        > "{{FISH_COMP}}/${bin}.fish"
-        "$BIN" --completions elvish      > "{{ELVISH_COMP}}/${bin}.elv"
-        "$BIN" --completions nushell     > "{{NU_COMP}}/50${bin}-completions.nu"
-        "$BIN" --completions power-shell > "{{PS_COMP}}/${bin}.ps1"
-        echo "Installed completions for ${bin}"
-    done
-    echo ""
-    echo "Notes for shells that require manual sourcing:"
-    echo "  zsh        auto-loaded ({{ZSH_COMP}} is in zsh's default \$fpath)"
-    echo "  elvish    add to rc.elv:  eval (slurp < {{ELVISH_COMP}}/etr.elv)"
-    echo "                            eval (slurp < {{ELVISH_COMP}}/etrs.elv)"
-    echo "  nushell   auto-loaded ({{NU_COMP}} is in nushell's autoload paths)"
-    echo "  powershell  add to \$PROFILE:  . {{PS_COMP}}/etr.ps1"
-    echo "                                . {{PS_COMP}}/etrs.ps1"
 
 # ── Local end-to-end testing ─────────────────────────────────────────────────
 
