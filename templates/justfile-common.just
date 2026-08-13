@@ -2,11 +2,11 @@
 # Copyright (C) 2026 l1a
 #
 # ============================================================================
-# CANONICAL COMMON JUSTFILE BLOCK — template v2
+# CANONICAL COMMON JUSTFILE BLOCK — template v3
 # ============================================================================
 #
 # The text below `---- BEGIN CANONICAL ----` is the reference for the block
-# delimited by `# >>> COMMON (template v2)` and `# <<< COMMON` in a project's
+# delimited by `# >>> COMMON (template v3)` and `# <<< COMMON` in a project's
 # Justfile. Vendored in: rusticprofile, retch, etr.
 #
 # It is a THIN layer. The real work lives in two vendored Python helpers,
@@ -86,11 +86,22 @@
 #
 # SCOPE, STATED SO THE GAPS ARE NOT READ AS OVERSIGHTS
 # ----------------------------------------------------
-# Covers the install/man/completions family and `standard-check`. Does NOT cover
-# `check`/`lint`/`test`/`pr`/`open-pr`/`merge-pr`: those legitimately differ today
-# (`--workspace` in retch, `--all-targets` in etr, bare in rusticprofile) and
-# reconciling them is a behaviour change per repo rather than a copy. `man` stays
-# project-specific — one repo commits its page, one gitignores it, one builds two.
+# Covers the install/man/completions family, and — since v3 — the BEHAVIOUR of the
+# `pr`/`open-pr`/`merge-pr` triad, via `scripts/gate_conformance.py`.
+#
+# The triad's *bodies* are still not shared, and that is deliberate: `cargo clippy` is
+# bare in rusticprofile, `--workspace` in retch and `--all-targets` in etr; the NOTES
+# header differs; each checklist asks for different things. Forcing one body would
+# change what each gate DOES. So what is standardised is the set of guards each recipe
+# must carry, and `gate_conformance.py` asserts they are present.
+#
+# That check is STRUCTURAL, not behavioural, and its own docstring says so: it proves a
+# guard exists, not that it works. The install helpers can be checked behaviourally
+# because they are pure functions; the gate recipes run test suites, push branches and
+# merge PRs, so executing them from `check` would be slow and destructive.
+#
+# Still not covered: `check`/`lint`/`test` bodies, and `man` — one repo commits its
+# page, one gitignores it, one builds two.
 #
 # Known divergences left alone, for whoever extends this:
 #   * `Justfile` (rusticprofile, retch) vs `justfile` (etr)
@@ -170,3 +181,5 @@ standard-check:
     [ "{{PY}}" != "PYTHON-NOT-FOUND" ] || { echo "error: no python3/python on PATH" >&2; exit 1; }
     "{{PY}}" scripts/install_completions.py --self-test
     "{{PY}}" scripts/install_man.py --self-test
+    "{{PY}}" scripts/gate_conformance.py --self-test
+    "{{PY}}" scripts/gate_conformance.py "{{justfile()}}"
