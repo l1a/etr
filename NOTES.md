@@ -9,7 +9,52 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.7.1 — cross-platform install recipes (shared standard)
+## Current state: v0.7.2 — a gate that can be answered, tracked hooks, LF enforcement
+
+New in v0.7.2 (tooling and repo hygiene only; no Rust change, 112 tests unchanged). Closes the
+four items v0.7.1 recorded as found-but-not-fixed.
+
+- **`scripts/hooks/pre-push` is now tracked, and `just install-hooks` installs it.** Until now
+  this repo had no `scripts/hooks/` at all: a hook existed in one machine's `.git/hooks/`,
+  untracked, so it was unreproducible and **no fresh clone got a pre-push gate**. `AGENTS.md`
+  Part 1 §4 leans on real git hooks as *the* agent-agnostic enforcement layer — which only holds
+  if the hook is in the repository. The tracked hook skips on `GIT_NO_CHECK=1` and exits 0 when
+  `just` is absent, since refusing a push for someone without the toolchain would make the repo
+  unusable rather than safer. `scripts/install_hooks.py` **backs up an existing hook rather than
+  clobbering it**, asks `git rev-parse --git-path hooks` instead of assuming `.git/hooks` (wrong
+  in a worktree or submodule), and is Python for the same reason the install helpers are: no
+  `sh`, no `cygpath`.
+- **`.gitattributes` added — `* text=auto eol=lf`.** Both sibling repos have carried this for
+  months and this tree is Syncthing-shared across three OSes, so without it a Windows checkout
+  writes CRLF, Syncthing propagates it to the Unix clones, and git there reports **every** tracked
+  file as modified: a phantom whole-tree diff with zero content change. retch's v0.4.3 measured
+  13811 insertions / 13811 deletions, all line-ending flips. This was **live, not theoretical** —
+  git printed `LF will be replaced by CRLF` while committing v0.7.1. Binary assets
+  (`*.png`, `*.ico`) are pinned so nothing normalises them.
+- **`just pr` can be answered without a terminal.** It ended in a bare `read`, so a script, CI job
+  or agent blocked on a stdin that would never answer or died without saying why — and that reads
+  as **the gate refusing the change**, not as a question nobody could hear. It now accepts
+  `PR_CONFIRM`, an interactive stdin, or piped input under a ten-second bound, and the failure
+  message names `PR_CONFIRM`. **Not a bypass:** all four paths still require an explicit `y`, so
+  this widens *who can answer*, not *what counts as an answer*.
+- **`just open-pr` exists.** Previously `AGENTS.md` §4.0 asked, in prose, that `gh pr create` not
+  be run until `just pr` passed — which binds nobody. Neither `gh` nor `git` has a hook for "a PR
+  is about to open", so a justfile recipe is the only thing that can gate it, and being a recipe it
+  binds a human, Claude, Gemini or anything else identically. It also **pushes when the branch has
+  no upstream** — otherwise `gh pr create` has no remote branch to open from and fails *after* the
+  gate printed "Gate passed", which reads as the gate rejecting work it just approved. Deliberately
+  only when there is no upstream: pushing unconditionally would silently publish existing commits.
+- **Verified rather than assumed:** all four confirm paths exercised (`PR_CONFIRM=y` answers;
+  no-terminal-and-no-stdin **aborts naming the variable**; piped `y` still passes; piped `n` still
+  refuses), `install-hooks` run and the installed hook diffed byte-identical to the tracked one,
+  and `open-pr`'s push exercised on this PR's own branch — the one condition that cannot be
+  reproduced after the fact.
+- *Why all four existed:* they are `rusticprofile`'s `0.0.21`, `0.2.12`, `install-hooks` and
+  `.gitattributes`, none of which reached this repo. The same cross-repo staleness that left the
+  nushell completion path wrong here for months. **The `pr`/`open-pr` triad is still not covered by
+  the shared standard** — `templates/justfile-common.just` records it as out of scope, because
+  these recipes legitimately differ per repo; what is now aligned is their *behaviour*, by hand.
+
 
 New in v0.7.1 (tooling only; no Rust code change, test count unchanged at 112):
 

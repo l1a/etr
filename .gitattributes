@@ -1,0 +1,17 @@
+# Force LF on checkout on every platform.
+#
+# This working tree is shared across Linux, macOS and Windows by Syncthing, so without this
+# a Windows checkout writes CRLF, Syncthing propagates those bytes to the Unix clones, and
+# git there reports EVERY tracked file as modified — a phantom whole-tree diff with zero
+# content change. retch's v0.4.3 measured exactly that: 13811 insertions / 13811 deletions,
+# all line-ending flips, with `git diff --ignore-all-space` empty.
+#
+# It also overrides Git for Windows' system-level `core.autocrlf = true`, which is why the
+# warning "LF will be replaced by CRLF" appears without it. Both sibling repos carry this
+# file for the same reason.
+* text=auto eol=lf
+
+# Binary assets must never be normalised.
+*.png binary
+*.ico binary
+*.svg text eol=lf

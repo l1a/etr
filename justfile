@@ -1,6 +1,10 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # etr local test harness
 
+# Needed so a shebang recipe receives *ARGS as real argv ($@) rather than losing
+# quoting through textual ARGS interpolation -- see open-pr.
+set positional-arguments := true
+
 ETR_BIN    := justfile_directory() + "/target/debug/etr"
 ETRS_BIN   := justfile_directory() + "/target/debug/etrs"
 ETR_REL    := justfile_directory() + "/target/release/etr"
@@ -194,12 +198,78 @@ pr:
     echo "  [ ] NOTES.md known-gaps section and test-coverage count updated"
     echo "  [ ] GitHub wiki cloned and updated (etr.wiki.git — see AGENTS.md §4.11 for page list)"
     echo ""
-    echo -n "All manual items confirmed? [y/N] "
-    read -r CONFIRM
+    # A bare `read` makes this gate unanswerable by anything that is not a human at a
+    # terminal: a script, CI job or agent blocks on a stdin that will never answer, or dies
+    # without saying why -- and that reads as the gate REFUSING the change rather than asking
+    # a question nobody could hear. Three sources of an answer, in order:
+    #
+    #   1. PR_CONFIRM in the environment -- the explicit answer for a non-interactive caller.
+    #      NOT a bypass: setting it is the same act of confirmation as typing y, just recorded
+    #      where a script can supply it. Answer it AFTER checking each item.
+    #   2. An interactive stdin -- a human, prompted exactly as before.
+    #   3. Neither, so read piped input under a timeout. `echo y | just pr` keeps working, and
+    #      a stdin that never answers costs ten seconds rather than hanging.
+    #
+    # The failure names PR_CONFIRM: a gate that cannot be satisfied from the context it failed
+    # in is a wall, not a gate.
+    if [ -n "${PR_CONFIRM:-}" ]; then
+        CONFIRM="$PR_CONFIRM"
+        echo "All manual items confirmed? [y/N] $CONFIRM   (answered by PR_CONFIRM)"
+    elif [ -t 0 ]; then
+        echo -n "All manual items confirmed? [y/N] "
+        read -r CONFIRM
+    else
+        echo -n "All manual items confirmed? [y/N] "
+        read -r -t 10 CONFIRM || CONFIRM=""
+        echo "$CONFIRM"
+        [ -n "$CONFIRM" ] || { echo -e "${RED}Aborted.${NC} No terminal to confirm the checklist on, and nothing on stdin. Re-run with PR_CONFIRM=y once each item above is actually checked."; exit 1; }
+    fi
     [ "$CONFIRM" = "y" ] || [ "$CONFIRM" = "Y" ] \
         || { echo -e "${RED}Aborted.${NC} Complete the checklist first."; exit 1; }
 
     echo -e "\n${GREEN}Gate passed. You may now run: gh pr create${NC}\n"
+
+# Run the pre-PR gate, then gh pr create -- always use this, never gh pr create directly
+open-pr *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    #   just open-pr --title "..." --body-file body.md      # at a terminal
+    #   PR_CONFIRM=y just open-pr --title "..." --fill      # script, CI or agent
+    #
+    # This recipe is the only thing that can gate PR creation: neither `gh` nor `git` has a
+    # hook for "a PR is about to open". Being a justfile recipe rather than editor or agent
+    # configuration, it binds every contributor and tool identically -- AGENTS.md Part 1 §4.
+    # This repo previously asked for that discipline in prose instead, which binds nobody.
+    just pr
+
+    # Push the branch if it has no upstream yet. Without this, on a never-pushed branch
+    # `gh pr create` has no remote branch to open from and fails non-interactively -- AFTER
+    # the gate printed "Gate passed", which reads as the gate rejecting work it just approved.
+    #
+    # Deliberately ONLY when there is no upstream: pushing unconditionally would silently
+    # publish existing commits on a branch that already has one. pre-push runs `just check`,
+    # so the push is inside the gate rather than around it.
+    if ! git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' >/dev/null 2>&1; then
+        BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+        [ "$BRANCH" != HEAD ] || { echo "detached HEAD -- check out a branch first" >&2; exit 1; }
+        echo "no upstream for $BRANCH -- pushing it so gh has a remote branch to open from"
+        git push -u origin "$BRANCH"
+    fi
+
+    # Drop the empty argument just passes when *ARGS is unset.
+    ARGS=()
+    for a in "$@"; do [ -n "$a" ] && ARGS+=("$a"); done
+
+    # With no arguments and no terminal, gh fails with "must provide --title and --body";
+    # --fill uses the commit messages instead so the recipe finishes cleanly.
+    if [ ${#ARGS[@]} -eq 0 ] && [ ! -t 0 ]; then
+        ARGS=(--fill)
+    fi
+    gh pr create "${ARGS[@]}"
+
+# Install this repo's tracked git hooks (pre-push runs `just check`)
+install-hooks:
+    @"{{PY}}" scripts/install_hooks.py
 
 # Merge the active PR, switch to main, pull, delete the branch, and reset WIP.md (requires gh)
 merge-pr:
