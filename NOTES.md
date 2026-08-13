@@ -9,7 +9,7 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.7.2 — a gate that can be answered, tracked hooks, LF enforcement
+## Current state: v0.7.2 — a gate that can be answered, tracked hooks, LF enforcement, no auto-review
 
 New in v0.7.2 (tooling and repo hygiene only; no Rust change, 112 tests unchanged). Closes the
 four items v0.7.1 recorded as found-but-not-fixed.
@@ -49,6 +49,24 @@ four items v0.7.1 recorded as found-but-not-fixed.
   refuses), `install-hooks` run and the installed hook diffed byte-identical to the tracked one,
   and `open-pr`'s push exercised on this PR's own branch — the one condition that cannot be
   reproduced after the fact.
+- **Claude Code Review no longer runs on every pull request.** `claude-code-review.yml` is now
+  `workflow_dispatch` only; the `pull_request` trigger is kept commented immediately below it, so
+  restoring it is uncommenting two lines. The reason is not that the reviews were unwelcome: the
+  token behind the action has failed before in a way worse than useless — in `rusticprofile` it
+  went from 19 consecutive green runs to failing **every** run in ~490 ms on turn 1 at $0.00,
+  posting no findings. A rejection before any tokens are billed is a credential or quota problem,
+  not a verdict on the code, but left on `pull_request` it becomes a red check on every future PR
+  for a reason unrelated to that PR — which trains everyone to merge over failing checks. And this
+  family has already paid for the opposite failure, a review job going **green without reviewing
+  anything**. A check that cannot be believed in either direction is not a check.
+  - **Deliberately NOT copied from retch:** its `v0.6.17` also sets `if: false` on the job *in
+    addition* to keeping `workflow_dispatch`, which means a manual dispatch appears to run and
+    silently does nothing. That is the "setting that quietly does nothing" shape all three repos
+    exist to refuse, so etr keeps the dispatch genuinely runnable
+    (`gh workflow run claude-code-review.yml --ref <branch>`). Worth revisiting in retch.
+  - `claude.yml` (the `@claude` mention workflow) is **untouched** and shares the same secret, so
+    mentions fail the same way if the token is bad — noted in the workflow rather than left to be
+    rediscovered.
 - *Why all four existed:* they are `rusticprofile`'s `0.0.21`, `0.2.12`, `install-hooks` and
   `.gitattributes`, none of which reached this repo. The same cross-repo staleness that left the
   nushell completion path wrong here for months. **The `pr`/`open-pr` triad is still not covered by
