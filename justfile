@@ -925,6 +925,69 @@ e2e-cmd-local: check-tools install
         exit 1
     fi
     echo "    PASS: refused with a diagnostic naming the missing terminal (rc=${INT_RC})."
+
+    # ── 8. Teardown must not wait for the remote command ─────────────────────
+    # Regression test for the v0.7.8 fix. Two spawn_blocking tasks -- the PTY reader
+    # and the child waiter -- only finish when the shell exits, and Runtime::drop
+    # waits for blocking tasks. Worse, the reader holds a PTY master clone, so the
+    # PTY could never hang up on its own: a self-sustaining deadlock. etrs therefore
+    # outlived its own "shutting down" log line for as long as the command ran --
+    # forever, for a long-running one. Interactive sessions were unaffected (a login
+    # shell exits by itself), which is why this hid for so long.
+    echo "==> Part 7: SIGTERM must tear the server down, not wait for the command..."
+    # Identify THIS test's server by diffing the pid set, not `pgrep | head -1`:
+    # picking an arbitrary etrs can signal a different session entirely and then
+    # blame this one for the survivor. (That is exactly what the first version of
+    # this check did -- it reported an orphaned command while the process it had
+    # actually killed was somebody else's.)
+    BEFORE_PIDS=" $(pgrep -x -u "$(id -u)" etrs 2>/dev/null | tr '\n' ' ') "
+    "{{PY}}" "$NOTTY_HELPER" \
+        "exec {{INSTALL}}/etr localhost 'sleep 300' </dev/null >/dev/null 2>&1 &
+         sleep 6; exit 0" >/dev/null 2>&1 || true
+
+    ETRS_TD=""
+    for p in $(pgrep -x -u "$(id -u)" etrs 2>/dev/null || true); do
+        [[ "$BEFORE_PIDS" == *" $p "* ]] || { ETRS_TD="$p"; break; }
+    done
+    if [[ -z "$ETRS_TD" ]]; then
+        echo "SKIP: no new etrs to signal (session did not start)." >&2
+    else
+        # Its child is the remote command; track that pid rather than matching on
+        # a command name, which would also catch unrelated sleeps.
+        CMD_PID=$(pgrep -P "$ETRS_TD" 2>/dev/null | head -1 || true)
+        TD_START=$(date +%s)
+        kill -TERM "$ETRS_TD" 2>/dev/null || true
+        TD_GONE=0
+        for _ in $(seq 1 30); do
+            kill -0 "$ETRS_TD" 2>/dev/null || { TD_GONE=1; break; }
+            sleep 0.5
+        done
+        TD_ELAPSED=$(( $(date +%s) - TD_START ))
+        if [[ $TD_GONE -eq 0 ]]; then
+            echo "FAIL: etrs still alive ${TD_ELAPSED}s after SIGTERM -- teardown is" >&2
+            echo "      blocked on the remote command (sleep 300) instead of exiting." >&2
+            kill -9 "$ETRS_TD" 2>/dev/null || true
+            rm -f "$PTY_HELPER" "$OUT_FILE" "$NOTTY_HELPER"
+            exit 1
+        fi
+        echo "    PASS: etrs exited ${TD_ELAPSED}s after SIGTERM, with the command still running."
+        # The command must not be left behind either -- checked by pid, and only if
+        # we managed to identify it.
+        if [[ -n "$CMD_PID" ]]; then
+            CMD_GONE=0
+            for _ in $(seq 1 10); do
+                kill -0 "$CMD_PID" 2>/dev/null || { CMD_GONE=1; break; }
+                sleep 0.5
+            done
+            if [[ $CMD_GONE -eq 0 ]]; then
+                echo "FAIL: the remote command (pid ${CMD_PID}) outlived the server." >&2
+                kill -9 "$CMD_PID" 2>/dev/null || true
+                rm -f "$PTY_HELPER" "$OUT_FILE" "$NOTTY_HELPER"
+                exit 1
+            fi
+            echo "    PASS: the remote command was hung up with the session."
+        fi
+    fi
     rm -f "$PTY_HELPER" "$OUT_FILE" "$NOTTY_HELPER"
 
     echo ""

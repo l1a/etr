@@ -9,7 +9,61 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.7.7 — `just clean` stops killing live sessions
+## Current state: v0.7.8 — `etrs` actually exits when told to
+
+New in v0.7.8 (server fix; 112 unit tests unchanged, one new e2e part).
+
+- **`etrs` could not exit while a remote command was running.** Dropping the Tokio runtime
+  waits for `spawn_blocking` tasks, and two of them — the PTY reader blocked in `read()` on
+  the master, and the watcher blocked in `child.wait()` — only finish when the shell exits.
+  **They also cause the condition they wait on:** the reader holds a clone of the PTY
+  master, so the master is never fully dropped, so the kernel never sends a hangup, so the
+  command never exits, so the reader never unblocks. A self-sustaining deadlock — which is
+  why "let the PTY close and hang the shell up" does not work and the child has to be
+  signalled explicitly.
+- **The fix is a `SIGHUP` to the child's process group on every path out of the reconnect
+  loop**, which is what a real terminal hangup delivers. It escalates to `SIGKILL` after a
+  second, and *that was verified rather than assumed*: a command installing `SIG_IGN` for
+  SIGHUP still hung past 25 s with SIGHUP alone. The escalation loop exits as soon as the
+  group is gone, so the ordinary case costs one 50 ms tick, not a second.
+- **The reconnect-expiry path never recorded a utmp logout.** `record_logout` was called on
+  shell exit, SIGTERM, SIGHUP and signal-during-session — but the `reconnect window expired`
+  and `endpoint closed` arms just `break`. So the single most likely way for a session to
+  end, the user walking away, was the one that left a stale entry. Measured before the fix:
+  an expired interactive session exits cleanly and still leaves
+  `ktobias pts/3 ::1 via etr … gone - no logout` in utmp. Both arms now record it.
+
+### What made this hard to see, and what I got wrong first
+
+- **It looked like "`etrs` ignores SIGTERM". It does not.** The handler fires every time and
+  logs `SIGTERM during active session, closing connection` / `shutting down after signal` —
+  the *process* then fails to exit. Anything reading only the log would conclude shutdown
+  worked.
+- **The deciding variable is not signal-vs-expiry, it is interactive-vs-remote-command**, and
+  an early test confounded the two. The 2×2 that settled it:
+
+  | | interactive session | `etr host 'cmd'` |
+  |---|---|---|
+  | SIGTERM | exits in 0.3 s | **hung** |
+  | reconnect-window expiry | exits | **hung** |
+
+  An interactive login shell exits on its own and breaks the deadlock; `sleep 600` does not.
+  So the bug was invisible in ordinary interactive use, which is nearly all use.
+- **Proof it was the blocking tasks**, from `/proc/<pid>`: after SIGTERM, 18 of 21 threads
+  were torn down and exactly three remained — main in `futex_do_wait` (inside `Runtime::drop`),
+  one in `wait_woken` (the PTY read), one in `do_wait` (`wait4`) — while `12 -> /dev/ptmx`
+  stayed open and the child stayed alive. Timing agreed: SIGTERM 2 s into a 12 s command,
+  process exited 9.7 s later, exactly when the command ended.
+- **`std::process::exit()` is not an option here**, though it would fix the hang in one line:
+  `X11Cleanup::drop` removes `/tmp/.X11-unix/X<n>` and two xauth entries, and skipping
+  destructors would leak both per X11-forwarded session.
+- *Correction to v0.7.7 below:* that section says `etrs` "may not exit on SIGTERM when idle"
+  and speculates that stale utmp entries outlive killed servers "the exact problem the v0.4.7
+  work set out to fix". Both were wrong as stated — the handler is not the problem, and the
+  signal paths do record a logout. There **is** a real utmp hole, but on the expiry path and
+  by plain omission, not because a handler failed to fire.
+
+## Previous: v0.7.7 — `just clean` stops killing live sessions
 
 New in v0.7.7 (tooling only; no Rust change, 112 tests unchanged).
 
@@ -49,15 +103,15 @@ New in v0.7.7 (tooling only; no Rust change, 112 tests unchanged).
 
 ### Found while doing this, NOT fixed here
 
-- **`etrs` may not exit on SIGTERM when idle.** Four orphaned `etrs` processes left over
-  from e2e runs all survived ~3 s of `SIGTERM` and only died on `SIGKILL` (reproduced twice,
-  4/4 processes). This contradicts the v0.4.7 note above, which says the reconnect-wait loop
-  listens for SIGTERM/SIGHUP and exits cleanly after recording a utmp logout. If that
-  handler is not firing for a session whose client is long gone, then **stale utmp entries
-  can outlive a killed server** — the exact problem the v0.4.7 work set out to fix. Needs a
-  controlled reproduction (start a session, drop the client, `kill -TERM` the server, watch
-  the log and `last`) before anything is changed; `clean-procs` escalates to SIGKILL so it
-  is not blocked on the answer.
+- ~~**`etrs` may not exit on SIGTERM when idle**~~ **Investigated and fixed in v0.7.8 — but
+  this entry was wrong in its reasoning and is kept as written so the correction is legible.**
+  The handler was firing all along; the process could not exit because two `spawn_blocking`
+  tasks were deadlocked against the PTY. It was also not about being "idle": the deciding
+  variable is interactive-vs-remote-command. The stale-utmp guess turned out to be real but
+  for a different reason — the reconnect-expiry path simply never called `record_logout`.
+  See the v0.7.8 section. *The lesson worth keeping: this entry reasoned from four orphaned
+  processes and a plausible mechanism, and got the mechanism wrong; the 2×2 that settled it
+  took twenty minutes and would have been cheaper than writing the speculation down.*
 - *Adjacent, deliberately out of scope:* the six e2e recipes' cleanup traps still run
   `pkill -x etrs`, so running `just e2e-local` on a machine with a live remote session kills
   it — the same defect this release fixes in `clean`, in six more places. Fixing it properly
