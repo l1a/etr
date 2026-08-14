@@ -1040,6 +1040,7 @@ async fn run_connection_loop(
                 x11_enabled,
                 x11_auth_proto.clone(),
                 x11_auth_cookie.clone(),
+                has_remote_command,
                 verbose,
             ) => r,
             Ok(_) = escape_rx.wait_for(|&v| v) => {
@@ -1096,6 +1097,10 @@ async fn run_session(
     x11_enabled: bool,
     x11_auth_proto: String,
     x11_auth_cookie: Vec<u8>,
+    // True when a remote command was given rather than an interactive shell.
+    // Controls whether stdin reaching EOF ends the session — see the
+    // wait-for-completion `select!` at the end of this function.
+    has_remote_command: bool,
     verbose: u8,
 ) -> io::Result<()> {
     // ── Open control stream ───────────────────────────────────────────────
@@ -1224,11 +1229,47 @@ async fn run_session(
     // ── stdin task: stdin → QUIC PTY send ────────────────────────────────
     let session_stdin = Arc::clone(&session);
     let mut stdin_task = tokio::spawn(async move {
+        // Set once stdin has hit EOF and the VEOF byte has been relayed, so the
+        // second pass through the loop parks instead of sending it again.
+        let mut eof_signalled = false;
         loop {
             let payload = {
                 let mut rx = stdin_rx.lock().await;
                 match rx.recv().await {
                     Some(p) => p,
+                    // Stdin reached EOF while running a remote command.
+                    //
+                    // Returning here would drop `pty_send`, which *finishes* the
+                    // client→server half of the PTY QUIC stream — the server
+                    // reads that as the session ending and tears the connection
+                    // down, so the command's output never comes back
+                    // ("Session ended: connection lost").
+                    //
+                    // Half-close instead, in two steps:
+                    //
+                    // 1. Relay `VEOF` (0x04) once. The remote side is a PTY, and
+                    //    a PTY cannot be half-closed the way ssh half-closes a
+                    //    pipe — there is no out-of-band "stdin is done" to send.
+                    //    What a real terminal does here is exactly this: Ctrl-D
+                    //    at a line start makes the reader's `read()` return 0. So
+                    //    `printf x | etr host cat` lets `cat` see EOF and exit,
+                    //    instead of blocking forever on a stream nothing will
+                    //    ever close. Commands that don't read stdin (`echo …`)
+                    //    never dequeue the byte and are unaffected.
+                    // 2. Park forever, holding `pty_send` open so the server keeps
+                    //    the session alive until the command exits and sends its
+                    //    Disconnect. Teardown aborts this task, which is what
+                    //    finally drops the stream.
+                    None if has_remote_command && !eof_signalled => {
+                        vlog!(verbose, 2, "[etr] stdin EOF; relaying VEOF to remote");
+                        eof_signalled = true;
+                        vec![0x04]
+                    }
+                    None if has_remote_command => {
+                        vlog!(verbose, 2, "[etr] stdin EOF; holding PTY stream open");
+                        std::future::pending::<()>().await;
+                        unreachable!("pending() never resolves");
+                    }
                     None => break,
                 }
             };
@@ -1611,9 +1652,28 @@ async fn run_session(
     fwd_handles.push(reverse_acceptor_handle);
 
     // ── Wait for any task to complete ─────────────────────────────────────
+    //
+    // The `stdin_task` arm is **disabled while a remote command is running**.
+    // `stdin_task` finishes when the stdin channel closes, which happens on
+    // stdin EOF — and with `etr host 'cmd' </dev/null` or a pipe, that EOF
+    // arrives immediately, before the command has produced anything. Letting it
+    // end the session aborted `pty_recv_task` and `stdout_task` along with it,
+    // so the command's output was discarded and `etr` exited 0 having printed
+    // nothing but the terminal reset. ssh does not behave that way: it stops
+    // sending stdin but keeps relaying output until the remote side is done.
+    //
+    // With the arm disabled the session ends on a *definite* terminator instead
+    // — the server's `Disconnect` when the command exits (via `ctrl_reader_task`)
+    // or the PTY stream closing (`pty_recv_task`) — rather than on a timeout.
+    //
+    // Interactive sessions keep the old behaviour deliberately. There the remote
+    // side is a shell that never exits on its own, and nothing in the PTY stream
+    // carries "stdin is finished" to it, so dropping this arm would turn a prompt
+    // return into a hang. Console stdin never EOFs, so the arm simply never fires
+    // in normal interactive use.
     let result = tokio::select! {
         r = &mut ctrl_reader_task => r.unwrap_or_else(|e| Err(io::Error::other(e.to_string()))),
-        _ = &mut stdin_task        => Ok(()),
+        _ = &mut stdin_task, if !has_remote_command => Ok(()),
         r = &mut pty_recv_task     => r.unwrap_or_else(|e| Err(io::Error::other(e.to_string()))),
         _ = &mut ctrl_send_task    => Ok(()),
         _ = &mut sigwinch_task     => Ok(()),
