@@ -1630,9 +1630,125 @@ log:
     @mkdir -p "$(dirname "{{LOG_FILE}}")"
     @tail -f "{{LOG_FILE}}"
 
-# Kill daemon and tmux session (manual cleanup)
+# Remove build artifacts (see clean-procs for leftover test processes)
 clean:
-    -pkill -x etrs 2>/dev/null
-    -tmux kill-session -t "{{TMUX_SESS}}" 2>/dev/null
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # Build artifacts ONLY. This deliberately does not touch processes: it used to
+    # start with `pkill -x etrs`, which kills EVERY etrs the user owns -- including
+    # the server hosting a live remote session on this machine. Someone clearing
+    # build output has not asked for their sessions to be dropped, and a plain
+    # `cargo clean` gives no hint that it might. Process cleanup now lives in
+    # `just clean-procs`, where it is the stated purpose and is confirmed first.
     cargo clean
-    @echo "cleaned up"
+    # cargo clean only knows about this crate's target dir. These are gitignored
+    # build/dev output it leaves behind, so "clean" never actually cleaned them:
+    rm -rf man/build                 # rebuilt by `just man`
+    rm -rf tools/stress/target       # a separate crate, invisible to the root clean
+    rm -f etrs_fwd.json.gz           # profile capture; AGENTS.md 4.10 wants it gone before tagging
+    # Plain `echo`, not `@echo`: the `@` line-suppression prefix is just's syntax for
+    # NON-shebang recipes. Inside a `#!/usr/bin/env bash` recipe it is handed to bash
+    # verbatim, which fails with `@echo: command not found` and exit 127 -- after the
+    # cleaning has already happened, so it looks like clean broke rather than that its
+    # last line did.
+    echo "cleaned build artifacts (processes untouched -- see: just clean-procs)"
+
+# Kill leftover test/dev processes and tmux sessions, after showing what they are
+clean-procs:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'; NC=$'\033[0m'
+
+    # `pgrep -x` (exact process name), never `pgrep -f`: a full-command-line match
+    # would also match this very recipe's own shell, whose command line contains the
+    # pattern -- the classic self-match that makes a filter kill its own script.
+    # Restricted to the invoking user so a shared box's other users are never touched.
+    ETRS_PIDS=$(pgrep -x -u "$(id -u)" etrs 2>/dev/null || true)
+    STRESS_PIDS=$(pgrep -x -u "$(id -u)" stress_tool 2>/dev/null || true)
+    # Every test session name in this justfile starts with etr_ (etr_test,
+    # etr_cmd_test, etr_env_test, etr_forward_test, etr_reverse_test,
+    # etr_udp_concurrent, etr_stress...), so one prefix covers them all.
+    SESSIONS=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep '^etr_' || true)
+
+    if [ -z "$ETRS_PIDS" ] && [ -z "$STRESS_PIDS" ] && [ -z "$SESSIONS" ]; then
+        echo "${GREEN}Nothing to clean up.${NC} No etrs or stress_tool processes, no etr_* tmux sessions."
+        exit 0
+    fi
+
+    # Show them BEFORE killing anything. This is the whole point of the recipe: an
+    # orphaned test server and the server hosting a live remote session are
+    # indistinguishable to pkill, but not to a human reading start times and args.
+    echo "${YELLOW}Found the following. Some may be REAL sessions, not leftovers:${NC}"
+    echo
+    if [ -n "$ETRS_PIDS" ]; then
+        echo "  etrs processes (each one is somebody's session -- including yours):"
+        # shellcheck disable=SC2086
+        ps -o pid=,lstart=,etime=,args= -p $(echo "$ETRS_PIDS" | tr '\n' ' ') | sed 's/^/    /'
+        echo
+    fi
+    if [ -n "$STRESS_PIDS" ]; then
+        echo "  stress_tool processes:"
+        # shellcheck disable=SC2086
+        ps -o pid=,etime=,args= -p $(echo "$STRESS_PIDS" | tr '\n' ' ') | sed 's/^/    /'
+        echo
+    fi
+    if [ -n "$SESSIONS" ]; then
+        echo "  tmux sessions matching etr_*:"
+        echo "$SESSIONS" | sed 's/^/    /'
+        echo
+    fi
+
+    # Same three answer sources as `just pr`, for the same reason: a cleanup step is
+    # often run from a script, and a bare `read` there blocks on a stdin nobody holds.
+    if [ -n "${CLEAN_CONFIRM:-}" ]; then
+        CONFIRM="$CLEAN_CONFIRM"
+        echo "Kill all of the above? [y/N] $CONFIRM   (answered by CLEAN_CONFIRM)"
+    elif [ -t 0 ]; then
+        echo -n "Kill all of the above? [y/N] "
+        read -r CONFIRM
+    else
+        echo -n "Kill all of the above? [y/N] "
+        read -r -t 10 CONFIRM || CONFIRM=""
+        echo "$CONFIRM"
+        [ -n "$CONFIRM" ] || { echo "${RED}Aborted.${NC} No terminal to confirm on and nothing on stdin. Re-run with CLEAN_CONFIRM=y."; exit 1; }
+    fi
+    [ "$CONFIRM" = "y" ] || [ "$CONFIRM" = "Y" ] \
+        || { echo "${RED}Aborted.${NC} Nothing was killed."; exit 1; }
+
+    for s in $SESSIONS; do
+        tmux kill-session -t "$s" 2>/dev/null && echo "  killed tmux session $s" || true
+    done
+
+    # TERM first, then escalate. An orphaned etrs does not always go on SIGTERM --
+    # observed needing SIGKILL -- and a reap that leaves the process running while
+    # reporting success is worse than one that never ran.
+    ALL_PIDS=$(printf '%s\n%s\n' "$ETRS_PIDS" "$STRESS_PIDS" | grep -v '^$' || true)
+    [ -n "$ALL_PIDS" ] || { echo "${GREEN}Done.${NC}"; exit 0; }
+
+    while read -r pid; do
+        kill -TERM "$pid" 2>/dev/null || true
+    done <<< "$ALL_PIDS"
+
+    # Give them a moment to exit cleanly (etrs records a utmp logout on the way out).
+    for _ in 1 2 3 4 5 6; do
+        REMAINING=""
+        while read -r pid; do
+            kill -0 "$pid" 2>/dev/null && REMAINING="$REMAINING $pid"
+        done <<< "$ALL_PIDS"
+        [ -n "$REMAINING" ] || break
+        sleep 0.5
+    done
+
+    if [ -n "${REMAINING:-}" ]; then
+        echo "${YELLOW}Still running after SIGTERM:${NC}$REMAINING -- sending SIGKILL"
+        for pid in $REMAINING; do
+            kill -9 "$pid" 2>/dev/null || true
+        done
+        sleep 0.5
+        STUBBORN=""
+        for pid in $REMAINING; do
+            kill -0 "$pid" 2>/dev/null && STUBBORN="$STUBBORN $pid"
+        done
+        [ -z "$STUBBORN" ] || { echo "${RED}FAILED to kill:${NC}$STUBBORN"; exit 1; }
+    fi
+    echo "${GREEN}Done.${NC} All listed processes and sessions are gone."
