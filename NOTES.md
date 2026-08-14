@@ -9,7 +9,39 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.7.3 — merge-pr is gated on CI, and the gate triad is checked
+## Current state: v0.7.4 — NOTES.md tells the truth about its own gaps again
+
+New in v0.7.4 (documentation and repo hygiene only; no Rust change, 112 tests unchanged).
+
+- **The *Known gaps / next steps* list was carrying a gap that shipped closed three
+  releases ago.** "`just` recipes unusable from native Windows shells" sat there un-struck
+  while the v0.7.1 section, forty lines above it, opens by saying it *closes that exact
+  gap and names it*. AGENTS.md §4.9 requires completed gaps be struck through, and this is
+  the one file Part 2 §0 tells every agent to read first — so the failure mode is specific:
+  an agent reading the authoritative list picks up work that is already done, and the
+  evidence that it is done is in the same file. Now struck through with a pointer to v0.7.1.
+- **Three claims in the v0.7.1 section were true when written and false the moment v0.7.2
+  merged.** They are phrased in the present tense — "does not exist", "there is no
+  `install-hooks` recipe", "still true" — so they do not read as history, they read as
+  current state: `scripts/hooks/`, `.gitattributes`, `just pr`'s bare `read` and the missing
+  `just open-pr`. v0.7.2 fixed all four and says so. The blocks are kept rather than deleted
+  (they record *why* the work was deferred, which is worth having) but are now explicitly
+  marked superseded, so no reader mistakes them for open items.
+- **Two stale figures corrected:** the build-and-install section advertised `cargo test
+  (110 tests)` against a suite of 112 — disagreeing with this file's own coverage table — and
+  the `install-tag` example pinned 0.7.1. The wiki's `Development.md` carried the same 110.
+- **`fix/windows-backspace-and-initial-prompt` deleted, local and remote** (was `55434fb`,
+  recoverable from the reflog or by sha). It held the *deferred PTY reader* approach — start
+  the PTY master reader on the first connection rather than at session start — which the
+  v0.6.4 section of this file records as **attempted and reverted**: it had no effect,
+  because the fault is in the Windows *input* path, not the output path. Both dependency
+  bumps it carried (`anyhow` 1.0.103, `crossbeam-epoch` 0.9.20) are already on `main`. Per
+  AGENTS.md Part 1 §1 it was an abandoned branch to prune; leaving it invited someone to
+  rediscover a dead end that is already written down.
+- *No behaviour changed and no test was added*, which is exactly why the two unconditional
+  steps still ran: the man pages rebuild with the bumped version header, and the version is
+  bumped. "It's only docs" is the rationalisation §4 names.
+
 
 New in v0.7.3 (tooling only; no Rust change, 112 tests unchanged).
 
@@ -147,7 +179,13 @@ ushellutoload` — one entry — and nushell never reads the XDG path. Introduc
   header (`BINS := "etr etrs"`, `MAN_PAGES := …`) above the block, which is why the block can
   be byte-identical to siblings that ship one binary.
 
-### Two gaps found while doing this, deliberately NOT fixed here
+### Two gaps found while doing this, deliberately NOT fixed here — ~~open~~ **both fixed in v0.7.2**
+
+> **Superseded.** The two bullets below, and the paragraph after them, are kept as the record
+> of *why* this work was deferred to its own PR — but they are written in the present tense
+> and every item in them landed in **v0.7.2**: `scripts/hooks/pre-push` is tracked and
+> installed by `just install-hooks`, `.gitattributes` exists, `just pr` accepts `PR_CONFIRM`,
+> and `just open-pr` exists. Read them as history, not as open gaps.
 
 - **`scripts/hooks/` does not exist, so no fresh clone gets a pre-push gate.** A `pre-push`
   hook is present in this machine's `.git/hooks/` but is untracked, so it is unreproducible
@@ -160,10 +198,11 @@ ushellutoload` — one entry — and nushell never reads the XDG path. Introduc
   records a phantom whole-tree diff (13811 insertions / 13811 deletions, all line-ending
   flips) caused by its absence.
 
-Also unchanged and still true: `just pr`'s checklist ends in a bare `read`, so it cannot be
-answered non-interactively — the same gap both siblings have (rusticprofile fixed it with a
-`PR_CONFIRM` env override), and `just open-pr` does not exist here at all, so there is no
-gated call site for `gh pr create`.
+Also unchanged and still true *as of v0.7.1* — ~~and both fixed in v0.7.2~~: `just pr`'s
+checklist ends in a bare `read`, so it cannot be answered non-interactively — the same gap
+both siblings have (rusticprofile fixed it with a `PR_CONFIRM` env override), and
+`just open-pr` does not exist here at all, so there is no gated call site for
+`gh pr create`.
 
 ## Previous: v0.7.0 — AUR publishing (etr-terminal-bin)
 
@@ -897,11 +936,11 @@ cargo build
 just install
 
 # Install a released tag instead -- binaries, completions and man pages all from that tag
-just install-tag 0.7.1
+just install-tag 0.7.3
 
 # Code quality gate — run before every commit
-just check            # cargo fmt --check + cargo clippy -D warnings
-just test             # cargo test (110 tests)
+just check            # cargo fmt --check + cargo clippy -D warnings (also runs standard-check)
+just test             # cargo test (112 tests)
 ```
 
 ---
@@ -981,15 +1020,14 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
   Do not attempt a fix without first capturing `etr -vvv` and `etrs` logs from an
   actual occurrence to identify the real cause. Note the terminal is restored
   correctly on `~.` regardless (client-side, v0.6.5).
-- **`just` recipes unusable from native Windows shells**: the `justfile` recipes
-  use `#!/usr/bin/env bash` shebangs, so on Windows `just` tries to translate the
-  interpreter path with `cygpath`. From PowerShell/nushell (no Git-Bash `cygpath`
-  on PATH) recipes like `just install` fail with "could not find `cygpath`
-  executable". Workaround for the client build/install on Windows:
-  `cargo install --path . --bin etr --force` (or `cargo build --release --bin etr`
-  then copy `target\release\etr.exe` to `~/.cargo/bin`). A real fix would make the
-  common recipes cross-shell — e.g. plain (non-shebang) recipes that shell out to
-  `cargo` directly, or documenting that `just` needs Git Bash on PATH on Windows.
+- ~~**`just` recipes unusable from native Windows shells**~~ **Done in v0.7.1** (this entry
+  was left un-struck until v0.7.4 — see that section). The install-family recipes were
+  `#!/usr/bin/env bash` shebang recipes, so on Windows `just` tried to translate the
+  interpreter path with `cygpath` and every one failed before running a line from
+  PowerShell/nushell. They are now plain recipes driving two vendored Python helpers
+  (`scripts/install_completions.py`, `scripts/install_man.py`), which need no `sh`, no
+  `cygpath`, no coreutils and nothing from Git's `usrin` — which is precisely the
+  "plain (non-shebang) recipes" fix this gap asked for.
 - **Remote command truncated with redirected stdin**: `etr host 'cmd'` with
   `</dev/null` or a pipe on stdin ends the session as soon as stdin hits EOF,
   because `run_session`'s `tokio::select!` treats `stdin_task` completing as
