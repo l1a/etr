@@ -23,6 +23,16 @@ use etr::session::SessionState;
 static LOG_FILE: std::sync::OnceLock<std::sync::Mutex<std::fs::File>> = std::sync::OnceLock::new();
 static IN_RAW_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Set once `enable_raw_mode` has actually succeeded, and never cleared.
+///
+/// Distinct from [`IN_RAW_MODE`], which tracks whether raw mode is in effect
+/// *right now* (and which `restore_terminal` clears): this records whether the
+/// terminal was ever ours to modify at all. When there is no controlling
+/// terminal — cron, a systemd unit, CI, an agent shell — it stays `false` and
+/// [`restore_terminal`] becomes a no-op, so the VT reset sequences are never
+/// written into a stdout that is really a file or a pipe.
+static RAW_EVER_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 // The console input/output modes and input codepage in effect before etr
 // touched anything, captured once by `capture_console_originals` so they can be
 // restored verbatim on exit.  Restoring the exact modes is essential: crossterm's
@@ -243,9 +253,17 @@ fn read_stdin(buf: &mut [u8]) -> io::Result<usize> {
 /// which move the cursor.  On a clean exit pass `false` so the cursor is left
 /// untouched, since the remote already restored the screen.
 ///
-/// Must only be called when raw/VT mode was actually entered — otherwise the
-/// escape bytes would print literally on a console without VT processing enabled.
+/// Only acts when raw/VT mode was actually entered — otherwise the escape bytes
+/// would print literally on a console without VT processing enabled, or land in
+/// a redirected stdout as 70 bytes of garbage ahead of the real output. That
+/// precondition used to be the caller's to honour; it is now enforced here via
+/// [`RAW_EVER_ENABLED`], because the no-controlling-terminal path reaches several
+/// of these call sites and getting it wrong is invisible until someone pipes
+/// `etr host 'cmd'` into a file.
 fn restore_terminal(reset_screen: bool) {
+    if !RAW_EVER_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     IN_RAW_MODE.store(false, std::sync::atomic::Ordering::Relaxed);
     {
         let mut out = io::stdout();
@@ -1014,15 +1032,56 @@ async fn run_connection_loop(
         vlog!(verbose, 2, "[etr] QUIC connected to {server_addr}");
         vlog!(verbose, 2, "[etr] {}", quic::tls_info());
 
-        enable_raw_mode().unwrap();
-        // On Windows, raw mode alone still leaves the console emitting legacy key
-        // codes (Backspace → 0x08) and not rendering ANSI; switch it to VT mode so
-        // we speak the same conventions as the remote Unix PTY.  No-op on Unix.
-        enable_vt_console();
-        IN_RAW_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
-        in_raw = true;
+        // Raw mode needs a controlling terminal: crossterm opens `/dev/tty`, which
+        // fails with ENXIO under cron, a systemd unit, a CI job or an agent shell.
+        // This used to be `.unwrap()`, so those contexts got a Rust panic and
+        // exit 101 instead of anything actionable.
+        match enable_raw_mode() {
+            Ok(()) => {
+                // On Windows, raw mode alone still leaves the console emitting legacy key
+                // codes (Backspace → 0x08) and not rendering ANSI; switch it to VT mode so
+                // we speak the same conventions as the remote Unix PTY.  No-op on Unix.
+                enable_vt_console();
+                RAW_EVER_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+                IN_RAW_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
+                in_raw = true;
+            }
+            // A remote command does not need a local terminal: there is nothing to
+            // put in raw mode and nothing to interact with, only output to relay.
+            // Carrying on makes `etr host 'cmd'` work from a script, a cron job or
+            // CI. Everything downstream already copes — `terminal::size()` is
+            // handled with `if let Ok`, so no resize is sent and the server keeps
+            // its default PTY size, and `restore_terminal` is a no-op because
+            // `RAW_EVER_ENABLED` stays false (emitting the VT resets here would
+            // inject escape bytes into a redirected stdout, corrupting the very
+            // command output this path exists to deliver).
+            Err(e) if has_remote_command => {
+                vlog!(
+                    verbose,
+                    1,
+                    "[etr] No controlling terminal ({e}); running without raw mode"
+                );
+            }
+            // An interactive session, though, has nothing to interact with. Failing
+            // loudly beats connecting to a shell nobody can type at — and which
+            // would never exit on its own, so it would hang rather than return.
+            Err(e) => {
+                eprintln!("[etr] Cannot enter raw mode: no controlling terminal ({e}).");
+                // Name the target the user actually typed, not `server_addr` —
+                // that is the resolved QUIC address (`[::1]:53167`), which is
+                // useless as advice and looks like a different host entirely.
+                eprintln!(
+                    "[etr] An interactive session needs one. To run a command without a\n\
+                     [etr] terminal, pass it as arguments instead:  etr {target} <command>"
+                );
+                std::process::exit(1);
+            }
+        }
         // Release the stdin reader now that raw + VT mode is active, so its first
         // read is per-keystroke rather than a line-buffered cooked read (#54).
+        // Fired on the degraded path too: the reader is gated on this signal, so
+        // skipping it would leave a Windows run with no terminal blocked forever on
+        // a reader that never starts — and piped stdin still has to be relayed.
         #[cfg(windows)]
         if let Some(tx) = raw_ready_tx.take() {
             let _ = tx.send(());

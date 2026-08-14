@@ -851,7 +851,81 @@ e2e-cmd-local: check-tools install
         exit 1
     fi
     echo "    PASS: stdin-reading command saw EOF and exited (${ELAPSED}s)."
-    rm -f "$PTY_HELPER" "$OUT_FILE"
+
+    # ── 7. No controlling terminal ───────────────────────────────────────────
+    # Regression test for the v0.7.6 fix. enable_raw_mode() opens /dev/tty, which
+    # fails with ENXIO under cron, a systemd unit, CI or an agent shell; that call
+    # was `.unwrap()`, so those contexts got a Rust panic and exit 101.
+    #
+    # `setsid(2)` via python rather than the setsid(1) binary: the command does not
+    # exist on macOS, which is a supported platform for these tests.
+    NOTTY_HELPER="$(mktemp)"
+    cat > "$NOTTY_HELPER" <<'PYEOF'
+    import os, sys
+    os.setsid()                      # detach from the controlling terminal
+    os.execv("/bin/sh", ["/bin/sh", "-c", sys.argv[1]])
+    PYEOF
+
+    SENTINEL_NOTTY="NOTTY_TEST_SENTINEL_$$"
+    echo "==> Part 5: a remote command must run without a controlling terminal..."
+    # `|| NOTTY_RC=$?` rather than a bare call: `set -e` is in force, so a failing
+    # run would abort the recipe before the exit code could be inspected -- the
+    # exit-101 check below would be unreachable and the test would fail silently,
+    # reporting nothing about the panic it exists to catch.
+    NOTTY_RC=0
+    "{{PY}}" "$NOTTY_HELPER" \
+        "exec {{INSTALL}}/etr localhost 'echo ${SENTINEL_NOTTY}' </dev/null" \
+        > "$OUT_FILE" 2>/dev/null || NOTTY_RC=$?
+
+    if [[ $NOTTY_RC -eq 101 ]]; then
+        echo "FAIL: etr panicked (exit 101) with no controlling terminal." >&2
+        rm -f "$PTY_HELPER" "$OUT_FILE" "$NOTTY_HELPER"
+        exit 1
+    fi
+    if ! grep -q "${SENTINEL_NOTTY}" "$OUT_FILE"; then
+        echo "FAIL: no command output with no controlling terminal (rc=${NOTTY_RC})." >&2
+        cat -v "$OUT_FILE" >&2
+        rm -f "$PTY_HELPER" "$OUT_FILE" "$NOTTY_HELPER"
+        exit 1
+    fi
+    # The output must be byte-clean. With no terminal there is nothing to reset, so
+    # restore_terminal must stay silent -- otherwise 70 bytes of VT escapes land in
+    # what is really a file or a pipe, corrupting the output Part 3 exists to
+    # deliver. Checking for ESC catches that directly.
+    if LC_ALL=C grep -q $'\033' "$OUT_FILE"; then
+        echo "FAIL: VT escape sequences leaked into non-terminal output." >&2
+        cat -v "$OUT_FILE" >&2
+        rm -f "$PTY_HELPER" "$OUT_FILE" "$NOTTY_HELPER"
+        exit 1
+    fi
+    echo "    PASS: ran with no terminal, output present and free of escapes."
+
+    echo "==> Part 6: an interactive session with no terminal must fail clearly..."
+    # Same `set -e` guard as Part 5 -- and here a non-zero exit is the *expected*
+    # result, so without it this check could never pass.
+    INT_RC=0
+    "{{PY}}" "$NOTTY_HELPER" "exec {{INSTALL}}/etr localhost </dev/null" \
+        > "$OUT_FILE" 2>&1 || INT_RC=$?
+
+    if [[ $INT_RC -eq 0 ]]; then
+        echo "FAIL: interactive session with no terminal exited 0; expected a refusal." >&2
+        rm -f "$PTY_HELPER" "$OUT_FILE" "$NOTTY_HELPER"
+        exit 1
+    fi
+    if [[ $INT_RC -eq 101 ]]; then
+        echo "FAIL: interactive session panicked (exit 101) instead of reporting." >&2
+        cat -v "$OUT_FILE" >&2
+        rm -f "$PTY_HELPER" "$OUT_FILE" "$NOTTY_HELPER"
+        exit 1
+    fi
+    if ! grep -q 'no controlling terminal' "$OUT_FILE"; then
+        echo "FAIL: refusal did not name the missing terminal (rc=${INT_RC}):" >&2
+        cat -v "$OUT_FILE" >&2
+        rm -f "$PTY_HELPER" "$OUT_FILE" "$NOTTY_HELPER"
+        exit 1
+    fi
+    echo "    PASS: refused with a diagnostic naming the missing terminal (rc=${INT_RC})."
+    rm -f "$PTY_HELPER" "$OUT_FILE" "$NOTTY_HELPER"
 
     echo ""
     echo "==> All remote command tests passed."

@@ -9,7 +9,50 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.7.5 — a remote command's output survives redirected stdin
+## Current state: v0.7.6 — `etr` no longer panics without a controlling terminal
+
+New in v0.7.6 (client fix; 112 unit tests unchanged, two new e2e parts).
+
+- **`etr` panicked with `exit 101` when there was no controlling terminal.**
+  `enable_raw_mode()` opens `/dev/tty`, which fails with `ENXIO` under cron, a systemd
+  unit, a CI job or an agent shell — and the call was `.unwrap()`, so the user got a Rust
+  panic and a backtrace hint instead of a diagnostic. Found during the v0.7.5 work, where
+  it masked the real bug with an unrelated failure.
+- **The two cases are treated differently, because they genuinely differ.**
+  - *A remote command* (`etr host 'cmd'`) does not need a local terminal — there is
+    nothing to put in raw mode and nothing to interact with, only output to relay. It now
+    runs without raw mode, which makes `etr host 'cmd'` usable from a script, a cron job or
+    CI. Everything downstream already coped: every `terminal::size()` call site is an
+    `if let Ok`, so no resize is sent and the server keeps its default PTY size.
+  - *An interactive session* exits 1 with a message naming the missing terminal and
+    pointing at the command form. Degrading there would connect to a shell nobody can type
+    at, which — since the remote shell never exits on its own — would hang rather than
+    return.
+- **The output stays byte-clean, which is the subtle half.** `restore_terminal` writes the
+  VT reset sequences to stdout, and its own doc comment already required that it only be
+  called when raw mode was actually entered. The degraded path reaches several of its call
+  sites, so honouring that by hand at each one would have been fragile — a new
+  `RAW_EVER_ENABLED` flag now enforces it inside the function. Without it, 70 bytes of
+  escapes would land in a redirected stdout, **corrupting exactly the command output v0.7.5
+  existed to deliver**. Measured: 13 bytes out for `echo <sentinel>` with no terminal, all
+  of them the output; 80 with a terminal, where the 70-byte reset belongs.
+- **The Windows stdin-reader gate fires on both branches.** That reader waits on a one-shot
+  signal sent after raw mode is enabled (the v0.6.5 first-line-echo fix); leaving it unsent
+  on the degraded path would block a no-terminal Windows run forever on a reader that never
+  starts, and piped stdin still has to be relayed.
+- **Regression coverage, negative-controlled.** `just e2e-cmd-local` gains Part 5 (a remote
+  command runs with no terminal, output present **and containing no ESC byte**) and Part 6
+  (an interactive session refuses, non-zero, naming the terminal). Run against the pre-fix
+  binary, Part 5 fails with "etr panicked (exit 101)" while Parts 1–4 still pass. The tests
+  detach with `os.setsid()` from Python rather than the `setsid(1)` binary, which does not
+  exist on macOS.
+  - Worth keeping: both checks first had to be rewritten as `CMD || RC=$?`. Under the
+    recipe's `set -e` a bare call **aborts before the exit code can be read**, so the
+    exit-101 branch was unreachable and Part 6 — where a non-zero exit is the *expected*
+    result — could never have passed. It failed with no message at all, which is the same
+    "a check that cannot report" shape recorded throughout `~/AGENTS.md`.
+
+## Previous: v0.7.5 — a remote command's output survives redirected stdin
 
 New in v0.7.5 (client fix; 112 unit tests unchanged, two new e2e parts).
 
@@ -1088,15 +1131,11 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
   sender must be kept alive (dropping it finishes the QUIC stream and the server ends the
   session), and `VEOF` must be relayed in-band (a PTY cannot be half-closed, so a
   stdin-reading command such as `cat` otherwise hangs). See the v0.7.5 section.
-- **`etr` panics when there is no controlling terminal**: `enable_raw_mode().unwrap()` in
-  `src/bin/etr.rs` fails with `ENXIO` when `/dev/tty` cannot be opened — cron, a systemd
-  unit, a CI job, an agent shell — so the user gets a Rust panic message and `exit 101`
-  rather than a diagnostic. Found while reproducing the redirected-stdin bug in v0.7.5,
-  where it masked the real failure with an unrelated one. Fixing it needs a decision about
-  intent: run degraded with no raw mode (reasonable for `etr host 'cmd'`, which may not need
-  a live terminal at all), or fail with a clear message naming the missing tty. Not a
-  reflex `unwrap` removal — the right behaviour differs between the interactive and
-  remote-command cases.
+- ~~**`etr` panics when there is no controlling terminal**~~ **Done in v0.7.6**: the
+  decision this entry asked for was taken — degrade for a remote command, refuse with a
+  diagnostic for an interactive session — because the right behaviour does differ between
+  the two. See the v0.7.6 section, including the `RAW_EVER_ENABLED` guard that keeps the
+  degraded path's output free of VT escapes.
 - ~~**`utmp`/`wtmp` registration**~~ **Done**: `etrs` writes `USER_PROCESS` to utmp
   and wtmp on connect, and `DEAD_PROCESS` on clean shell exit, via `libutempter`
   (`src/login.rs`).  `libutempter` delegates to the setgid-utmp helper
