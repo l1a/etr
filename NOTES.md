@@ -9,7 +9,63 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.7.6 — `etr` no longer panics without a controlling terminal
+## Current state: v0.7.7 — `just clean` stops killing live sessions
+
+New in v0.7.7 (tooling only; no Rust change, 112 tests unchanged).
+
+- **`just clean` killed every `etrs` the user owned, including live remote sessions.** Its
+  first line was `pkill -x etrs`. Someone clearing build output has not asked for their
+  sessions to be dropped, and nothing about the name or the output hinted that it might —
+  the damage lands on whoever is *developing remotely on the machine being cleaned*, which
+  is exactly this project's own use case.
+- **And it was not even cleaning properly.** It ran `cargo clean` and nothing else, so
+  three gitignored build outputs survived: `man/build/`, `tools/stress/target/` (a separate
+  crate the root `cargo clean` cannot see) and `etrs_fwd.json.gz` — the profile capture
+  §4.10 already asks to be cleared before tagging. So the recipe skipped artifacts and
+  killed processes: precisely backwards. `clean` now removes all four and touches no
+  process or tmux session.
+- **New `just clean-procs` owns process cleanup, and shows its work first.** An orphaned
+  test server and the server hosting a live session are indistinguishable to `pkill`, but
+  not to a human reading start times and arguments — so it lists every `etrs` and
+  `stress_tool` owned by the invoking user, plus tmux sessions matching `etr_*` (every test
+  session name in the justfile shares that prefix), and only then asks. The confirmation
+  takes `CLEAN_CONFIRM`, an interactive stdin, or piped input under a bound, mirroring
+  `just pr`'s `PR_CONFIRM` — a cleanup step is often scripted, and a bare `read` there
+  blocks on a stdin nobody holds.
+  - Uses `pgrep -x`, never `pgrep -f`: a full-command-line match would also match the
+    recipe's own shell, whose command line contains the pattern. That self-match is
+    recorded in `~/AGENTS.md` §10 as having caused three separate incidents.
+  - Restricted to the invoking user, so a shared machine's other users are never touched.
+  - **Escalates TERM → KILL**, because SIGTERM is not reliably enough — see the gap below.
+    A reap that leaves the process running while reporting success is worse than one that
+    never ran.
+- *Two defects in the recipe itself, both found by running it rather than reading it:*
+  `@echo` inside a `#!/usr/bin/env bash` recipe is **not** just's line-suppression prefix —
+  it is handed to bash verbatim and fails with `@echo: command not found`, exit 127, *after*
+  the cleaning has happened, so `clean` looked broken when only its last line was. And the
+  first structural check that `clean` contains no `pkill` passed on the **comment**
+  explaining why it no longer does; stripping comments first is the same discipline
+  `scripts/gate_conformance.py` already applies for the same reason.
+
+### Found while doing this, NOT fixed here
+
+- **`etrs` may not exit on SIGTERM when idle.** Four orphaned `etrs` processes left over
+  from e2e runs all survived ~3 s of `SIGTERM` and only died on `SIGKILL` (reproduced twice,
+  4/4 processes). This contradicts the v0.4.7 note above, which says the reconnect-wait loop
+  listens for SIGTERM/SIGHUP and exits cleanly after recording a utmp logout. If that
+  handler is not firing for a session whose client is long gone, then **stale utmp entries
+  can outlive a killed server** — the exact problem the v0.4.7 work set out to fix. Needs a
+  controlled reproduction (start a session, drop the client, `kill -TERM` the server, watch
+  the log and `last`) before anything is changed; `clean-procs` escalates to SIGKILL so it
+  is not blocked on the answer.
+- *Adjacent, deliberately out of scope:* the six e2e recipes' cleanup traps still run
+  `pkill -x etrs`, so running `just e2e-local` on a machine with a live remote session kills
+  it — the same defect this release fixes in `clean`, in six more places. Fixing it properly
+  means each recipe tracking the pid it spawned rather than reaping by name, which is a
+  larger change than a rename. Their leftovers are also not hypothetical: four orphans were
+  present when `clean-procs` was first run, so the traps do not catch everything today.
+
+## Previous: v0.7.6 — `etr` no longer panics without a controlling terminal
 
 New in v0.7.6 (client fix; 112 unit tests unchanged, two new e2e parts).
 
