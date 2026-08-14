@@ -766,6 +766,93 @@ e2e-cmd-local: check-tools install
     fi
     echo "    PASS: etr exited cleanly after fast-exit command."
 
+    # ── 6. Redirected stdin must not truncate the command's output ───────────
+    # Regression test for the v0.7.5 fix. `etr host 'cmd' </dev/null` used to end
+    # the session the instant stdin hit EOF -- `run_session`'s select! treated
+    # stdin_task completing as session end -- so the output was discarded and etr
+    # exited 0 having printed nothing but the terminal reset.
+    #
+    # tmux is deliberately NOT used here: the pane's stdin is the tmux pty, which
+    # never EOFs, so a tmux-hosted run cannot exercise this path at all. The
+    # command needs a controlling terminal (raw mode) AND a redirected stdin at
+    # the same time, so it runs under `sh -c` inside a pty with fd 0 redirected.
+    > "$CLIENT_LOG"
+    SENTINEL_EOF="EOF_TEST_SENTINEL_$$"
+    echo "==> Part 3: redirected stdin must not truncate output..."
+
+    # Bare `mktemp` rather than `mktemp -t …`: the -t form means different things
+    # in GNU and BSD coreutils, and macOS is a supported test platform.
+    PTY_HELPER="$(mktemp)"
+    OUT_FILE="$(mktemp)"
+    cat > "$PTY_HELPER" <<'PYEOF'
+    import os, pty, select, sys, time
+    pid, mfd = pty.fork()
+    if pid == 0:
+        os.execv("/bin/sh", ["/bin/sh", "-c", sys.argv[1]])
+    chunks, deadline = [], time.time() + 40
+    while time.time() < deadline:
+        r, _, _ = select.select([mfd], [], [], 1.0)
+        if r:
+            try:
+                d = os.read(mfd, 4096)
+            except OSError:
+                break
+            if not d:
+                break
+            chunks.append(d)
+        if os.waitpid(pid, os.WNOHANG)[0] != 0:
+            while True:
+                rr, _, _ = select.select([mfd], [], [], 0.5)
+                if not rr:
+                    break
+                try:
+                    d = os.read(mfd, 4096)
+                except OSError:
+                    break
+                if not d:
+                    break
+                chunks.append(d)
+            break
+    sys.stdout.buffer.write(b"".join(chunks))
+    PYEOF
+
+    "{{PY}}" "$PTY_HELPER" \
+        "exec {{INSTALL}}/etr localhost 'echo ${SENTINEL_EOF}' </dev/null" > "$OUT_FILE" 2>&1 || true
+
+    if ! grep -q "${SENTINEL_EOF}" "$OUT_FILE"; then
+        echo "FAIL: output of a remote command was lost when stdin was redirected." >&2
+        echo "      Expected '${SENTINEL_EOF}' in etr's output; got $(wc -c < "$OUT_FILE") bytes:" >&2
+        cat -v "$OUT_FILE" >&2
+        rm -f "$PTY_HELPER" "$OUT_FILE"
+        exit 1
+    fi
+    echo "    PASS: remote command output survives stdin EOF."
+
+    # A command that *reads* stdin must still terminate: a PTY cannot be
+    # half-closed, so the client relays VEOF (0x04) on stdin EOF. Without it this
+    # hangs until the server's reconnect timeout instead of failing fast.
+    SENTINEL_CAT="CAT_TEST_SENTINEL_$$"
+    echo "==> Part 4: a stdin-reading command must see EOF and exit..."
+    START=$(date +%s)
+    "{{PY}}" "$PTY_HELPER" \
+        "exec sh -c 'printf \"${SENTINEL_CAT}\\n\" | {{INSTALL}}/etr localhost cat'" \
+        > "$OUT_FILE" 2>&1 || true
+    ELAPSED=$(( $(date +%s) - START ))
+
+    if ! grep -q "${SENTINEL_CAT}" "$OUT_FILE"; then
+        echo "FAIL: 'cat' did not echo piped stdin back (elapsed ${ELAPSED}s)." >&2
+        cat -v "$OUT_FILE" >&2
+        rm -f "$PTY_HELPER" "$OUT_FILE"
+        exit 1
+    fi
+    if [[ $ELAPSED -ge 35 ]]; then
+        echo "FAIL: 'cat' took ${ELAPSED}s — it never saw EOF and hung." >&2
+        rm -f "$PTY_HELPER" "$OUT_FILE"
+        exit 1
+    fi
+    echo "    PASS: stdin-reading command saw EOF and exited (${ELAPSED}s)."
+    rm -f "$PTY_HELPER" "$OUT_FILE"
+
     echo ""
     echo "==> All remote command tests passed."
 

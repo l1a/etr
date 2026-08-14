@@ -9,7 +9,60 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.7.4 — NOTES.md tells the truth about its own gaps again
+## Current state: v0.7.5 — a remote command's output survives redirected stdin
+
+New in v0.7.5 (client fix; 112 unit tests unchanged, two new e2e parts).
+
+- **`etr host 'cmd' </dev/null` printed nothing and exited 0.** `run_session`'s
+  wait-for-completion `select!` treated `stdin_task` finishing as the session ending, and
+  with redirected stdin that EOF arrives immediately — before the command has produced
+  anything. Ending there aborted `pty_recv_task` and `stdout_task` too, so the output was
+  discarded and the only bytes written were the 70-byte terminal reset. **Measured, not
+  inferred:** under a pty, `echo <sentinel> </dev/null` emitted exactly 70 bytes with the
+  sentinel absent, against 81 bytes with it present when stdin was left attached — an
+  11-byte difference that is precisely the lost output.
+- **The obvious one-line fix was wrong, and the failure is worth recording.** Disabling
+  that `select!` arm alone changed the symptom to `[etr] Session ended: connection lost`,
+  still with no output. Returning from `stdin_task` **drops `pty_send`, which *finishes*
+  the client→server half of the PTY QUIC stream** — the server reads that as the session
+  ending and tears the connection down. Half-closing means keeping the sender alive, not
+  merely not exiting.
+- **A PTY cannot be half-closed, so EOF has to be relayed in-band.** With the stream held
+  open, `printf x | etr host cat` then **hung** (killed at 45 s) because `cat` never saw
+  EOF: there is no out-of-band "stdin is done" on this stream, and unlike ssh-over-a-pipe
+  there is no pipe to close. The client now relays **`VEOF` (`0x04`) once** on stdin EOF —
+  exactly what a terminal does on Ctrl-D — then parks, holding the stream open until the
+  command exits and the server sends its `Disconnect`. Commands that never read stdin
+  never dequeue the byte.
+- **Interactive sessions keep the old behaviour, deliberately.** The whole change is gated
+  on `has_remote_command`. There the remote side is a shell that never exits on its own,
+  so holding the session open past stdin EOF would turn `etr host </dev/null` from a prompt
+  return into a hang. Verified: it still exits. Console stdin never EOFs, so the arm never
+  fires in normal interactive use regardless.
+- **Regression coverage, verified to actually fail without the fix.** `just e2e-cmd-local`
+  gains Part 3 (output survives stdin EOF) and Part 4 (a stdin-reading command sees EOF and
+  exits, with an elapsed-time assertion so a hang fails loudly instead of passing slowly).
+  Run against the pre-fix binary, Part 3 fails reporting the same 70 bytes measured above
+  while Parts 1–2 still pass — so the test is specific to this bug rather than to any
+  breakage. **These parts deliberately do not use tmux**: a tmux pane's stdin is a pty that
+  never EOFs, so a tmux-hosted run cannot reach this path at all. They need a controlling
+  terminal *and* a redirected fd 0 simultaneously, which means a real `pty.fork` with
+  `</dev/null` inside it.
+- `PROTOCOL.md` §5.2 now records both conventions — that finishing the client→server half
+  means "session over", and that `VEOF` is how stdin EOF reaches the remote reader. No tag
+  or field changed.
+
+### Found while doing this, NOT fixed here
+
+- **`etr` panics when there is no controlling terminal.** `enable_raw_mode().unwrap()`
+  (`src/bin/etr.rs`) fails with `ENXIO` ("No such device or address") when `/dev/tty`
+  cannot be opened — from cron, a systemd unit, a CI job or an agent shell — and the user
+  gets a Rust panic and `exit 101` instead of a diagnostic. Confirmed here: it is what made
+  the first attempt to reproduce the bug above fail for an unrelated reason. It needs a
+  decision rather than a reflex fix (run degraded without raw mode, or exit with a clear
+  message), so it belongs in its own PR.
+
+## Previous: v0.7.4 — NOTES.md tells the truth about its own gaps again
 
 New in v0.7.4 (documentation and repo hygiene only; no Rust change, 112 tests unchanged).
 
@@ -1028,15 +1081,22 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
   (`scripts/install_completions.py`, `scripts/install_man.py`), which need no `sh`, no
   `cygpath`, no coreutils and nothing from Git's `usrin` — which is precisely the
   "plain (non-shebang) recipes" fix this gap asked for.
-- **Remote command truncated with redirected stdin**: `etr host 'cmd'` with
-  `</dev/null` or a pipe on stdin ends the session as soon as stdin hits EOF,
-  because `run_session`'s `tokio::select!` treats `stdin_task` completing as
-  session end — so a fast command's output can be lost before it is relayed.
-  Interactive console stdin never EOFs, so normal interactive use is unaffected.
-  ssh keeps reading command output after stdin EOF; matching that would mean
-  half-closing the stdin path (stop sending) while continuing to drain PTY
-  output until the server disconnects. Discovered during the v0.6.5 Windows
-  input/terminal-restore work; pre-existing, not part of that fix.
+- ~~**Remote command truncated with redirected stdin**~~ **Done in v0.7.5**: the client no
+  longer ends the session when stdin hits EOF while a remote command is running. Note the
+  prescription recorded here — "half-closing the stdin path (stop sending) while continuing
+  to drain PTY output" — turned out to be **necessary but not sufficient**, twice over: the
+  sender must be kept alive (dropping it finishes the QUIC stream and the server ends the
+  session), and `VEOF` must be relayed in-band (a PTY cannot be half-closed, so a
+  stdin-reading command such as `cat` otherwise hangs). See the v0.7.5 section.
+- **`etr` panics when there is no controlling terminal**: `enable_raw_mode().unwrap()` in
+  `src/bin/etr.rs` fails with `ENXIO` when `/dev/tty` cannot be opened — cron, a systemd
+  unit, a CI job, an agent shell — so the user gets a Rust panic message and `exit 101`
+  rather than a diagnostic. Found while reproducing the redirected-stdin bug in v0.7.5,
+  where it masked the real failure with an unrelated one. Fixing it needs a decision about
+  intent: run degraded with no raw mode (reasonable for `etr host 'cmd'`, which may not need
+  a live terminal at all), or fail with a clear message naming the missing tty. Not a
+  reflex `unwrap` removal — the right behaviour differs between the interactive and
+  remote-command cases.
 - ~~**`utmp`/`wtmp` registration**~~ **Done**: `etrs` writes `USER_PROCESS` to utmp
   and wtmp on connect, and `DEAD_PROCESS` on clean shell exit, via `libutempter`
   (`src/login.rs`).  `libutempter` delegates to the setgid-utmp helper

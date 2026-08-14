@@ -130,6 +130,17 @@ seen seq number as the `last_received_seq` watermark for replay on reconnect.
 **Server → client**: PTY output (terminal bytes)  
 **Client → server**: stdin keypresses
 
+**Stdin EOF has no framing of its own.** The stream carries no "stdin is finished"
+marker, and the client must **not** finish its half of the bidi stream to signal one:
+the server treats the client→server direction ending as the session ending and tears
+the connection down, discarding any output still in flight. When the client's local
+stdin reaches EOF while a remote command is running it therefore does two things —
+relays `VEOF` (`0x04`) as ordinary chunk data, then holds the stream open without
+sending further chunks. `VEOF` is what makes the remote side observe EOF at all: the
+server end is a PTY, which cannot be half-closed the way a pipe can, so a reader such
+as `cat` would otherwise block forever. Both are client-side conventions on an
+otherwise unchanged wire format; no tag or field is involved.
+
 ### 5.3 Forward stream (tag `0x03`)
 
 After the tag byte, the client sends a length-prefixed `StreamOpen` proto, then:
