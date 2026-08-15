@@ -9,7 +9,38 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.7.8 — `etrs` actually exits when told to
+## Current state: v0.7.9 — the release checklist no longer deletes the handoff file
+
+New in v0.7.9 (documentation only; no code change, 112 tests unchanged).
+
+- **`AGENTS.md` §4.10 told agents to run a command that destroys `WIP.md`.** The pre-tag
+  hygiene step said to run `git clean -fdx --exclude=target`, describing it as "safe … 
+  gitignored files are not part of any branch's tracked state". On this repo the preview is:
+
+  ```
+  Would remove .claude/
+  Would remove WIP.md          <-- the cross-machine handoff file Part 1 §3 mandates
+  Would remove man/build/
+  ```
+
+  **`WIP.md` is gitignored precisely because it is the Syncthing-synced handoff file**, so
+  the release checklist's own command deletes the file another section of the same document
+  requires you to maintain, along with every note in it. Caught during the v0.7.8 release,
+  and only because the preview output was actually read rather than skimmed.
+- **The original claim was half right, which is what made it dangerous.** Cleaning gitignored
+  files genuinely does not affect other branches or PRs — that part is true. It does affect
+  *state that lives only in gitignored files*, which here is the entire cross-machine
+  handoff. A caveat that is accurate about the thing it names and silent about the thing that
+  matters reads as reassurance.
+- §4.10 now carries the exclusions inline (`--exclude=WIP.md --exclude=.claude`), tells you
+  to read the preview, and steers toward removing known artifacts (`rm -rf man/build`)
+  instead of reaching for a whole-tree clean at all.
+- **Not a Portable Core change, and the siblings were checked rather than assumed:** neither
+  `retch` nor `rusticprofile` has a `git clean` instruction in its `AGENTS.md`, so nothing
+  needs propagating. Both do gitignore `WIP.md`, so either would inherit the hazard if it
+  ever adopted this checklist item.
+
+## Previous: v0.7.8 — `etrs` actually exits when told to
 
 New in v0.7.8 (server fix; 112 unit tests unchanged, one new e2e part).
 

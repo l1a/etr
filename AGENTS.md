@@ -195,11 +195,31 @@ and hard-fails on the first problem:
       files, no staged changes). The tag must only be created from a clean `main`.
 - [ ] Clean up any residual test/profiling artifacts in the working tree before
       tagging: profile captures (`.json.gz`, `*.profdata`), temporary log files,
-      any other gitignored scratch files produced during development. Run
-      `git clean -ndx --exclude=target` to preview what would be removed, then
-      `git clean -fdx --exclude=target` to remove it. This is safe even with
-      multiple branches in progress — gitignored files are not part of any
-      branch's tracked state, so cleaning them never affects other branches or PRs.
+      any other gitignored scratch files produced during development.
+
+      > **`git clean -fdx` WOULD DELETE `WIP.md`. Never run it without the
+      > exclusions below.** `WIP.md` is gitignored *precisely because* it is the
+      > Syncthing-synced cross-machine handoff file that Part 1 §3 requires you to
+      > maintain — so the unguarded command destroys the file another section of
+      > this document mandates, along with every note in it. `.claude/` (local agent
+      > settings) goes the same way. This checklist told agents the command was
+      > "safe … gitignored files are not part of any branch's tracked state" until
+      > 2026-08-15, when a release run's preview showed `Would remove WIP.md` and it
+      > was caught only because the preview was actually read.
+
+      **Always preview, and always read the output:**
+      ```bash
+      git clean -ndx --exclude=target --exclude=WIP.md --exclude=.claude   # preview
+      git clean -fdx --exclude=target --exclude=WIP.md --exclude=.claude   # remove
+      ```
+      Better still for a routine release, remove the specific artifacts you know
+      about (`rm -rf man/build`, `rm -f *.json.gz`) rather than reaching for a
+      whole-tree clean at all. Reserve `git clean` for a tree you have inspected.
+
+      The original claim was half right and that is what made it dangerous:
+      cleaning gitignored files genuinely does not affect other branches or PRs. It
+      does affect *state that lives only in gitignored files*, which on this repo is
+      the entire cross-machine handoff.
 - [ ] `cargo publish` must **never** use `--allow-dirty`. If publish requires that
       flag, stop: something tracked was left uncommitted. Commit or discard it first.
 
