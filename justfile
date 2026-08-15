@@ -486,13 +486,17 @@ e2e-local: check-tools install
     #!/usr/bin/env bash
     set -euo pipefail
 
+    # Reap only what THIS test starts -- never a live session on this machine.
+    source scripts/e2e_procs.sh
+    ETRS_PRE=$(procs_snapshot etrs)
+
     CLIENT_LOG="${XDG_STATE_HOME:-$HOME/.local/state}/etr/etr.log"
 
     cleanup() {
         echo ""
         echo "--- cleanup ---"
         tmux kill-session -t "{{TMUX_SESS}}" 2>/dev/null && echo "killed tmux session {{TMUX_SESS}}" || true
-        pkill -x etrs 2>/dev/null && echo "stopped etrs" || true
+        procs_reap etrs "${ETRS_PRE:-}"
     }
     trap cleanup EXIT
 
@@ -589,6 +593,10 @@ e2e-env-local: check-tools install
     #!/usr/bin/env bash
     set -euo pipefail
 
+    # Reap only what THIS test starts -- never a live session on this machine.
+    source scripts/e2e_procs.sh
+    ETRS_PRE=$(procs_snapshot etrs)
+
     CLIENT_LOG="${XDG_STATE_HOME:-$HOME/.local/state}/etr/etr.log"
     TMUX_SESS_ENV="etr_env_test"
 
@@ -596,7 +604,7 @@ e2e-env-local: check-tools install
         echo ""
         echo "--- cleanup ---"
         tmux kill-session -t "$TMUX_SESS_ENV" 2>/dev/null && echo "killed tmux session $TMUX_SESS_ENV" || true
-        pkill -x etrs 2>/dev/null && echo "stopped etrs" || true
+        procs_reap etrs "${ETRS_PRE:-}"
     }
     trap cleanup EXIT
 
@@ -678,6 +686,10 @@ e2e-cmd-local: check-tools install
     #!/usr/bin/env bash
     set -euo pipefail
 
+    # Reap only what THIS test starts -- never a live session on this machine.
+    source scripts/e2e_procs.sh
+    ETRS_PRE=$(procs_snapshot etrs)
+
     CLIENT_LOG="${XDG_STATE_HOME:-$HOME/.local/state}/etr/etr.log"
     TMUX_SESS_CMD="etr_cmd_test"
     SENTINEL="CMD_TEST_SENTINEL_$$"
@@ -686,7 +698,7 @@ e2e-cmd-local: check-tools install
         echo ""
         echo "--- cleanup ---"
         tmux kill-session -t "$TMUX_SESS_CMD" 2>/dev/null && echo "killed tmux session $TMUX_SESS_CMD" || true
-        pkill -x etrs 2>/dev/null && echo "stopped etrs" || true
+        procs_reap etrs "${ETRS_PRE:-}"
     }
     trap cleanup EXIT
 
@@ -940,7 +952,7 @@ e2e-cmd-local: check-tools install
     # blame this one for the survivor. (That is exactly what the first version of
     # this check did -- it reported an orphaned command while the process it had
     # actually killed was somebody else's.)
-    BEFORE_PIDS=" $(pgrep -x -u "$(id -u)" etrs 2>/dev/null | tr '\n' ' ') "
+    BEFORE_PIDS=$(procs_snapshot etrs)
     "{{PY}}" "$NOTTY_HELPER" \
         "exec {{INSTALL}}/etr localhost 'sleep 300' </dev/null >/dev/null 2>&1 &
          sleep 6; exit 0" >/dev/null 2>&1 || true
@@ -998,6 +1010,10 @@ e2e-forward-local: check-tools install
     #!/usr/bin/env bash
     set -euo pipefail
 
+    # Reap only what THIS test starts -- never a live session on this machine.
+    source scripts/e2e_procs.sh
+    ETRS_PRE=$(procs_snapshot etrs)
+
     CLIENT_LOG="${XDG_STATE_HOME:-$HOME/.local/state}/etr/etr.log"
     TMUX_FORWARD="etr_forward_test"
     TCP_ECHO_PORT=19321
@@ -1010,7 +1026,7 @@ e2e-forward-local: check-tools install
         echo "--- cleanup ---"
         kill "${TCP_ECHO_PID:-}" "${UDP_ECHO_PID:-}" 2>/dev/null || true
         tmux kill-session -t "$TMUX_FORWARD" 2>/dev/null || true
-        pkill -x etrs 2>/dev/null || true
+        procs_reap etrs "${ETRS_PRE:-}"
     }
     trap cleanup EXIT
 
@@ -1178,6 +1194,10 @@ e2e-reverse-local: check-tools install
     #!/usr/bin/env bash
     set -euo pipefail
 
+    # Reap only what THIS test starts -- never a live session on this machine.
+    source scripts/e2e_procs.sh
+    ETRS_PRE=$(procs_snapshot etrs)
+
     CLIENT_LOG="${XDG_STATE_HOME:-$HOME/.local/state}/etr/etr.log"
     TMUX_REVERSE="etr_reverse_test"
     TCP_LOCAL_PORT=19301
@@ -1190,7 +1210,7 @@ e2e-reverse-local: check-tools install
         echo "--- cleanup ---"
         kill "${TCP_ECHO_PID:-}" "${UDP_ECHO_PID:-}" 2>/dev/null || true
         tmux kill-session -t "$TMUX_REVERSE" 2>/dev/null || true
-        pkill -x etrs 2>/dev/null || true
+        procs_reap etrs "${ETRS_PRE:-}"
     }
     trap cleanup EXIT
 
@@ -1372,6 +1392,10 @@ e2e-udp-concurrent: check-tools install
     #!/usr/bin/env bash
     set -euo pipefail
 
+    # Reap only what THIS test starts -- never a live session on this machine.
+    source scripts/e2e_procs.sh
+    ETRS_PRE=$(procs_snapshot etrs)
+
     CLIENT_LOG="${XDG_STATE_HOME:-$HOME/.local/state}/etr/etr.log"
     TMUX_CONC="etr_udp_concurrent"
     UDP_ECHO_PORT=19341
@@ -1382,7 +1406,7 @@ e2e-udp-concurrent: check-tools install
         echo "--- cleanup ---"
         kill "${UDP_ECHO_PID:-}" 2>/dev/null || true
         tmux kill-session -t "$TMUX_CONC" 2>/dev/null || true
-        pkill -x etrs 2>/dev/null || true
+        procs_reap etrs "${ETRS_PRE:-}"
     }
     trap cleanup EXIT
 
@@ -1441,6 +1465,11 @@ stress-local: check-tools install build-stress
     #!/usr/bin/env bash
     set -euo pipefail
 
+    # Reap only what THIS test starts -- never a live session on this machine.
+    source scripts/e2e_procs.sh
+    ETRS_PRE=$(procs_snapshot etrs)
+    STRESS_PRE=$(procs_snapshot stress_tool)
+
     TCP_ECHO_PORT=19292   # -L: remote TCP echo target
     TCP_FWD_PORT=19291    # -L: local listener
     UDP_ECHO_PORT=19294   # -L: remote UDP echo target
@@ -1464,16 +1493,16 @@ stress-local: check-tools install build-stress
         echo "--- cleanup ---"
         kill "$TCP_ECHO_PID" "$UDP_ECHO_PID" "$TCP_PUMP_PID" "$UDP_PUMP_PID" \
              "$TCP_R_ECHO_PID" "$UDP_R_ECHO_PID" "$TCP_R_PUMP_PID" "$UDP_R_PUMP_PID" 2>/dev/null || true
-        pkill -x stress_tool 2>/dev/null || true
+        procs_reap stress_tool "${STRESS_PRE:-}"
         tmux kill-session -t "$STRESS_SESS" 2>/dev/null || true
-        pkill -x etrs 2>/dev/null || true
+        procs_reap etrs "${ETRS_PRE:-}"
         rm -f "$TCP_PUMP_OUT" "$UDP_PUMP_OUT" "$TCP_R_PUMP_OUT" "$UDP_R_PUMP_OUT"
     }
     trap cleanup EXIT
 
     # Kill any stress_tool processes left over from a previous crashed run so
     # their ports are free before we try to bind them.
-    pkill -x stress_tool 2>/dev/null || true
+    procs_reap stress_tool "${STRESS_PRE:-}"
     sleep 0.3
 
     mkdir -p "$(dirname "{{LOG_FILE}}")"

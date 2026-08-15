@@ -33,6 +33,17 @@ New in v0.7.8 (server fix; 112 unit tests unchanged, one new e2e part).
   an expired interactive session exits cleanly and still leaves
   `ktobias pts/3 ::1 via etr … gone - no logout` in utmp. Both arms now record it.
 
+- **The seven e2e cleanup traps no longer `pkill -x etrs`.** v0.7.7 fixed that footgun in
+  `just clean` and left it in six e2e recipes plus `stress-local`, where it is worse: running
+  a test suite is not a request to drop your sessions, and unlike `clean` there is no reading
+  of "e2e-local" that includes it. Each recipe now snapshots the matching pids **before** it
+  starts anything (`scripts/e2e_procs.sh`, sourced) and reaps only what appeared since.
+  Matching by *name* cannot tell a leftover from somebody's live session; a pid that did not
+  exist a moment ago can only be ours. `stress-local` gets the same treatment for
+  `stress_tool`. SIGTERM first, SIGKILL only for stragglers — and since this release `etrs`
+  exits promptly on SIGTERM, the escalation firing is now itself a signal that teardown has
+  regressed.
+
 ### What made this hard to see, and what I got wrong first
 
 - **It looked like "`etrs` ignores SIGTERM". It does not.** The handler fires every time and
@@ -57,6 +68,13 @@ New in v0.7.8 (server fix; 112 unit tests unchanged, one new e2e part).
 - **`std::process::exit()` is not an option here**, though it would fix the hang in one line:
   `X11Cleanup::drop` removes `/tmp/.X11-unix/X<n>` and two xauth entries, and skipping
   destructors would leak both per X11-forwarded session.
+- **A verification that passed for the wrong reason, caught only by re-checking it.** The
+  test for "a live session survives a full e2e run" checks the session's pid immediately
+  after the recipe returns — but `pkill` sends SIGTERM and `etrs` takes ~0.3 s to die, so the
+  **negative** control observed a dying process as alive and reported that the *old,
+  dangerous* code was safe. A four-second settle makes it fail correctly. Without re-running
+  the control, this would have shipped as "verified" on a verification that could not fail.
+  Same family as the `ls`/`eza` and `$pipestatus` entries in `~/AGENTS.md`.
 - *Correction to v0.7.7 below:* that section says `etrs` "may not exit on SIGTERM when idle"
   and speculates that stale utmp entries outlive killed servers "the exact problem the v0.4.7
   work set out to fix". Both were wrong as stated — the handler is not the problem, and the
