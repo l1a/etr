@@ -486,13 +486,17 @@ e2e-local: check-tools install
     #!/usr/bin/env bash
     set -euo pipefail
 
+    # Reap only what THIS test starts -- never a live session on this machine.
+    source scripts/e2e_procs.sh
+    ETRS_PRE=$(procs_snapshot etrs)
+
     CLIENT_LOG="${XDG_STATE_HOME:-$HOME/.local/state}/etr/etr.log"
 
     cleanup() {
         echo ""
         echo "--- cleanup ---"
         tmux kill-session -t "{{TMUX_SESS}}" 2>/dev/null && echo "killed tmux session {{TMUX_SESS}}" || true
-        pkill -x etrs 2>/dev/null && echo "stopped etrs" || true
+        procs_reap etrs "${ETRS_PRE:-}"
     }
     trap cleanup EXIT
 
@@ -589,6 +593,10 @@ e2e-env-local: check-tools install
     #!/usr/bin/env bash
     set -euo pipefail
 
+    # Reap only what THIS test starts -- never a live session on this machine.
+    source scripts/e2e_procs.sh
+    ETRS_PRE=$(procs_snapshot etrs)
+
     CLIENT_LOG="${XDG_STATE_HOME:-$HOME/.local/state}/etr/etr.log"
     TMUX_SESS_ENV="etr_env_test"
 
@@ -596,7 +604,7 @@ e2e-env-local: check-tools install
         echo ""
         echo "--- cleanup ---"
         tmux kill-session -t "$TMUX_SESS_ENV" 2>/dev/null && echo "killed tmux session $TMUX_SESS_ENV" || true
-        pkill -x etrs 2>/dev/null && echo "stopped etrs" || true
+        procs_reap etrs "${ETRS_PRE:-}"
     }
     trap cleanup EXIT
 
@@ -678,6 +686,10 @@ e2e-cmd-local: check-tools install
     #!/usr/bin/env bash
     set -euo pipefail
 
+    # Reap only what THIS test starts -- never a live session on this machine.
+    source scripts/e2e_procs.sh
+    ETRS_PRE=$(procs_snapshot etrs)
+
     CLIENT_LOG="${XDG_STATE_HOME:-$HOME/.local/state}/etr/etr.log"
     TMUX_SESS_CMD="etr_cmd_test"
     SENTINEL="CMD_TEST_SENTINEL_$$"
@@ -686,7 +698,7 @@ e2e-cmd-local: check-tools install
         echo ""
         echo "--- cleanup ---"
         tmux kill-session -t "$TMUX_SESS_CMD" 2>/dev/null && echo "killed tmux session $TMUX_SESS_CMD" || true
-        pkill -x etrs 2>/dev/null && echo "stopped etrs" || true
+        procs_reap etrs "${ETRS_PRE:-}"
     }
     trap cleanup EXIT
 
@@ -925,6 +937,69 @@ e2e-cmd-local: check-tools install
         exit 1
     fi
     echo "    PASS: refused with a diagnostic naming the missing terminal (rc=${INT_RC})."
+
+    # ── 8. Teardown must not wait for the remote command ─────────────────────
+    # Regression test for the v0.7.8 fix. Two spawn_blocking tasks -- the PTY reader
+    # and the child waiter -- only finish when the shell exits, and Runtime::drop
+    # waits for blocking tasks. Worse, the reader holds a PTY master clone, so the
+    # PTY could never hang up on its own: a self-sustaining deadlock. etrs therefore
+    # outlived its own "shutting down" log line for as long as the command ran --
+    # forever, for a long-running one. Interactive sessions were unaffected (a login
+    # shell exits by itself), which is why this hid for so long.
+    echo "==> Part 7: SIGTERM must tear the server down, not wait for the command..."
+    # Identify THIS test's server by diffing the pid set, not `pgrep | head -1`:
+    # picking an arbitrary etrs can signal a different session entirely and then
+    # blame this one for the survivor. (That is exactly what the first version of
+    # this check did -- it reported an orphaned command while the process it had
+    # actually killed was somebody else's.)
+    BEFORE_PIDS=$(procs_snapshot etrs)
+    "{{PY}}" "$NOTTY_HELPER" \
+        "exec {{INSTALL}}/etr localhost 'sleep 300' </dev/null >/dev/null 2>&1 &
+         sleep 6; exit 0" >/dev/null 2>&1 || true
+
+    ETRS_TD=""
+    for p in $(pgrep -x -u "$(id -u)" etrs 2>/dev/null || true); do
+        [[ "$BEFORE_PIDS" == *" $p "* ]] || { ETRS_TD="$p"; break; }
+    done
+    if [[ -z "$ETRS_TD" ]]; then
+        echo "SKIP: no new etrs to signal (session did not start)." >&2
+    else
+        # Its child is the remote command; track that pid rather than matching on
+        # a command name, which would also catch unrelated sleeps.
+        CMD_PID=$(pgrep -P "$ETRS_TD" 2>/dev/null | head -1 || true)
+        TD_START=$(date +%s)
+        kill -TERM "$ETRS_TD" 2>/dev/null || true
+        TD_GONE=0
+        for _ in $(seq 1 30); do
+            kill -0 "$ETRS_TD" 2>/dev/null || { TD_GONE=1; break; }
+            sleep 0.5
+        done
+        TD_ELAPSED=$(( $(date +%s) - TD_START ))
+        if [[ $TD_GONE -eq 0 ]]; then
+            echo "FAIL: etrs still alive ${TD_ELAPSED}s after SIGTERM -- teardown is" >&2
+            echo "      blocked on the remote command (sleep 300) instead of exiting." >&2
+            kill -9 "$ETRS_TD" 2>/dev/null || true
+            rm -f "$PTY_HELPER" "$OUT_FILE" "$NOTTY_HELPER"
+            exit 1
+        fi
+        echo "    PASS: etrs exited ${TD_ELAPSED}s after SIGTERM, with the command still running."
+        # The command must not be left behind either -- checked by pid, and only if
+        # we managed to identify it.
+        if [[ -n "$CMD_PID" ]]; then
+            CMD_GONE=0
+            for _ in $(seq 1 10); do
+                kill -0 "$CMD_PID" 2>/dev/null || { CMD_GONE=1; break; }
+                sleep 0.5
+            done
+            if [[ $CMD_GONE -eq 0 ]]; then
+                echo "FAIL: the remote command (pid ${CMD_PID}) outlived the server." >&2
+                kill -9 "$CMD_PID" 2>/dev/null || true
+                rm -f "$PTY_HELPER" "$OUT_FILE" "$NOTTY_HELPER"
+                exit 1
+            fi
+            echo "    PASS: the remote command was hung up with the session."
+        fi
+    fi
     rm -f "$PTY_HELPER" "$OUT_FILE" "$NOTTY_HELPER"
 
     echo ""
@@ -934,6 +1009,10 @@ e2e-cmd-local: check-tools install
 e2e-forward-local: check-tools install
     #!/usr/bin/env bash
     set -euo pipefail
+
+    # Reap only what THIS test starts -- never a live session on this machine.
+    source scripts/e2e_procs.sh
+    ETRS_PRE=$(procs_snapshot etrs)
 
     CLIENT_LOG="${XDG_STATE_HOME:-$HOME/.local/state}/etr/etr.log"
     TMUX_FORWARD="etr_forward_test"
@@ -947,7 +1026,7 @@ e2e-forward-local: check-tools install
         echo "--- cleanup ---"
         kill "${TCP_ECHO_PID:-}" "${UDP_ECHO_PID:-}" 2>/dev/null || true
         tmux kill-session -t "$TMUX_FORWARD" 2>/dev/null || true
-        pkill -x etrs 2>/dev/null || true
+        procs_reap etrs "${ETRS_PRE:-}"
     }
     trap cleanup EXIT
 
@@ -1115,6 +1194,10 @@ e2e-reverse-local: check-tools install
     #!/usr/bin/env bash
     set -euo pipefail
 
+    # Reap only what THIS test starts -- never a live session on this machine.
+    source scripts/e2e_procs.sh
+    ETRS_PRE=$(procs_snapshot etrs)
+
     CLIENT_LOG="${XDG_STATE_HOME:-$HOME/.local/state}/etr/etr.log"
     TMUX_REVERSE="etr_reverse_test"
     TCP_LOCAL_PORT=19301
@@ -1127,7 +1210,7 @@ e2e-reverse-local: check-tools install
         echo "--- cleanup ---"
         kill "${TCP_ECHO_PID:-}" "${UDP_ECHO_PID:-}" 2>/dev/null || true
         tmux kill-session -t "$TMUX_REVERSE" 2>/dev/null || true
-        pkill -x etrs 2>/dev/null || true
+        procs_reap etrs "${ETRS_PRE:-}"
     }
     trap cleanup EXIT
 
@@ -1309,6 +1392,10 @@ e2e-udp-concurrent: check-tools install
     #!/usr/bin/env bash
     set -euo pipefail
 
+    # Reap only what THIS test starts -- never a live session on this machine.
+    source scripts/e2e_procs.sh
+    ETRS_PRE=$(procs_snapshot etrs)
+
     CLIENT_LOG="${XDG_STATE_HOME:-$HOME/.local/state}/etr/etr.log"
     TMUX_CONC="etr_udp_concurrent"
     UDP_ECHO_PORT=19341
@@ -1319,7 +1406,7 @@ e2e-udp-concurrent: check-tools install
         echo "--- cleanup ---"
         kill "${UDP_ECHO_PID:-}" 2>/dev/null || true
         tmux kill-session -t "$TMUX_CONC" 2>/dev/null || true
-        pkill -x etrs 2>/dev/null || true
+        procs_reap etrs "${ETRS_PRE:-}"
     }
     trap cleanup EXIT
 
@@ -1378,6 +1465,11 @@ stress-local: check-tools install build-stress
     #!/usr/bin/env bash
     set -euo pipefail
 
+    # Reap only what THIS test starts -- never a live session on this machine.
+    source scripts/e2e_procs.sh
+    ETRS_PRE=$(procs_snapshot etrs)
+    STRESS_PRE=$(procs_snapshot stress_tool)
+
     TCP_ECHO_PORT=19292   # -L: remote TCP echo target
     TCP_FWD_PORT=19291    # -L: local listener
     UDP_ECHO_PORT=19294   # -L: remote UDP echo target
@@ -1401,16 +1493,16 @@ stress-local: check-tools install build-stress
         echo "--- cleanup ---"
         kill "$TCP_ECHO_PID" "$UDP_ECHO_PID" "$TCP_PUMP_PID" "$UDP_PUMP_PID" \
              "$TCP_R_ECHO_PID" "$UDP_R_ECHO_PID" "$TCP_R_PUMP_PID" "$UDP_R_PUMP_PID" 2>/dev/null || true
-        pkill -x stress_tool 2>/dev/null || true
+        procs_reap stress_tool "${STRESS_PRE:-}"
         tmux kill-session -t "$STRESS_SESS" 2>/dev/null || true
-        pkill -x etrs 2>/dev/null || true
+        procs_reap etrs "${ETRS_PRE:-}"
         rm -f "$TCP_PUMP_OUT" "$UDP_PUMP_OUT" "$TCP_R_PUMP_OUT" "$UDP_R_PUMP_OUT"
     }
     trap cleanup EXIT
 
     # Kill any stress_tool processes left over from a previous crashed run so
     # their ports are free before we try to bind them.
-    pkill -x stress_tool 2>/dev/null || true
+    procs_reap stress_tool "${STRESS_PRE:-}"
     sleep 0.3
 
     mkdir -p "$(dirname "{{LOG_FILE}}")"

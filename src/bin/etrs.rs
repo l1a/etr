@@ -556,6 +556,12 @@ async fn run_session(
     // Shell-exit signal: set to true when the child shell exits.
     let (shell_exit_tx, shell_exit_rx) = tokio::sync::watch::channel(false);
 
+    // Captured before `child` moves into the watcher task below, because teardown
+    // needs to be able to hang the shell up and the watcher owns the handle from
+    // here on.  See `hangup_child` at the end of the reconnect loop for why simply
+    // dropping the PTY is not enough.
+    let child_pid = child.process_id();
+
     // Shell-exit watcher: sends Disconnect on the control stream when the shell exits.
     {
         let outbound_ctrl_tx = Arc::clone(&outbound_ctrl_tx);
@@ -637,12 +643,29 @@ async fn run_session(
             res = tokio::time::timeout(reconnect_window, endpoint.accept()) => {
                 match res {
                     Ok(Some(inc)) => inc,
+                    // These two arms used to `break` without recording a logout, unlike
+                    // every other exit from this loop (SIGTERM and SIGHUP above, the
+                    // shell-exit watcher, and the signal path inside the session). The
+                    // result was a utmp entry left behind on the single most likely way
+                    // for a session to end -- the user walking away. Measured: an expired
+                    // interactive session exits cleanly and still leaves
+                    // `ktobias pts/3 ::1 via etr … gone - no logout` in utmp.
                     Ok(None) => {
                         vlog!(1, "[etrs] endpoint closed");
+                        if let Some(fd) = master_fd {
+                            tokio::task::spawn_blocking(move || login::record_logout(fd))
+                                .await
+                                .ok();
+                        }
                         break;
                     }
                     Err(_) => {
                         vlog!(1, "[etrs] reconnect window expired, shutting down");
+                        if let Some(fd) = master_fd {
+                            tokio::task::spawn_blocking(move || login::record_logout(fd))
+                                .await
+                                .ok();
+                        }
                         break;
                     }
                 }
@@ -717,7 +740,78 @@ async fn run_session(
         }
     }
 
+    // Every path out of the loop above lands here. If the shell is still running,
+    // hang it up before returning -- otherwise this process cannot exit at all.
+    if !*shell_exit_rx.borrow() {
+        hangup_child(child_pid).await;
+    }
+
     Ok(())
+}
+
+/// Hang up the session's shell so `run_session` can actually return.
+///
+/// **This is not tidiness, it is the difference between exiting and not.** Dropping
+/// the runtime waits for `spawn_blocking` tasks, and two of them — the PTY reader
+/// blocked in `read()` on the master, and the watcher blocked in `child.wait()` —
+/// only finish when the shell exits. Worse, they *cause* the condition they wait on:
+/// the reader holds a clone of the PTY master, so the master is never fully dropped,
+/// so the kernel never sends a hangup, so the shell never exits. A self-sustaining
+/// deadlock, and the reason the PTY closing cannot be relied on to break it.
+///
+/// Measured before this existed: `etr host 'sleep 600'`, SIGTERM at t=2s into a 12s
+/// shell, process exited 9.7s later — exactly when the shell ended, not when it was
+/// asked to stop. With a long-running command it never exited at all. Interactive
+/// sessions were unaffected, because a login shell exits on its own and breaks the
+/// cycle; that asymmetry is what made this look like "SIGTERM is ignored".
+///
+/// `SIGHUP` to the **process group**, which is what a real terminal hangup delivers,
+/// so the shell and anything it started in the foreground all get it. portable_pty
+/// puts the child in its own session, so its pgid equals its pid.
+///
+/// SIGHUP alone is not sufficient and this was verified rather than assumed: a command
+/// that installs `SIG_IGN` for SIGHUP kept the process alive past 25 s. Since the whole
+/// point is that this function must always succeed, it escalates to `SIGKILL`, which
+/// cannot be ignored.
+#[cfg(unix)]
+async fn hangup_child(child_pid: Option<u32>) {
+    use nix::sys::signal::{Signal, killpg};
+    use nix::unistd::Pid;
+
+    let Some(pid) = child_pid else {
+        return;
+    };
+    let pgid = Pid::from_raw(pid as i32);
+    vlog!(
+        1,
+        "[etrs] hanging up shell (pgid {pid}) so teardown can complete"
+    );
+    // ESRCH just means it already exited between the check and here -- not an error.
+    let _ = killpg(pgid, Signal::SIGHUP);
+
+    // Well-behaved shells and commands are gone well inside this window; the loop
+    // exits as soon as the group does, so the common case costs one 50 ms tick.
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        if killpg(pgid, None).is_err() {
+            return; // group gone
+        }
+    }
+
+    // Still there after a second: it is ignoring SIGHUP.
+    //
+    // The theoretical hazard is pid reuse -- once the watcher reaps the child, this
+    // pgid could in principle name something else. The window is the second above, the
+    // probe immediately before means the group still existed at the end of it, and
+    // Linux allocates pids sequentially across a 4M space, so reuse inside a second
+    // would need millions of intervening spawns. This is the same SIGHUP-then-SIGKILL
+    // escalation sshd, tmux and systemd all perform, and the alternative -- a process
+    // that never exits -- is the defect being fixed.
+    vlog!(
+        1,
+        "[etrs] shell ignored SIGHUP; sending SIGKILL to pgid {pid}"
+    );
+    let _ = killpg(pgid, Signal::SIGKILL);
 }
 
 type PtyTx = Arc<std::sync::Mutex<Option<mpsc::Sender<(u64, Vec<u8>)>>>>;
