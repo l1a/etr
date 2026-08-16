@@ -85,6 +85,8 @@ Arguments:
 
 Options:
   -s, --ssh-port <PORT>          SSH port [default: 22]
+  -4, --prefer-ipv4              Prefer IPv4 (falls back to IPv6)
+  -6, --prefer-ipv6              Prefer IPv6 (falls back to IPv4)
   -L <[local_port:]host:port[/udp]>
                                  Forward a local port to a remote address (repeatable)
   -R <[remote_port:]host:port[/udp]>
@@ -109,6 +111,24 @@ Verbose logs go to `~/.local/state/etr/etr.log` by default during a live session
 - **Reliable ordered delivery** — no dropped or reordered packets reach the application
 - **Multiplexed streams** — PTY and each port-forward run on independent QUIC streams; a slow forward cannot stall the terminal
 - **Congestion control** — built-in; no hand-rolled flow control needed
+
+## IPv4 / IPv6
+
+Both binaries are dual-stack: `etrs` binds `[::]` by default, which also serves IPv4
+clients, and `etr` connects over whichever family the resolver returns first.
+
+`-4`/`--prefer-ipv4` and `-6`/`--prefer-ipv6` change which family is tried first — for the
+SSH bootstrap, the QUIC session, and forward targets on both sides:
+
+```bash
+etr -6 user@example.com                       # prefer IPv6 for this session
+etr -4 -L 5432:db.internal:5432 user@jumphost # …and for the forward's target on the server
+```
+
+Unlike `ssh -4`/`-6`, these are a **preference, not a restriction**: if the host has no
+address of the requested family, or none the kernel can route to, `etr` uses the other
+family and says so at `-v` rather than failing. Config equivalent: `address_family` under
+`[client]` (and `[server]` for a manually started `etrs`).
 
 ## Reconnect behaviour
 
@@ -193,6 +213,7 @@ Optional TOML config at `~/.config/etr/config.toml`:
 [client]
 ssh_port = 22                        # default SSH port
 server_path = "/usr/local/bin/etrs"  # path to etrs on remote hosts
+address_family = "auto"              # "ipv4" / "ipv6" / "auto" — same as -4 / -6
 log_path = "/tmp/client.log"         # path to the client log file
 server_log_path = "/tmp/server.log"  # path to the server log file on remote host
 env = ["COLORTERM", "EDITOR=nvim"]   # variables to set/forward in the remote shell

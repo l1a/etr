@@ -45,6 +45,26 @@ SSH channel and pinned for subsequent QUIC connections.
 :   SSH port to use for the initial bootstrap connection. Defaults to 22,
     or the value of **ssh_port** in the config file.
 
+**-4**, **\-\-prefer-ipv4**
+:   Prefer IPv4 when the host resolves to both families.
+
+**-6**, **\-\-prefer-ipv6**
+:   Prefer IPv6 when the host resolves to both families.
+
+    These are a **preference, not a restriction** — unlike **ssh**(1)'s
+    **-4**/**-6**. The requested family is tried first for the SSH bootstrap,
+    the QUIC session, and the targets of **-R** forwards; the other family is
+    still used when the host has no address of the preferred one, or has one
+    the kernel cannot route to. **etr** therefore never fails purely because
+    the requested family was unavailable, and the fallback is reported at
+    **-v**.
+
+    The preference is also sent to **etrs**(1), which applies it when
+    resolving the targets of **-L** forwards on its own side.
+
+    The two flags are mutually exclusive. Config file equivalent:
+    **address_family** under **\[client\]**.
+
 **-v**
 :   Increase verbosity. May be repeated up to three times:
 
@@ -145,6 +165,9 @@ ssh_port = 22
 # Path to etrs on remote hosts (default: "etrs", relies on PATH)
 server_path = "/usr/local/bin/etrs"
 
+# Which IP version to try first: "ipv4", "ipv6" or "auto" (default)
+address_family = "auto"
+
 # Default path to the client log file
 log_path = "/tmp/client.log"
 
@@ -205,6 +228,11 @@ Connect on a non-standard SSH port:
 Connect with verbose logging:
 
     etr -vv user@example.com
+
+Prefer IPv6 for a dual-stack host (falls back to IPv4 if there is no
+usable IPv6 address):
+
+    etr -6 user@example.com
 
 Forward a local port to a remote database:
 

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 
+use etr::addrfam::AddrPref;
 use etr::config::Config;
 use etr::forward::ForwardSpec;
 #[cfg(unix)]
@@ -326,6 +327,18 @@ struct Cli {
     #[arg(short = 'v', action = ArgAction::Count)]
     verbose: u8,
 
+    /// Prefer IPv4 when the host resolves to both families.
+    /// A preference, not a restriction: IPv6 is still used if the host has no
+    /// IPv4 address or none is routable.
+    #[arg(short = '4', long, conflicts_with = "prefer_ipv6")]
+    prefer_ipv4: bool,
+
+    /// Prefer IPv6 when the host resolves to both families.
+    /// A preference, not a restriction: IPv4 is still used if the host has no
+    /// IPv6 address or none is routable.
+    #[arg(short = '6', long, conflicts_with = "prefer_ipv4")]
+    prefer_ipv6: bool,
+
     /// Path to the etrs binary on the remote host (default: relies on PATH)
     #[arg(long)]
     server_path: Option<String>,
@@ -513,6 +526,12 @@ async fn main() -> io::Result<()> {
     let ssh_port = cli
         .ssh_port
         .unwrap_or_else(|| cfg.client.ssh_port.unwrap_or(22));
+
+    // CLI flags win over [client] address_family; both default to Auto, which
+    // leaves every resolution path behaving exactly as it did before -4/-6 existed.
+    let addr_pref = AddrPref::from_flags(cli.prefer_ipv4, cli.prefer_ipv6)
+        .or(AddrPref::from_config(cfg.client.address_family.as_deref()));
+
     let server_path = cli
         .server_path
         .or(cfg.client.server_path)
@@ -622,6 +641,33 @@ async fn main() -> io::Result<()> {
 
     let remote_command: String = cli.command.join(" ");
 
+    // `ssh -4`/`-6` are restrictions, not preferences: passing one for a family
+    // the target does not have turns `etr -6 host` into a bootstrap failure
+    // instead of a fallback.  So resolve first and only pass the flag when the
+    // host really has an address of that family.  A host that does not resolve
+    // locally (an ssh_config `Host` alias, say) gets no flag, leaving ssh's own
+    // resolution untouched.
+    let host_for_lookup = match target.find('@') {
+        Some(idx) => &target[idx + 1..],
+        None => target.as_str(),
+    };
+    let ssh_family_flag = if addr_pref == AddrPref::Auto {
+        None
+    } else if etr::addrfam::family_available(&format!("{host_for_lookup}:{ssh_port}"), addr_pref)
+        .await
+    {
+        addr_pref.ssh_flag()
+    } else {
+        vlog!(
+            cli.verbose,
+            1,
+            "[etr] {} requested, but {host_for_lookup} has no such address — \
+             letting ssh choose the family",
+            addr_pref.as_str()
+        );
+        None
+    };
+
     let x11_enabled = cli.x11
         || cli.x11_trusted
         || cfg.client.x11.unwrap_or(false)
@@ -644,6 +690,8 @@ async fn main() -> io::Result<()> {
             Some(remote_command.as_str())
         },
         x11_enabled,
+        ssh_family_flag,
+        addr_pref,
         cli.verbose,
     ) {
         Ok(r) => r,
@@ -702,6 +750,7 @@ async fn main() -> io::Result<()> {
         x11_enabled,
         x11_auth_proto,
         x11_auth_cookie,
+        addr_pref,
         cli.verbose,
     )
     .await
@@ -753,6 +802,8 @@ fn bootstrap_ssh(
     env_vars: &[String],
     remote_command: Option<&str>,
     x11_enabled: bool,
+    ssh_family_flag: Option<&str>,
+    addr_pref: AddrPref,
     verbose: u8,
 ) -> io::Result<(u16, Vec<u8>)> {
     let session_id_hex = hex_encode(session_id);
@@ -761,7 +812,13 @@ fn bootstrap_ssh(
         n => format!("-{}", "v".repeat(n as usize)),
     };
     let mut cmd = Command::new("ssh");
-    cmd.arg("-p").arg(ssh_port.to_string()).arg(target);
+    cmd.arg("-p").arg(ssh_port.to_string());
+    // Only set when the caller has already confirmed the target has an address
+    // of that family — see the call site.
+    if let Some(flag) = ssh_family_flag {
+        cmd.arg(flag);
+    }
+    cmd.arg(target);
     cmd.arg(server_path);
     if let Some(log_path) = server_log_path {
         cmd.arg("--log-path").arg(log_path);
@@ -785,6 +842,12 @@ fn bootstrap_ssh(
     }
     if x11_enabled {
         stdin.write_all(b"ETRX11:true\n")?;
+    }
+    // Tell the server which family to prefer when it resolves `-L` targets, which
+    // it does on its own side.  Old servers skip the line (it has no `=`), so
+    // this stays compatible in both directions.
+    if let Some(v) = addr_pref.wire() {
+        stdin.write_all(format!("ETRPREFER:{v}\n").as_bytes())?;
     }
     if let Some(cmd) = remote_command {
         stdin.write_all(format!("ETRCMD:{cmd}\n").as_bytes())?;
@@ -836,6 +899,7 @@ async fn run_connection_loop(
     x11_enabled: bool,
     x11_auth_proto: String,
     x11_auth_cookie: Vec<u8>,
+    addr_pref: AddrPref,
     verbose: u8,
 ) -> io::Result<()> {
     // Snapshot the console's original modes/codepage before anything (raw mode,
@@ -847,15 +911,25 @@ async fn run_connection_loop(
     } else {
         &target
     };
-    let server_addr = tokio::net::lookup_host(format!("{host}:{port}"))
-        .await?
-        .next()
+    // Pick the QUIC peer address: preferred family first, and among the
+    // candidates the first the kernel actually has a route to.  The routing
+    // probe matters even without a flag — a host whose AAAA record comes back
+    // first on a machine with no IPv6 route used to fail the connect outright
+    // instead of falling through to the A record.
+    let server_addr = etr::addrfam::resolve_preferred(&format!("{host}:{port}"), addr_pref)
+        .await
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("could not resolve host: {host}"),
             )
         })?;
+    vlog!(
+        verbose,
+        2,
+        "[etr] server address {server_addr} (family preference: {})",
+        addr_pref.as_str()
+    );
 
     // Build QUIC client endpoint + config (reused across reconnects).
     let cert = rustls::pki_types::CertificateDer::from(server_cert);
@@ -1100,6 +1174,7 @@ async fn run_connection_loop(
                 x11_auth_proto.clone(),
                 x11_auth_cookie.clone(),
                 has_remote_command,
+                addr_pref,
                 verbose,
             ) => r,
             Ok(_) = escape_rx.wait_for(|&v| v) => {
@@ -1160,6 +1235,9 @@ async fn run_session(
     // Controls whether stdin reaching EOF ends the session — see the
     // wait-for-completion `select!` at the end of this function.
     has_remote_command: bool,
+    // `-4`/`-6`: which family to try first when resolving the local targets of
+    // `-R` reverse forwards, which are resolved on this side.
+    addr_pref: AddrPref,
     verbose: u8,
 ) -> io::Result<()> {
     // ── Open control stream ───────────────────────────────────────────────
@@ -1545,9 +1623,9 @@ async fn run_session(
                 match proto {
                     ForwardProto::Tcp => {
                         let addr = format!("{}:{}", so.remote_host, so.remote_port);
-                        use tokio::net::TcpStream;
                         vlog!(verbose, 2, "[etr] connecting to local TCP target {addr}");
-                        let tcp = match TcpStream::connect(&addr).await {
+                        let tcp = match etr::forward::connect_tcp_preferred(&addr, addr_pref).await
+                        {
                             Ok(t) => t,
                             Err(e) => {
                                 vlog!(
@@ -1564,7 +1642,7 @@ async fn run_session(
                     ForwardProto::Udp => {
                         let addr_str = format!("{}:{}", so.remote_host, so.remote_port);
                         let addr: std::net::SocketAddr =
-                            match etr::forward::resolve_udp_target(&addr_str).await {
+                            match etr::forward::resolve_udp_target(&addr_str, addr_pref).await {
                                 Some(a) => a,
                                 None => {
                                     vlog!(
@@ -2200,6 +2278,77 @@ mod tests {
     fn test_ssh_port_override() {
         let cli = Cli::try_parse_from(["etr", "-s", "2222", "host"]).unwrap();
         assert_eq!(cli.ssh_port, Some(2222));
+    }
+
+    #[test]
+    fn test_prefer_family_flags_default_to_auto() {
+        let cli = Cli::try_parse_from(["etr", "host"]).unwrap();
+        assert!(!cli.prefer_ipv4);
+        assert!(!cli.prefer_ipv6);
+        assert_eq!(
+            AddrPref::from_flags(cli.prefer_ipv4, cli.prefer_ipv6),
+            AddrPref::Auto,
+            "no flag must leave every resolution path on its previous default"
+        );
+    }
+
+    #[test]
+    fn test_prefer_ipv4_short_and_long_flags() {
+        for args in [
+            ["etr", "-4", "host"].as_slice(),
+            ["etr", "--prefer-ipv4", "host"].as_slice(),
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(cli.prefer_ipv4, "{args:?}");
+            assert_eq!(
+                AddrPref::from_flags(cli.prefer_ipv4, cli.prefer_ipv6),
+                AddrPref::Ipv4
+            );
+        }
+    }
+
+    #[test]
+    fn test_prefer_ipv6_short_and_long_flags() {
+        for args in [
+            ["etr", "-6", "host"].as_slice(),
+            ["etr", "--prefer-ipv6", "host"].as_slice(),
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(cli.prefer_ipv6, "{args:?}");
+            assert_eq!(
+                AddrPref::from_flags(cli.prefer_ipv4, cli.prefer_ipv6),
+                AddrPref::Ipv6
+            );
+        }
+    }
+
+    #[test]
+    fn test_prefer_families_are_mutually_exclusive() {
+        assert!(Cli::try_parse_from(["etr", "-4", "-6", "host"]).is_err());
+    }
+
+    /// `-4`/`-6` must not be swallowed by `trailing_var_arg` when they precede
+    /// the target, and must still reach the remote command when they follow it.
+    #[test]
+    fn test_prefer_flag_before_target_is_not_a_remote_command_arg() {
+        let cli = Cli::try_parse_from(["etr", "-6", "host", "ls", "-la"]).unwrap();
+        assert!(cli.prefer_ipv6);
+        assert_eq!(cli.target.as_deref(), Some("host"));
+        assert_eq!(cli.command, vec!["ls", "-la"]);
+    }
+
+    #[test]
+    fn test_cli_flag_beats_config_address_family() {
+        // CLI first, config as the fallback — the precedence main() applies.
+        assert_eq!(
+            AddrPref::from_flags(true, false).or(AddrPref::from_config(Some("ipv6"))),
+            AddrPref::Ipv4
+        );
+        // With no flag, the config value is what takes effect.
+        assert_eq!(
+            AddrPref::from_flags(false, false).or(AddrPref::from_config(Some("ipv6"))),
+            AddrPref::Ipv6
+        );
     }
 
     #[test]

@@ -31,6 +31,12 @@ pub const DEFAULT_CONFIG: &str = r#"# etr configuration file
 # Path to the etrs binary on the remote host (default: "etrs", relies on PATH).
 # server_path = "etrs"
 
+# Which IP version to try first when a host resolves to both: "ipv4", "ipv6",
+# or "auto" (default). A preference, not a restriction — the other family is
+# still used when the preferred one is absent or unroutable.
+# Equivalent to -4 / --prefer-ipv4 and -6 / --prefer-ipv6.
+# address_family = "auto"
+
 # Path to the client-side log file (default: $XDG_STATE_HOME/etr/etr.log).
 # Logs are only written when -v or higher is passed.
 # log_path = "~/.local/state/etr/etr.log"
@@ -65,6 +71,12 @@ pub const DEFAULT_CONFIG: &str = r#"# etr configuration file
 # disconnected (default: 1800, i.e. 30 minutes).
 # Overridden by --reconnect-timeout or the ETR_SERVER_NETWORK_TMOUT env var.
 # reconnect_timeout = 1800
+
+# Which IP version etrs tries first when it resolves the targets of -L
+# forwards, and which wildcard address it binds by default ("ipv4" binds
+# 0.0.0.0; "ipv6"/"auto" bind the dual-stack [::]). Equivalent to etrs -4/-6.
+# A connecting client's own -4/-6 overrides this for forward targets.
+# address_family = "auto"
 "#;
 
 /// Per-key comment blocks appended by `merge_defaults` for the `[client]` section.
@@ -76,6 +88,10 @@ const CLIENT_KEY_BLOCKS: &[(&str, &str)] = &[
     (
         "server_path",
         "# Path to the etrs binary on the remote host (default: \"etrs\", relies on PATH).\n# server_path = \"etrs\"",
+    ),
+    (
+        "address_family",
+        "# Which IP version to try first when a host resolves to both: \"ipv4\", \"ipv6\",\n# or \"auto\" (default). A preference, not a restriction — the other family is\n# still used when the preferred one is absent or unroutable.\n# Equivalent to -4 / --prefer-ipv4 and -6 / --prefer-ipv6.\n# address_family = \"auto\"",
     ),
     (
         "log_path",
@@ -112,10 +128,16 @@ const CLIENT_KEY_BLOCKS: &[(&str, &str)] = &[
 ];
 
 /// Per-key comment blocks appended by `merge_defaults` for the `[server]` section.
-const SERVER_KEY_BLOCKS: &[(&str, &str)] = &[(
-    "reconnect_timeout",
-    "# How long (seconds) the server keeps a session alive while the client is\n# disconnected (default: 1800, i.e. 30 minutes).\n# reconnect_timeout = 1800",
-)];
+const SERVER_KEY_BLOCKS: &[(&str, &str)] = &[
+    (
+        "reconnect_timeout",
+        "# How long (seconds) the server keeps a session alive while the client is\n# disconnected (default: 1800, i.e. 30 minutes).\n# reconnect_timeout = 1800",
+    ),
+    (
+        "address_family",
+        "# Which IP version etrs tries first when it resolves the targets of -L\n# forwards, and which wildcard address it binds by default (\"ipv4\" binds\n# 0.0.0.0; \"ipv6\"/\"auto\" bind the dual-stack [::]). Equivalent to etrs -4/-6.\n# A connecting client's own -4/-6 overrides this for forward targets.\n# address_family = \"auto\"",
+    ),
+];
 
 /// Top-level configuration loaded from `~/.config/etr/config.toml`.
 ///
@@ -136,6 +158,12 @@ pub struct ClientConfig {
 
     /// Default path to etrs on the remote host.
     pub server_path: Option<String>,
+
+    /// Which IP version to try first: `"ipv4"`, `"ipv6"`, or `"auto"`.
+    /// Overridden by `-4`/`-6`; parsed by
+    /// [`AddrPref::from_config`](crate::addrfam::AddrPref::from_config), which
+    /// treats an unrecognised value as `"auto"`.
+    pub address_family: Option<String>,
 
     /// Default path to the client log file.
     pub log_path: Option<String>,
@@ -169,6 +197,12 @@ pub struct ServerConfig {
     /// disconnected.  CLI `--reconnect-timeout` and the `ETR_SERVER_NETWORK_TMOUT`
     /// env var override this; the compiled-in default is 1800 s (30 min).
     pub reconnect_timeout: Option<u64>,
+
+    /// Which IP version `etrs` tries first for `-L` forward targets, and which
+    /// wildcard address it binds when `-b` is not given: `"ipv4"`, `"ipv6"`, or
+    /// `"auto"`.  Overridden by `etrs -4`/`-6`; for forward targets a connecting
+    /// client's own preference wins.
+    pub address_family: Option<String>,
 }
 
 impl Config {
@@ -478,6 +512,7 @@ mod tests {
 [client]\n\
 ssh_port = 22\n\
 server_path = \"etrs\"\n\
+address_family = \"auto\"\n\
 log_path = \"~/.local/state/etr/etr.log\"\n\
 server_log_path = \"~/.local/state/etr/etrs.log\"\n\
 gateway_ports = false\n\
@@ -487,7 +522,8 @@ env = []\n\
 x11 = false\n\
 x11_trusted = false\n\
 [server]\n\
-reconnect_timeout = 1800\n";
+reconnect_timeout = 1800\n\
+address_family = \"auto\"\n";
         let (merged, additions) = merge_defaults(existing);
         assert!(additions.is_empty(), "unexpected additions: {additions:?}");
         assert_eq!(merged.trim(), existing.trim());
@@ -500,6 +536,7 @@ reconnect_timeout = 1800\n";
 [client]\n\
 # ssh_port = 22\n\
 # server_path = \"etrs\"\n\
+# address_family = \"auto\"\n\
 # log_path = \"~/.local/state/etr/etr.log\"\n\
 # server_log_path = \"~/.local/state/etr/etrs.log\"\n\
 # gateway_ports = false\n\
@@ -509,7 +546,8 @@ reconnect_timeout = 1800\n";
 # x11 = false\n\
 # x11_trusted = false\n\
 [server]\n\
-# reconnect_timeout = 1800\n";
+# reconnect_timeout = 1800\n\
+# address_family = \"auto\"\n";
         let (_, additions) = merge_defaults(existing);
         assert!(additions.is_empty(), "unexpected additions: {additions:?}");
     }

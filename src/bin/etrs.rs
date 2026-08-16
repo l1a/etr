@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 
+use etr::addrfam::AddrPref;
 use etr::config::Config;
 #[cfg(unix)]
 use etr::login;
@@ -34,6 +35,21 @@ static VERBOSITY: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
 
 fn verbosity() -> u8 {
     *VERBOSITY.get().unwrap_or(&0)
+}
+
+/// Which IP family to try first when resolving the targets of `-L` forwards.
+///
+/// Set once during startup from the client's `ETRPREFER:` bootstrap line, or
+/// failing that from this server's own `-4`/`-6` flag or `[server]
+/// address_family`.  Stored as a process-wide `OnceLock` rather than threaded
+/// through `run_session` → `handle_connection` → `serve_*_forward`, mirroring
+/// [`VERBOSITY`]: it is a start-up setting that never changes and is needed five
+/// call levels down.
+static ADDR_PREF: std::sync::OnceLock<AddrPref> = std::sync::OnceLock::new();
+
+/// The effective address-family preference for forward-target resolution.
+fn addr_pref() -> AddrPref {
+    *ADDR_PREF.get().unwrap_or(&AddrPref::Auto)
 }
 
 macro_rules! vlog {
@@ -53,13 +69,24 @@ struct Cli {
     #[arg(short, long, default_value = "0")]
     port: u16,
 
-    /// IP address to bind
-    #[arg(short, long, default_value = "[::]")]
-    bind: String,
+    /// IP address to bind (default: [::], which serves IPv4 too on a
+    /// dual-stack kernel; -4 changes the default to 0.0.0.0)
+    #[arg(short, long)]
+    bind: Option<String>,
 
     /// Verbosity: -v session events, -vv QUIC details, -vvv stream trace
     #[arg(short = 'v', action = ArgAction::Count)]
     verbose: u8,
+
+    /// Prefer IPv4: bind 0.0.0.0 by default, and try IPv4 first when resolving
+    /// the targets of -L forwards. Overridden per-session by a client's own -4/-6.
+    #[arg(short = '4', long, conflicts_with = "prefer_ipv6")]
+    prefer_ipv4: bool,
+
+    /// Prefer IPv6: try IPv6 first when resolving the targets of -L forwards.
+    /// The default bind is already the dual-stack [::].
+    #[arg(short = '6', long, conflicts_with = "prefer_ipv4")]
+    prefer_ipv6: bool,
 
     /// Path to the server log file (default: $XDG_STATE_HOME/etr/etrs.log)
     #[arg(long, value_name = "PATH")]
@@ -84,6 +111,52 @@ enum ShellChoice {
     PowerShell,
     Zsh,
     Nushell,
+}
+
+/// One line of the SSH bootstrap stream after the `SESSION_ID/PASSKEY/TERM` header.
+///
+/// Unrecognised `ETR*:` prefixes fall through to [`BootstrapLine::Env`] exactly as
+/// they did before this enum existed — a line without an `=` is then dropped
+/// downstream, which is what keeps a newer client's extra lines harmless here.
+#[derive(Debug, PartialEq, Eq)]
+enum BootstrapLine {
+    /// A `KEY=VALUE` environment entry (or anything unrecognised).
+    Env(String),
+    /// `ETRCMD:<command>` — run this instead of an interactive shell.
+    Command(String),
+    /// `ETRX11:…` — the client asked for X11 forwarding.
+    X11,
+    /// `ETRPREFER:<4|6>` — the client's `-4`/`-6` address-family preference.
+    Prefer(AddrPref),
+}
+
+/// Classify one bootstrap line.  Shared by [`run_server`] and its tests so the
+/// tests exercise the shipped parser rather than a copy of it.
+fn parse_bootstrap_line(line: &str) -> BootstrapLine {
+    if let Some(cmd) = line.strip_prefix("ETRCMD:") {
+        BootstrapLine::Command(cmd.to_string())
+    } else if line.starts_with("ETRX11:") {
+        BootstrapLine::X11
+    } else if let Some(v) = line.strip_prefix("ETRPREFER:") {
+        BootstrapLine::Prefer(AddrPref::from_wire(v))
+    } else {
+        BootstrapLine::Env(line.to_string())
+    }
+}
+
+/// The address `etrs` binds: `-b` when given, otherwise a default chosen by the
+/// address-family preference.
+///
+/// `-4` narrows the default to `0.0.0.0` because a single wildcard bind cannot
+/// express "prefer IPv4"; every other case keeps `[::]`, which already accepts
+/// IPv4 clients on a dual-stack kernel.  An explicit `-b` always wins — the flag
+/// supplies a default, it does not override one.
+fn effective_bind_ip(explicit: Option<&str>, pref: AddrPref) -> String {
+    match explicit {
+        Some(b) => b.to_string(),
+        None if pref == AddrPref::Ipv4 => "0.0.0.0".to_string(),
+        None => "[::]".to_string(),
+    }
 }
 
 fn main() -> io::Result<()> {
@@ -128,11 +201,17 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
-    run_server(cli, reconnect_timeout)
+    // This server's own preference: CLI flags win over [server] address_family.
+    // A connecting client's `ETRPREFER:` line overrides it for forward targets
+    // only — the bind address is this host's business.
+    let own_pref = AddrPref::from_flags(cli.prefer_ipv4, cli.prefer_ipv6)
+        .or(AddrPref::from_config(cfg.server.address_family.as_deref()));
+
+    run_server(cli, reconnect_timeout, own_pref)
 }
 
 #[cfg(not(unix))]
-fn run_server(_cli: Cli, _reconnect_timeout: Duration) -> io::Result<()> {
+fn run_server(_cli: Cli, _reconnect_timeout: Duration, _own_pref: AddrPref) -> io::Result<()> {
     eprintln!(
         "etrs (the etr server) only runs on Unix (Linux/macOS): it relies on \
          fork/setsid and Unix domain sockets for X11 forwarding. Run etrs on the \
@@ -142,7 +221,7 @@ fn run_server(_cli: Cli, _reconnect_timeout: Duration) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn run_server(cli: Cli, reconnect_timeout: Duration) -> io::Result<()> {
+fn run_server(cli: Cli, reconnect_timeout: Duration, own_pref: AddrPref) -> io::Result<()> {
     // Read session bootstrap line from SSH stdin: SESSION_ID_HEX/PASSKEY/TERM
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
@@ -166,23 +245,28 @@ fn run_server(cli: Cli, reconnect_timeout: Duration) -> io::Result<()> {
     let mut extra_env: Vec<String> = Vec::new();
     let mut remote_command: Option<String> = None;
     let mut x11_enabled = false;
+    let mut client_pref = AddrPref::Auto;
     {
         use std::io::BufRead;
         let stdin = io::stdin();
         for line in stdin.lock().lines() {
             match line {
                 Ok(l) if l.is_empty() => break,
-                Ok(l) if l.starts_with("ETRCMD:") => {
-                    remote_command = l.strip_prefix("ETRCMD:").map(str::to_string);
-                }
-                Ok(l) if l.starts_with("ETRX11:") => {
-                    x11_enabled = true;
-                }
-                Ok(l) => extra_env.push(l),
+                Ok(l) => match parse_bootstrap_line(&l) {
+                    BootstrapLine::Command(cmd) => remote_command = Some(cmd),
+                    BootstrapLine::X11 => x11_enabled = true,
+                    BootstrapLine::Prefer(p) => client_pref = p,
+                    BootstrapLine::Env(kv) => extra_env.push(kv),
+                },
                 Err(_) => break,
             }
         }
     }
+
+    // The client's -4/-6 governs how this server resolves the targets of that
+    // session's -L forwards; without one, this server's own flag applies.  Set
+    // before the fork so both processes agree.
+    let _ = ADDR_PREF.set(client_pref.or(own_pref));
 
     // Generate ephemeral self-signed QUIC certificate.
     let (cert, key) = quic::generate_self_signed_cert();
@@ -220,7 +304,11 @@ fn run_server(cli: Cli, reconnect_timeout: Duration) -> io::Result<()> {
 
     // Child: build the Tokio runtime, create the quinn endpoint, send port to
     // parent, then detach stdio and run the session.
-    let bind_str = format!("{}:{}", cli.bind, cli.port);
+    let bind_str = format!(
+        "{}:{}",
+        effective_bind_ip(cli.bind.as_deref(), own_pref),
+        cli.port
+    );
     let bind_addr: std::net::SocketAddr = bind_str
         .parse()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e}")))?;
@@ -1217,10 +1305,8 @@ async fn serve_tcp_forward(
     quic_recv: quinn::RecvStream,
     _session: Arc<Mutex<SessionState>>,
 ) {
-    use tokio::net::TcpStream;
-
     let addr = format!("{}:{}", so.remote_host, so.remote_port);
-    let tcp = match TcpStream::connect(&addr).await {
+    let tcp = match etr::forward::connect_tcp_preferred(&addr, addr_pref()).await {
         Ok(s) => s,
         Err(e) => {
             vlog!(1, "[etrs] TCP connect to {addr} failed: {e}");
@@ -1532,7 +1618,7 @@ async fn serve_udp_forward(
     // Resolve the remote host once so every per-sender socket uses the same family.
     let remote_addr_str = format!("{}:{}", so.remote_host, so.remote_port);
     let remote_addr: std::net::SocketAddr =
-        match etr::forward::resolve_udp_target(&remote_addr_str).await {
+        match etr::forward::resolve_udp_target(&remote_addr_str, addr_pref()).await {
             Some(a) => a,
             None => {
                 vlog!(1, "[etrs] UDP forward: cannot resolve {remote_addr_str}");
@@ -1869,8 +1955,123 @@ mod tests {
     fn test_cli_defaults() {
         let cli = Cli::try_parse_from(["etrs"]).unwrap();
         assert_eq!(cli.port, 0);
-        assert_eq!(cli.bind, "[::]");
+        // `-b` now defaults at use time rather than in clap, so that `-4` can
+        // change the default without overriding an explicit `-b`.
+        assert_eq!(cli.bind, None);
         assert_eq!(cli.verbose, 0);
+        assert!(!cli.prefer_ipv4);
+        assert!(!cli.prefer_ipv6);
+    }
+
+    #[test]
+    fn test_cli_explicit_bind_is_preserved() {
+        let cli = Cli::try_parse_from(["etrs", "-b", "127.0.0.1"]).unwrap();
+        assert_eq!(cli.bind.as_deref(), Some("127.0.0.1"));
+    }
+
+    #[test]
+    fn test_cli_prefer_ipv4_flag() {
+        let cli = Cli::try_parse_from(["etrs", "-4"]).unwrap();
+        assert!(cli.prefer_ipv4);
+        assert!(!cli.prefer_ipv6);
+        assert_eq!(
+            AddrPref::from_flags(cli.prefer_ipv4, cli.prefer_ipv6),
+            AddrPref::Ipv4
+        );
+    }
+
+    #[test]
+    fn test_cli_prefer_ipv6_long_flag() {
+        let cli = Cli::try_parse_from(["etrs", "--prefer-ipv6"]).unwrap();
+        assert!(cli.prefer_ipv6);
+        assert_eq!(
+            AddrPref::from_flags(cli.prefer_ipv4, cli.prefer_ipv6),
+            AddrPref::Ipv6
+        );
+    }
+
+    #[test]
+    fn test_cli_rejects_both_families() {
+        assert!(Cli::try_parse_from(["etrs", "-4", "-6"]).is_err());
+    }
+
+    /// `-4` supplies a default bind, it does not override an explicit `-b`.
+    /// Calls the shipped [`effective_bind_ip`], not a copy of its logic.
+    #[test]
+    fn test_bind_default_follows_preference() {
+        let plain = Cli::try_parse_from(["etrs"]).unwrap();
+        assert_eq!(
+            effective_bind_ip(plain.bind.as_deref(), AddrPref::Auto),
+            "[::]"
+        );
+
+        let v4 = Cli::try_parse_from(["etrs", "-4"]).unwrap();
+        assert_eq!(
+            effective_bind_ip(v4.bind.as_deref(), AddrPref::Ipv4),
+            "0.0.0.0"
+        );
+
+        // IPv6 keeps the dual-stack wildcard, which serves IPv4 clients too.
+        let v6 = Cli::try_parse_from(["etrs", "-6"]).unwrap();
+        assert_eq!(
+            effective_bind_ip(v6.bind.as_deref(), AddrPref::Ipv6),
+            "[::]"
+        );
+
+        let explicit = Cli::try_parse_from(["etrs", "-4", "-b", "192.0.2.1"]).unwrap();
+        assert_eq!(
+            effective_bind_ip(explicit.bind.as_deref(), AddrPref::Ipv4),
+            "192.0.2.1"
+        );
+    }
+
+    #[test]
+    fn test_bootstrap_line_parsing_covers_every_prefix() {
+        assert_eq!(
+            parse_bootstrap_line("KEY=VALUE"),
+            BootstrapLine::Env("KEY=VALUE".to_string())
+        );
+        assert_eq!(
+            parse_bootstrap_line("ETRCMD:btop -1"),
+            BootstrapLine::Command("btop -1".to_string())
+        );
+        assert_eq!(parse_bootstrap_line("ETRX11:true"), BootstrapLine::X11);
+        assert_eq!(
+            parse_bootstrap_line("ETRPREFER:4"),
+            BootstrapLine::Prefer(AddrPref::Ipv4)
+        );
+        assert_eq!(
+            parse_bootstrap_line("ETRPREFER:6"),
+            BootstrapLine::Prefer(AddrPref::Ipv6)
+        );
+        // A value this server does not know must not select a family.
+        assert_eq!(
+            parse_bootstrap_line("ETRPREFER:9"),
+            BootstrapLine::Prefer(AddrPref::Auto)
+        );
+        // An unknown ETR* line is treated as env, and dropped later for want of
+        // an `=` — the forward-compatibility rule PROTOCOL.md §2 states.
+        assert_eq!(
+            parse_bootstrap_line("ETRFUTURE:x"),
+            BootstrapLine::Env("ETRFUTURE:x".to_string())
+        );
+    }
+
+    /// A client's `ETRPREFER:` wins over the server's own flag; a client that
+    /// sends none (any release before this one) leaves the server's flag intact.
+    #[test]
+    fn test_client_preference_overrides_server_default() {
+        let from_old_client = AddrPref::Auto;
+        assert_eq!(from_old_client.or(AddrPref::Ipv6), AddrPref::Ipv6);
+
+        let BootstrapLine::Prefer(client) = parse_bootstrap_line("ETRPREFER:4") else {
+            panic!("ETRPREFER: must parse as a preference");
+        };
+        assert_eq!(
+            client.or(AddrPref::Ipv6),
+            AddrPref::Ipv4,
+            "a client's ETRPREFER must beat the server's own flag"
+        );
     }
 
     #[test]
@@ -1955,57 +2156,64 @@ mod tests {
         assert!(help.contains("--reconnect-timeout"));
     }
 
-    #[test]
-    fn test_etrcmd_line_parsing() {
-        // Simulate the bootstrap line-parsing logic for ETRCMD:.
-        let lines = vec![
-            "KEY=VALUE".to_string(),
-            "ETRCMD:distrobox -- btop".to_string(),
-            "OTHER=foo".to_string(),
-        ];
-        let mut extra_env: Vec<String> = Vec::new();
-        let mut remote_command: Option<String> = None;
+    /// Drive the shipped [`parse_bootstrap_line`] over a whole line sequence,
+    /// the way `run_server` does, and return what the server would end up with.
+    fn drive_bootstrap(lines: &[&str]) -> (Vec<String>, Option<String>, bool, AddrPref) {
+        let mut extra_env = Vec::new();
+        let mut remote_command = None;
+        let mut x11_enabled = false;
+        let mut client_pref = AddrPref::Auto;
         for l in lines {
-            if let Some(cmd) = l.strip_prefix("ETRCMD:") {
-                remote_command = Some(cmd.to_string());
-            } else {
-                extra_env.push(l);
+            match parse_bootstrap_line(l) {
+                BootstrapLine::Command(c) => remote_command = Some(c),
+                BootstrapLine::X11 => x11_enabled = true,
+                BootstrapLine::Prefer(p) => client_pref = p,
+                BootstrapLine::Env(kv) => extra_env.push(kv),
             }
         }
+        (extra_env, remote_command, x11_enabled, client_pref)
+    }
+
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn test_etrcmd_line_parsing() {
+        let (extra_env, remote_command, ..) =
+            drive_bootstrap(&["KEY=VALUE", "ETRCMD:distrobox -- btop", "OTHER=foo"]);
         assert_eq!(remote_command.as_deref(), Some("distrobox -- btop"));
         assert_eq!(extra_env, vec!["KEY=VALUE", "OTHER=foo"]);
     }
 
     #[test]
     fn test_etrcmd_absent_yields_none() {
-        let lines: Vec<String> = vec!["KEY=VALUE".to_string()];
-        let mut remote_command: Option<String> = None;
-        for l in lines {
-            if let Some(cmd) = l.strip_prefix("ETRCMD:") {
-                remote_command = Some(cmd.to_string());
-            }
-        }
+        let (_, remote_command, ..) = drive_bootstrap(&["KEY=VALUE"]);
         assert!(remote_command.is_none());
     }
 
     #[test]
     fn test_etrx11_line_parsing() {
-        let lines: Vec<String> = vec![
-            "KEY=VALUE".to_string(),
-            "ETRX11:true".to_string(),
-            "OTHER=foo".to_string(),
-        ];
-        let mut x11_enabled = false;
-        let mut extra_env = Vec::new();
-        for l in lines {
-            if l.starts_with("ETRX11:") {
-                x11_enabled = true;
-            } else {
-                extra_env.push(l);
-            }
-        }
+        let (extra_env, _, x11_enabled, _) =
+            drive_bootstrap(&["KEY=VALUE", "ETRX11:true", "OTHER=foo"]);
         assert!(x11_enabled);
         assert_eq!(extra_env, vec!["KEY=VALUE", "OTHER=foo"]);
+    }
+
+    #[test]
+    fn test_etrprefer_line_does_not_leak_into_the_environment() {
+        let (extra_env, _, _, client_pref) =
+            drive_bootstrap(&["KEY=VALUE", "ETRPREFER:6", "OTHER=foo"]);
+        assert_eq!(client_pref, AddrPref::Ipv6);
+        assert_eq!(
+            extra_env,
+            vec!["KEY=VALUE", "OTHER=foo"],
+            "ETRPREFER must never reach the remote shell's environment"
+        );
+    }
+
+    #[test]
+    fn test_bootstrap_without_etrprefer_leaves_preference_auto() {
+        // What every etr release before this one sends.
+        let (_, _, _, client_pref) = drive_bootstrap(&["KEY=VALUE", "ETRCMD:true"]);
+        assert_eq!(client_pref, AddrPref::Auto);
     }
 
     #[tokio::test]

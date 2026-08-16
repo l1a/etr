@@ -12,9 +12,15 @@ etrs - Eternal Terminal server (per-session)
 normally invoked directly; **etr** starts it automatically via SSH during
 session bootstrap.
 
-When started, **etrs** reads a single line from stdin in the form:
+When started, **etrs** reads a header line from stdin in the form:
 
     SESSION_ID_HEX/PASSKEY/TERM
+
+followed by zero or more optional lines carrying environment variables
+(*KEY*=*VALUE*), a remote command (**ETRCMD:**), an X11 request (**ETRX11:**)
+and the client's address-family preference (**ETRPREFER:**). Lines **etrs**
+does not recognise are ignored, so a newer client can be used with an older
+server.
 
 It then generates an ephemeral self-signed TLS certificate, binds a QUIC
 port, prints **PORT** *n* **CERT** *cert_hex* to stdout, and forks. The
@@ -33,7 +39,24 @@ window expires), the child exits.
 :   QUIC port to bind. Defaults to **0** (OS-assigned random port).
 
 **-b**, **\-\-bind** *ADDR*
-:   IP address to bind. Defaults to **[::]** (dual-stack, all interfaces).
+:   IP address to bind. Defaults to **[::]** (dual-stack, all interfaces),
+    or to **0.0.0.0** when **-4** is given.
+
+**-4**, **\-\-prefer-ipv4**
+:   Prefer IPv4: bind **0.0.0.0** unless **-b** says otherwise, and try IPv4
+    first when resolving the targets of the client's **-L** forwards.
+
+**-6**, **\-\-prefer-ipv6**
+:   Prefer IPv6 when resolving the targets of the client's **-L** forwards.
+    The default bind is already the dual-stack **[::]**, which accepts IPv4
+    clients too, so this does not change it.
+
+    Both are preferences rather than restrictions: the other family is still
+    used when a target has no address of the preferred one. A connecting
+    client's own **-4**/**-6** (sent as **ETRPREFER:**) overrides these for
+    forward targets, since the forwards are the client's. Config file
+    equivalent: **address_family** under **\[server\]**. The two flags are
+    mutually exclusive.
 
 **-v**
 :   Increase verbosity. May be repeated up to three times:
