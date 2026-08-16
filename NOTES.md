@@ -9,7 +9,77 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.7.9 — the release checklist no longer deletes the handoff file
+## Current state: v0.8.0 — `-4`/`-6` address-family preference
+
+New in v0.8.0 (client + server feature; 112 → 145 tests, one new e2e recipe).
+
+- **`etr -4`/`--prefer-ipv4` and `-6`/`--prefer-ipv6`, and the same pair on `etrs`.**
+  Until now the family was whatever the resolver happened to return first, and there was
+  no way to influence it — awkward on a dual-stack host where one family is slow, filtered
+  or simply the one you are trying to test.
+- **They are a preference, not a restriction, and that is the whole design.** `ssh -4`/`-6`
+  *forbid* the other family; these order it. If the host has no address of the requested
+  family, or none the kernel can route to, the other family is used and the fallback is
+  reported at `-v`. Nothing here can turn a working connection into a failure.
+  - **Consequence for the SSH bootstrap, which is the non-obvious part:** `etr` cannot just
+    forward `-6` to `ssh`, because ssh would then hard-fail on an IPv4-only host while etr
+    itself would have fallen back — one session, two different contracts. So the client
+    resolves the target first and passes ssh the flag **only when the host really has such
+    an address**. A name that does not resolve locally (an `ssh_config` `Host` alias) gets
+    no flag at all, leaving ssh's own resolution untouched.
+- **Scope: everywhere an address is chosen, not just the QUIC connect.** The SSH bootstrap,
+  the QUIC session, `-R` targets (resolved on the client) and `-L` targets (resolved on the
+  server). The client's choice reaches the server as a new `ETRPREFER:<4|6>` bootstrap
+  line — the same forward-compatible mechanism as `ETRCMD:`/`ETRX11:`, so an old server
+  ignores it and an old client simply never sends it. Verified live in both directions:
+  `etr -4 -L …:localhost:… ` made the server resolve `127.0.0.1`, `-6` made it resolve
+  `[::1]`, where unflagged it always picked `[::1]`.
+- **TCP forward targets are included, which they would not have been for free.**
+  `TcpStream::connect("host:port")` walks every resolved address but in the resolver's
+  order, so the flag would have been honoured for QUIC and UDP and silently ignored for
+  forwarded TCP. `forward::connect_tcp_preferred` reorders the candidates and keeps the
+  try-each-until-one-connects behaviour.
+- **`AddrPref::Auto` means "what this call site did before", not one global default.** The
+  two call sites genuinely differed: the QUIC address took the resolver's first answer,
+  while `resolve_udp_target` has preferred IPv6 since v0.4.x (a closed gap in the list
+  below, with a regression test asserting it). A single "no preference = IPv6 first" would
+  have silently changed the QUIC path for every unflagged user. Each caller passes its own
+  fallback via `AddrPref::or`, so an unflagged run behaves as it did in v0.7.9.
+- **One deliberate behaviour change without a flag:** the QUIC peer address is now picked
+  with the same routing probe the UDP path has always used (bind an ephemeral UDP socket,
+  `connect()` it — checks the routing table, sends nothing). A host whose AAAA comes back
+  first, on a machine with no IPv6 route, used to fail the connect outright; it now falls
+  through to the A record. If no candidate is routable the first one is returned anyway, so
+  the user still gets a real connection error rather than "could not resolve".
+- **`etrs -4` changes the default bind to `0.0.0.0`**, because a single wildcard bind cannot
+  express "prefer IPv4". `-6` leaves it at `[::]`, which already accepts IPv4 clients on a
+  dual-stack kernel — so a *client's* `-4` deliberately does **not** touch the server's bind,
+  only what the server resolves. An explicit `-b` always wins: the flag supplies a default,
+  it does not override one.
+- **Tests exercise the shipped code, not a copy of it.** The bootstrap-line handling moved
+  into `parse_bootstrap_line` and the bind default into `effective_bind_ip` precisely so the
+  tests can call them: the pre-existing `ETRCMD`/`ETRX11` tests re-implemented the parse loop
+  inside the test, which passes just as happily when the real loop is wrong. Same discipline
+  as the v0.7.7 note about a structural check passing on the comment that explained it.
+- **`just e2e-family-local`** asserts the flags change the family actually connected over —
+  a CLI test can only prove they parse. Measured here: unflagged and `-6` both connect to
+  `[::1]`, `-4` connects to `127.0.0.1`, so Part 1 is the discriminating one on this host.
+  Part 3 (an IPv4-only target under `-6` must still connect) skips where ssh to the literal
+  `127.0.0.1` is not in `known_hosts`, and says how to enable it.
+- Config: `address_family = "ipv4" | "ipv6" | "auto"` under `[client]` and `[server]`. An
+  unrecognised value is `"auto"` — a typo must degrade to today's behaviour, never to the
+  wrong family. `PROTOCOL.md` §2 documents `ETRPREFER:` (and `ETRX11:`, which it had never
+  listed) plus the forward-compatibility rule that makes both safe.
+
+### Found while doing this, NOT fixed here
+
+- **`man/etrs.1.md`'s BUGS section still says "The reconnect window (30 minutes) is not
+  configurable."** It has been configurable since v0.4.6 — `--reconnect-timeout`,
+  `ETR_SERVER_NETWORK_TMOUT`, or `[server] reconnect_timeout` — and that flag is not
+  documented in the page's OPTIONS either. Left for its own PR rather than widened into
+  this one; it is a documentation defect, not a behaviour one.
+
+## Previous: v0.7.9 — the release checklist no longer deletes the handoff file
 
 New in v0.7.9 (documentation only; no code change, 112 tests unchanged).
 
@@ -1162,7 +1232,18 @@ ssh_port = 22
 
 # Path to etrs on remote hosts (default: "etrs", relies on PATH)
 server_path = "/usr/local/bin/etrs"
+
+# Which IP version to try first: "ipv4", "ipv6" or "auto" (default)
+address_family = "auto"
+
+[server]
+# Same for etrs: forward-target resolution, and the default bind
+# ("ipv4" binds 0.0.0.0; "ipv6"/"auto" bind the dual-stack [::]).
+address_family = "auto"
 ```
+
+Run `etr --generate-config` for the fully-commented file, or `etr --merge-config`
+to add newly-introduced keys to an existing one.
 
 ---
 
@@ -1175,9 +1256,12 @@ server_path = "/usr/local/bin/etrs"
 | etrs binary path | `etrs` (PATH) | `--server-path` or config `server_path` |
 | Server log | `~/.local/state/etr/etrs.log` | `etrs --log-path PATH`, `etr --server-log-path PATH`, or config `server_log_path` |
 | Client log | `~/.local/state/etr/etr.log` | `etr --log-path PATH` or config `log_path` |
-| Server bind address | `[::]` (dual-stack) | `etrs -b ADDR` |
+| Server bind address | `[::]` (dual-stack) | `etrs -b ADDR`, or `0.0.0.0` under `etrs -4` |
+| Address family | resolver order (IPv6-first for UDP forward targets) | `-4`/`-6` on either binary, or config `address_family` |
 
-IPv6 is fully supported.
+IPv6 is fully supported.  `-4`/`-6` express a *preference* — the other family is
+still used when the requested one is absent or unroutable — which is why they are
+named `--prefer-ipv4`/`--prefer-ipv6` and behave unlike `ssh -4`/`-6`.
 
 ---
 
@@ -1195,7 +1279,7 @@ just install-tag 0.7.3
 
 # Code quality gate — run before every commit
 just check            # cargo fmt --check + cargo clippy -D warnings (also runs standard-check)
-just test             # cargo test (112 tests)
+just test             # cargo test (145 tests)
 ```
 
 ---
@@ -1210,6 +1294,8 @@ etr user@host             # standard connect
 etr localhost             # localhost testing (SSH to localhost must be configured)
 etr -vvv host             # verbose — shown on stderr before session, then logged to
                           #   ~/.local/state/etr/etr.log during raw-mode session
+etr -6 host               # prefer IPv6 (falls back to IPv4 if there is none usable)
+etr -4 host               # prefer IPv4
 
 # Server logs land in ~/.local/state/etr/etrs.log on the server.
 
@@ -1219,6 +1305,9 @@ just check-tools          # verifies tmux, ssh, passwordless localhost SSH
 
 # Full automated end-to-end test (happy path + reconnect)
 just e2e-local
+
+# -4/-6 actually change the family connected over (not just that they parse)
+just e2e-family-local
 
 # Memory/throughput stress test (1 PTY + 2 -L forward streams, all directions)
 just stress-local
@@ -1338,6 +1427,9 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
   more syscalls, not fewer copies, determines throughput here.
   UDP (~9 Mb/s) is still limited by per-datagram protobuf encoding overhead.
 - ~~**UDP forward target resolution should prefer IPv6 when genuinely available**~~ **Done**: `etr::forward::resolve_udp_target` (new helper in `src/forward.rs`) resolves the target, tries IPv6 candidates first, and probes routing via a no-packet UDP `connect()` call.  The first address whose routing probe succeeds is used.  Falls back to IPv4 if no IPv6 route exists.  The stress-tool UDP echo server now also binds `[::1]:port` alongside `0.0.0.0:port` so both families reach it in tests.
+  *Since v0.8.0 the IPv6-first order is the **default** rather than the only behaviour:
+  `-4`/`-6` override it, and the routing probe was factored out into `addrfam::first_routable`
+  so the QUIC connect path gets it too.*
 - ~~**GitHub release retention**~~ **Done**: the release workflow's `prune` job deletes releases beyond the 20 most recent after each publish, using `gh release delete --cleanup-tag`.
 - ~~**Dependency updates (minor/safe)**~~ **Done**: `crossterm` 0.27→0.29, `nix` 0.29→0.31, `prost` 0.13→0.14.
 - ~~**Dependency updates (major)**~~ **Done**: `rand` 0.8→0.9, `clap_complete_nushell` 0.1→4.6, `criterion` 0.5→0.8.
@@ -1345,7 +1437,7 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
 
 ---
 
-## Test coverage (112 tests)
+## Test coverage (145 tests)
 
 | Module | What's tested |
 |--------|--------------|
@@ -1353,8 +1445,9 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
 | `protocol` | SessionOpen/Accept encode-decode (incl. `gateway_ports`, `reverse_forwards`, and `x11_enabled`/`x11_auth_proto`/`x11_auth_cookie` round-trip), StreamOpen/Close, Heartbeat, Disconnect, UdpDatagram |
 | `session/stream` | Acknowledge edge cases, replay from 0, initial seq values |
 | `session/mod` | Close/ack unknown stream, `last_received_map` semantics, collect_replays, `open_stream` idempotence |
-| `bin/etrs` | CLI defaults, verbose count, custom port, subcommand parsing, hex_decode, custom --log-path override, `ETRX11` bootstrap line parsing |
+| `bin/etrs` | CLI defaults, verbose count, custom port, subcommand parsing, hex_decode, custom --log-path override, `ETRCMD`/`ETRX11`/`ETRPREFER` bootstrap line parsing (through the shipped `parse_bootstrap_line`), `-4`/`-6` flags and their mutual exclusion, `effective_bind_ip` defaults vs explicit `-b`, client preference overriding the server's own |
 | `login` | no-panic checks for record_login / record_logout with invalid fd |
-| `bin/etr` | CLI defaults, port parsing, target parsing, no --cipher flag, custom --log-path and --server-log-path overrides, config fallback for log paths, terminal-restore sequences (cursor-safe modes cover mouse/paste/cursor and never move the cursor; screen reset leaves alt-screen without clearing scrollback) |
-| `config` | TOML parse (full section, partial, empty), default values, `gateway_ports` / `forward` / `reverse_forward` / `x11` / `x11_trusted` config keys |
-| `forward` | `-L`/`-R` spec parsing: TCP/UDP/IPv6, explicit proto, bad port, empty host, Display; bind address parsing (explicit IP, `[::1]`, wildcard `*`); `get_bind_addresses` with and without gateway flag; `resolve_udp_target`: localhost prefers IPv6, explicit IPv4, unresolvable host; `X11Display` parsing |
+| `bin/etr` | CLI defaults, port parsing, target parsing, `-4`/`-6` short and long forms, their mutual exclusion, a family flag ahead of a remote command, CLI-beats-config precedence, no --cipher flag, custom --log-path and --server-log-path overrides, config fallback for log paths, terminal-restore sequences (cursor-safe modes cover mouse/paste/cursor and never move the cursor; screen reset leaves alt-screen without clearing scrollback) |
+| `config` | TOML parse (full section, partial, empty), default values, `gateway_ports` / `forward` / `reverse_forward` / `x11` / `x11_trusted` / `address_family` config keys, `merge_defaults` idempotence |
+| `forward` | `-L`/`-R` spec parsing: TCP/UDP/IPv6, explicit proto, bad port, empty host, Display; bind address parsing (explicit IP, `[::1]`, wildcard `*`); `get_bind_addresses` with and without gateway flag; `resolve_udp_target`: localhost prefers IPv6, explicit IPv4, unresolvable host, `-4` overriding the IPv6-first default, fallback to the other family; `connect_tcp_preferred`: reaches an IPv4 listener, falls back across families, errors on an unresolvable host; `X11Display` parsing |
+| `addrfam` | `AddrPref` from flags / config aliases / `ETRPREFER:` wire values (unknown → `Auto` in every direction), `or` fallback, ssh flag mapping, `order_by_family` (preferred family first, stable within a family, identity for `Auto`, single-family and empty input), `first_routable`, `resolve_preferred`, `family_available` |

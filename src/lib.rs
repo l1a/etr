@@ -2,7 +2,7 @@
 //! `etr` — Eternal Terminal in Rust.
 //!
 //! This crate is the shared library used by both the `etr` client and `etrs`
-//! server.  It is organised into four modules:
+//! server.  It is organised into these modules:
 //!
 //! - [`protocol`]: QUIC wire messages — protobuf [`protocol::Envelope`] with
 //!   session handshake and stream multiplexing types.
@@ -11,6 +11,8 @@
 //! - [`session`]: Per-session and per-stream state that survives reconnections.
 //! - [`config`]: Config-file loading (`~/.config/etr/config.toml`).
 //! - [`forward`]: `-L` forwarding spec parser.
+//! - [`addrfam`]: `-4`/`-6` address-family preference and resolution helpers.
+pub mod addrfam;
 pub mod config;
 pub mod forward;
 pub mod login;

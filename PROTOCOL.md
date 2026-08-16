@@ -1,6 +1,8 @@
 # etr Wire Protocol
 
-This document is the authoritative reference for the etr wire protocol as of **v0.3.0**.
+This document is the authoritative reference for the etr wire protocol as of **v0.8.0**.
+The QUIC streams and messages are unchanged since v0.3.0; the SSH bootstrap in §2 has
+since gained optional lines, all of which older peers ignore.
 
 For the history of the pre-0.3.0 UDP/KEM-based protocol, see the git log.
 
@@ -27,6 +29,8 @@ ephemeral TLS certificate for pinning.
 ```
 SESSION_ID_HEX/PASSKEY/TERM\n
 [KEY=VALUE\n ...]
+[ETRX11:true\n]
+[ETRPREFER:<4|6>\n]
 [ETRCMD:<command>\n]
 ```
 
@@ -37,7 +41,16 @@ terminated by `\n`, sent before `stdin` is closed:
 |------|--------|-------------|
 | Header | `SESSION_ID_HEX/PASSKEY/TERM` | Required. Fields separated by `/`. |
 | Env var | `KEY=VALUE` | Optional, repeatable. Sets an environment variable in the remote shell/command. Automatically includes `LANG`, `LC_*`, `COLORTERM`, and `TERM_PROGRAM*` if set on the client. |
-| Remote command | `ETRCMD:<command>` | Optional, at most once. If present, the server runs `$SHELL -c <command>` instead of an interactive shell and sends `Disconnect` when the command exits. Lines without a `=` and not starting with `ETRCMD:` are ignored for forward compatibility. |
+| X11 | `ETRX11:true` | Optional, at most once. Requests X11 forwarding; the server allocates a display and listeners for the session. |
+| Address family | `ETRPREFER:<4\|6>` | Optional, at most once. The client's `-4`/`-6` preference. The server applies it when resolving the targets of `-L` forwards, which it resolves on its own side. A value the server does not recognise is treated as no preference. |
+| Remote command | `ETRCMD:<command>` | Optional, at most once. If present, the server runs `$SHELL -c <command>` instead of an interactive shell and sends `Disconnect` when the command exits. |
+
+**Forward compatibility rule:** a line the server does not recognise as one of
+the `ETR*:` prefixes above is treated as an env var, and an env var without a
+`=` is discarded — so a newer client's extra lines are silently ignored by an
+older server rather than reaching the remote environment. Equally, every
+optional line is optional: a server must behave correctly when an older client
+sends none of them.
 
 | Header field | Format | Description |
 |-------|--------|-------------|

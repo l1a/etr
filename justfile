@@ -1005,6 +1005,124 @@ e2e-cmd-local: check-tools install
     echo ""
     echo "==> All remote command tests passed."
 
+# Run the local E2E test for the -4/-6 address-family preference
+#
+# Asserts the flags change which family etr actually connects over -- a CLI test
+# can only prove they parse -- and that they remain a *preference*: a target with
+# no address of the requested family must still connect rather than fail.
+#
+# `-vv` rather than `-v`: the chosen peer address is logged at level 2. The log
+# file is only written when stdin is a terminal, which is why these run in tmux.
+e2e-family-local: check-tools install
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    # Reap only what THIS test starts -- never a live session on this machine.
+    source scripts/e2e_procs.sh
+    ETRS_PRE=$(procs_snapshot etrs)
+
+    CLIENT_LOG="${XDG_STATE_HOME:-$HOME/.local/state}/etr/etr.log"
+    TMUX_SESS_FAM="etr_family_test"
+
+    cleanup() {
+        echo ""
+        echo "--- cleanup ---"
+        tmux kill-session -t "$TMUX_SESS_FAM" 2>/dev/null && echo "killed tmux session $TMUX_SESS_FAM" || true
+        procs_reap etrs "${ETRS_PRE:-}"
+    }
+    trap cleanup EXIT
+
+    mkdir -p "$(dirname "$CLIENT_LOG")"
+
+    # Run one flagged session against TARGET and leave the log for inspection.
+    # Returns non-zero if the sentinel never appeared in the pane.
+    run_session() {
+        local flag="$1" target="$2" sentinel="$3"
+        > "$CLIENT_LOG"
+        tmux kill-session -t "$TMUX_SESS_FAM" 2>/dev/null || true
+        tmux new-session -d -s "$TMUX_SESS_FAM" -x 200 -y 50 -- \
+            "{{INSTALL}}/etr" -vv "$flag" "$target" "echo ${sentinel}; sleep 3"
+        local i
+        for i in $(seq 1 30); do
+            sleep 1
+            tmux capture-pane -t "$TMUX_SESS_FAM" -p -S - 2>/dev/null \
+                | grep -q "${sentinel}" && return 0
+        done
+        echo "    (pane contents)" >&2
+        tmux capture-pane -t "$TMUX_SESS_FAM" -p -S - >&2 || true
+        echo "    (client log)" >&2
+        cat "$CLIENT_LOG" >&2 || true
+        return 1
+    }
+
+    # ── 1. -4 must connect over IPv4 ─────────────────────────────────────────
+    SENTINEL4="FAM4_SENTINEL_$$"
+    echo "==> Part 1: etr -4 localhost must connect over IPv4..."
+    if ! run_session -4 localhost "$SENTINEL4"; then
+        echo "FAIL: no output from 'etr -4 localhost' within 30 s." >&2
+        exit 1
+    fi
+    ADDR4=$(grep -o '\[etr\] server address [^ ]*' "$CLIENT_LOG" | tail -1 | awk '{print $4}')
+    if [[ -z "${ADDR4:-}" ]]; then
+        echo "FAIL: etr never logged the server address it chose." >&2
+        cat "$CLIENT_LOG" >&2
+        exit 1
+    fi
+    # An IPv6 socket address is bracketed; an IPv4 one never is.
+    if [[ "$ADDR4" == \[* ]]; then
+        echo "FAIL: -4 connected over IPv6 ($ADDR4)." >&2
+        exit 1
+    fi
+    echo "    PASS: -4 connected to $ADDR4"
+
+    # ── 2. -6 must connect over IPv6 (skipped where there is none) ───────────
+    echo "==> Part 2: etr -6 localhost must connect over IPv6..."
+    if ! ssh -q -o BatchMode=yes -o ConnectTimeout=3 -6 localhost true 2>/dev/null; then
+        echo "    SKIP: ssh -6 localhost does not work on this host."
+    else
+        SENTINEL6="FAM6_SENTINEL_$$"
+        if ! run_session -6 localhost "$SENTINEL6"; then
+            echo "FAIL: no output from 'etr -6 localhost' within 30 s." >&2
+            exit 1
+        fi
+        ADDR6=$(grep -o '\[etr\] server address [^ ]*' "$CLIENT_LOG" | tail -1 | awk '{print $4}')
+        if [[ "$ADDR6" != \[* ]]; then
+            echo "FAIL: -6 connected over IPv4 ($ADDR6)." >&2
+            exit 1
+        fi
+        echo "    PASS: -6 connected to $ADDR6"
+    fi
+
+    # ── 3. Preference, not restriction ───────────────────────────────────────
+    # 127.0.0.1 has no IPv6 address at all. `-6` must still connect (and must
+    # NOT hand ssh a -6 it would refuse on), which is the whole distinction
+    # between --prefer-ipv6 and ssh's -6.
+    echo "==> Part 3: etr -6 127.0.0.1 must fall back, not fail..."
+    if ! ssh -q -o BatchMode=yes -o ConnectTimeout=3 127.0.0.1 true 2>/dev/null; then
+        # Usually "Host key verification failed": known_hosts has an entry for
+        # `localhost` but not for the literal 127.0.0.1. Nothing to do with etr,
+        # so skip rather than fail -- and say how to enable it, since this part
+        # is the one that proves the flags are preferences and not restrictions.
+        echo "    SKIP: ssh to the literal 127.0.0.1 is not usable on this host."
+        echo "          Enable with: ssh-keyscan -H 127.0.0.1 >> ~/.ssh/known_hosts"
+    else
+        SENTINELF="FAMFB_SENTINEL_$$"
+        if ! run_session -6 127.0.0.1 "$SENTINELF"; then
+            echo "FAIL: -6 against an IPv4-only target did not connect -- the flag is" >&2
+            echo "      behaving as a restriction rather than a preference." >&2
+            exit 1
+        fi
+        if ! grep -q 'no such address' "$CLIENT_LOG"; then
+            echo "FAIL: etr did not report falling back for an unavailable family." >&2
+            cat "$CLIENT_LOG" >&2
+            exit 1
+        fi
+        echo "    PASS: -6 fell back to IPv4 for an IPv4-only target."
+    fi
+
+    echo ""
+    echo "==> All address-family tests passed."
+
 # Run the local E2E test for local port forwarding -L (TCP + UDP, IPv4 + IPv6, reconnect)
 e2e-forward-local: check-tools install
     #!/usr/bin/env bash

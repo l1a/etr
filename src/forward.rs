@@ -15,6 +15,7 @@
 //! 127.0.0.1:8080:localhost:80 Explicit bind address
 //! *:8080:localhost:80        Wildcard bind address
 //! ```
+use crate::addrfam::AddrPref;
 use crate::protocol::ForwardProto;
 
 /// A parsed `-L` or `-R` forwarding specification.
@@ -160,36 +161,54 @@ impl std::fmt::Display for ForwardSpec {
 }
 
 /// Resolve a `"host:port"` string to a `SocketAddr` for UDP forwarding,
-/// preferring IPv6 when the kernel has a route to it.
+/// honouring the caller's `-4`/`-6` preference.
 ///
-/// We prefer IPv6 to be consistent with modern Happy-Eyeballs behaviour.
-/// For each candidate address (IPv6 first, then IPv4) we probe routing by
-/// binding an ephemeral UDP socket and calling `connect()` on it — this
-/// checks the routing table without sending any packets.  The first address
-/// whose routing probe succeeds is returned.
-pub async fn resolve_udp_target(addr_str: &str) -> Option<std::net::SocketAddr> {
+/// Candidates of the preferred family are tried first; for each one, routing is
+/// probed by binding an ephemeral UDP socket and calling `connect()` on it —
+/// which checks the routing table without sending any packets.  The first
+/// address whose probe succeeds is returned, so an unroutable preferred family
+/// falls back to the other one rather than failing.
+///
+/// [`AddrPref::Auto`] means **IPv6 first**, which is what this function has done
+/// since v0.4.x and what its regression test asserts; the flag only overrides
+/// that order, it does not introduce it.
+///
+/// Returns `None` when the name does not resolve, or resolves only to addresses
+/// the kernel has no route to at all.
+pub async fn resolve_udp_target(addr_str: &str, pref: AddrPref) -> Option<std::net::SocketAddr> {
     let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(addr_str).await.ok()?.collect();
+    let ordered = crate::addrfam::order_by_family(&addrs, pref.or(AddrPref::Ipv6));
+    crate::addrfam::first_routable(&ordered)
+}
 
-    // IPv6 candidates first, then IPv4.
-    let ordered = addrs
-        .iter()
-        .filter(|a| a.is_ipv6())
-        .copied()
-        .chain(addrs.iter().filter(|a| a.is_ipv4()).copied());
-
+/// Connect to a forwarded TCP target, trying the preferred address family first.
+///
+/// `tokio::net::TcpStream::connect("host:port")` already walks every resolved
+/// address, but in whatever order the resolver returned them — so a `-4`/`-6`
+/// preference would be ignored for forwarded TCP while being honoured for the
+/// QUIC connection and for UDP forwards.  This reorders the candidate list and
+/// then keeps the same "try each until one connects" behaviour, so the flag
+/// changes *which family is tried first*, never whether the forward works.
+///
+/// The error returned when every candidate fails is the last connect error,
+/// matching what `TcpStream::connect` would have reported.
+pub async fn connect_tcp_preferred(
+    addr_str: &str,
+    pref: AddrPref,
+) -> std::io::Result<tokio::net::TcpStream> {
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(addr_str).await?.collect();
+    let ordered = crate::addrfam::order_by_family(&addrs, pref);
+    let mut last_err = std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("could not resolve {addr_str}"),
+    );
     for addr in ordered {
-        let bind_str = if addr.is_ipv6() {
-            "[::]:0"
-        } else {
-            "0.0.0.0:0"
-        };
-        if let Ok(sock) = std::net::UdpSocket::bind(bind_str)
-            && sock.connect(addr).is_ok()
-        {
-            return Some(addr);
+        match tokio::net::TcpStream::connect(addr).await {
+            Ok(s) => return Ok(s),
+            Err(e) => last_err = e,
         }
     }
-    None
+    Err(last_err)
 }
 
 #[cfg(test)]
@@ -309,7 +328,7 @@ mod tests {
     async fn test_resolve_udp_target_localhost() {
         // localhost always resolves to a loopback address; the routing probe must
         // succeed and return either ::1 (IPv6 preferred) or 127.0.0.1 (IPv4 fallback).
-        let addr = super::resolve_udp_target("localhost:53")
+        let addr = super::resolve_udp_target("localhost:53", AddrPref::Auto)
             .await
             .expect("localhost must resolve");
         assert_eq!(addr.port(), 53);
@@ -320,7 +339,7 @@ mod tests {
     async fn test_resolve_udp_target_prefers_ipv6() {
         // On any system with an IPv6 loopback (virtually universal), ::1 should be
         // chosen over 127.0.0.1 because IPv6 is tried first.
-        let addr = super::resolve_udp_target("localhost:53").await;
+        let addr = super::resolve_udp_target("localhost:53", AddrPref::Auto).await;
         if let Some(a) = addr {
             // If the system has IPv6 routing, the result must be IPv6.
             // If not (IPv6 disabled), IPv4 fallback is acceptable.
@@ -339,7 +358,7 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_udp_target_explicit_ipv4() {
         // An explicit IPv4 address skips the IPv6 probe and resolves directly.
-        let addr = super::resolve_udp_target("127.0.0.1:1234")
+        let addr = super::resolve_udp_target("127.0.0.1:1234", AddrPref::Auto)
             .await
             .expect("explicit IPv4 loopback must resolve");
         assert!(addr.is_ipv4());
@@ -348,8 +367,65 @@ mod tests {
 
     #[tokio::test]
     async fn test_resolve_udp_target_unresolvable() {
-        let addr = super::resolve_udp_target("this.hostname.does.not.exist.invalid:53").await;
+        let addr =
+            super::resolve_udp_target("this.hostname.does.not.exist.invalid:53", AddrPref::Auto)
+                .await;
         assert!(addr.is_none(), "unresolvable host must return None");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_udp_target_ipv4_preference_overrides_default() {
+        // `-4` must beat the IPv6-first default on a name that has both.
+        let addr = super::resolve_udp_target("localhost:53", AddrPref::Ipv4)
+            .await
+            .expect("localhost must resolve");
+        assert!(addr.is_ipv4(), "expected IPv4 under -4, got {addr}");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_udp_target_preference_falls_back_to_other_family() {
+        // Preference, not restriction: an IPv4-only target under `-6` still resolves.
+        let addr = super::resolve_udp_target("127.0.0.1:53", AddrPref::Ipv6)
+            .await
+            .expect("explicit IPv4 target must still resolve under -6");
+        assert!(addr.is_ipv4());
+    }
+
+    #[tokio::test]
+    async fn test_connect_tcp_preferred_reaches_an_ipv4_listener() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move { listener.accept().await.map(|_| ()) });
+
+        let stream = super::connect_tcp_preferred(&format!("127.0.0.1:{port}"), AddrPref::Ipv4)
+            .await
+            .expect("connect to a live IPv4 listener must succeed");
+        assert!(stream.peer_addr().unwrap().is_ipv4());
+        accept.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_connect_tcp_preferred_falls_back_across_families() {
+        // Listener on IPv4 loopback only, connected via a name that resolves to
+        // both families with `-6`: the IPv6 candidate must fail and the IPv4 one
+        // must still be tried, since the flag is a preference.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept = tokio::spawn(async move { listener.accept().await.map(|_| ()) });
+
+        let stream = super::connect_tcp_preferred(&format!("localhost:{port}"), AddrPref::Ipv6)
+            .await
+            .expect("IPv6 preference must fall back to the IPv4 listener");
+        assert!(stream.peer_addr().unwrap().is_ipv4());
+        accept.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_connect_tcp_preferred_unresolvable_host_errors() {
+        let r =
+            super::connect_tcp_preferred("this.hostname.does.not.exist.invalid:80", AddrPref::Auto)
+                .await;
+        assert!(r.is_err(), "unresolvable host must be an error");
     }
 
     #[test]
