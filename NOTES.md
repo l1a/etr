@@ -9,6 +9,39 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
+## Current state: v0.8.1 — the completions helper could overwrite the binary it was asked to read
+
+Tooling only; no runtime change (145 tests, unchanged).
+`scripts/install_completions.py` → **template v3**.
+
+- **The defect, found in `rusticprofile` and propagated here because the file is vendored
+  byte-identically.** There it destroyed a working binary on a host taking hourly backups — a
+  3.6 MB executable replaced by a 21 KB bash completion script. etr's copy carried the same bug.
+- **The mechanism.** `binaries` are command *names*, and the output path is
+  `directory / pattern.format(bin=binary)` — but **`Path("/dest") / "/abs/path"` discards the left
+  operand**. An absolute argument therefore relocates every write out of the completion directory
+  and onto the path itself, which under `--from-path` is the installed binary.
+- **It fails in the worst available order.** `--from-path` runs `[binary]`, so an absolute path
+  *works for the read* and only breaks the write: generation succeeds and then destroys its own
+  input, exit 0, nothing printed. And the flag is **called `--from-path`**, which invites precisely
+  the argument that breaks it — so documenting it would not have prevented it.
+- **Fixed by making it unexpressible.** `reject_path_like()` refuses any argument containing a path
+  separator or resolving absolute, **before any file is written**, and names the correct form
+  (`install_completions.py etr --from-path`) in the error.
+- **Watched failing in both places it is enforced**: neutering the condition fails `--self-test`
+  (*"rejects an absolute path — expected True, got False"*) and fails `just standard-check`, which
+  `just check` depends on. Re-running the original accident against a stand-in file now leaves it
+  **byte-identical** instead of clobbered. A fourth self-test case pins the *property* — joining a
+  directory with an absolute string yields the absolute string — so the check survives a rewrite of
+  the guard.
+- **etr's own recipes were never at risk**: `install`, `install-tag` and `standard-check` pass
+  `{{BINS}}`, i.e. bare names. Checked rather than assumed. The exposure is anyone invoking the
+  helper directly, which is how it happened.
+- *Incidentally repaired:* the worktree copy of this file was **CRLF while the index was LF**
+  (`git ls-files --eol` → `i/lf w/crlf`), stale from before `.gitattributes` landed. Writing the
+  canonical LF file brings the two back into agreement, which is why this is a 50-line diff rather
+  than a whole-file rewrite.
+
 ## Current state: v0.8.0 — `-4`/`-6` address-family preference
 
 New in v0.8.0 (client + server feature; 112 → 145 tests, one new e2e recipe).

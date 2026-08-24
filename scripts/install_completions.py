@@ -3,7 +3,7 @@
 # Copyright (C) 2026 l1a
 """Install shell completions for one or more binaries. Canonical across repos.
 
-TEMPLATE v2 — vendored verbatim in rusticprofile, retch and etr. Change it here,
+TEMPLATE v3 — vendored verbatim in rusticprofile, retch and etr. Change it here,
 bump TEMPLATE_VERSION, and propagate in each repo's own PR. `just standard-check`
 runs `--self-test` below, so the behavioural invariants are asserted rather than
 compared as text: three separate repositories cannot diff each other's files, but
@@ -56,7 +56,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-TEMPLATE_VERSION = 2
+TEMPLATE_VERSION = 3
 
 
 def completion_dirs(env, home):
@@ -100,6 +100,34 @@ def zsh_reads(directory):
     if res.returncode != 0:
         return None
     return str(directory) in res.stdout.splitlines()
+
+
+def reject_path_like(binary):
+    """Refuse a path where a command NAME belongs. Invariant 4.
+
+    `out = directory / pattern.format(bin=binary)` — and `Path("/dest") / "/abs/path"`
+    DISCARDS the left operand. So an absolute `binary` silently relocates the write out of
+    the completion directory and onto the path itself, which for `--from-path` is the
+    installed binary: the helper overwrites the very executable it was asked to read.
+
+    Measured 2026-08-24: `install_completions.py ~/.cargo/bin/rusticprofile --from-path`
+    replaced a 3.6 MB binary with a 21 KB bash completion script, on a host taking hourly
+    backups. It fails in the worst possible way — `--from-path` runs `[binary]`, so an
+    absolute path WORKS for the read and only breaks the write. Generation succeeds, then
+    destroys its own input, and the flag is *called* `--from-path`, which invites exactly
+    the argument that breaks it.
+
+    Made unexpressible rather than documented, on the precedent of refusing a snapshot-set
+    name beginning with `-`: a note in a docstring would not have stopped it, because the
+    person passing the path has already read the flag name and concluded it wants one.
+    """
+    if os.sep in binary or (os.altsep and os.altsep in binary) or Path(binary).is_absolute():
+        raise RuntimeError(
+            f"`{binary}` looks like a path; this takes a command NAME.\n"
+            f"  Use:  install_completions.py {Path(binary).name} --from-path\n"
+            "  (--from-path means 'run the binary as resolved on PATH', not "
+            "'here is a path to the binary'.)"
+        )
 
 
 def generate(binary, shell, out_path, repo_root, from_path=False):
@@ -173,6 +201,23 @@ def self_test():
     # All six shells present, so a silently dropped one cannot pass.
     check("shell count", len(unix), 6)
 
+    # Invariant 4: a path where a NAME belongs must be refused, because pathlib would
+    # otherwise discard the destination directory and write over the binary itself.
+    def refuses(arg):
+        try:
+            reject_path_like(arg)
+            return False
+        except RuntimeError:
+            return True
+
+    check("rejects an absolute path", refuses(str(Path.home() / ".cargo/bin/rusticprofile")), True)
+    check("rejects a relative path", refuses(f"bin{os.sep}rusticprofile"), True)
+    check("accepts a bare name", refuses("rusticprofile"), False)
+    # The failure it prevents, stated as the property rather than the mechanism: joining a
+    # directory with an absolute string must never be how an output path is chosen.
+    check("pathlib really does discard the left operand",
+          str(Path("/dest/dir") / "/abs/path"), str(Path("/abs/path")))
+
     if failures:
         print(f"self-test FAILED (template v{TEMPLATE_VERSION}):", file=sys.stderr)
         print("\n".join(failures), file=sys.stderr)
@@ -196,6 +241,9 @@ def main(argv):
 
     repo_root = Path(__file__).resolve().parent.parent
     dirs = completion_dirs(os.environ, Path.home())
+
+    for binary in binaries:
+        reject_path_like(binary)  # invariant 4 — before ANY file is written
 
     for binary in binaries:
         for shell, (directory, pattern) in dirs.items():
