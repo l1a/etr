@@ -9,8 +9,15 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.8.2 — man page documentation for --reconnect-timeout
-## Current State (v0.8.2)
+## Current state: v0.8.3 — AGENTS.md §4.11 wiki clone fast-forward requirement
+## Current State (v0.8.3)
+
+Documentation & release hygiene (145 tests, unchanged).
+
+- **`AGENTS.md` §4.11 updated with explicit wiki fast-forward instruction.**
+  Clarified that contributors/agents must fast-forward an existing local clone (`git pull --ff-only`) before making changes, preventing stale local clones from inadvertently reverting upstream wiki updates.
+
+## Previous: v0.8.2 — man page documentation for --reconnect-timeout
 
 Documentation fix (145 tests, unchanged).
 
