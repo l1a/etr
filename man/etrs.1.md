@@ -73,6 +73,12 @@ window expires), the child exits.
 **\-\-log-path** *PATH*
 :   Path to the server log file. Defaults to **\$XDG_STATE_HOME/etr/etrs.log**.
 
+**\-\-reconnect\-timeout** *SECS*
+:   How long (in seconds) to keep a session alive while the client is
+    disconnected. Defaults to **1800** (30 minutes). Override priority:
+    CLI flag > **ETR_SERVER_NETWORK_TMOUT** > **reconnect_timeout** under
+    **\[server\]** in config file > default.
+
 **-h**, **\-\-help**
 :   Print help and exit.
 
@@ -89,6 +95,10 @@ window expires), the child exits.
 
 **SHELL**
 :   Shell to launch for the PTY session. Defaults to **/bin/bash** if unset.
+
+**ETR_SERVER_NETWORK_TMOUT**
+:   How long (in seconds) to keep a session alive while disconnected if
+    **\-\-reconnect\-timeout** is not specified.
 
 **XDG_STATE_HOME**
 :   Base directory for the log file. Defaults to **~/.local/state**.
@@ -117,10 +127,6 @@ gateway-mode reverse forwarding.
 # SEE ALSO
 
 **etr**(1), **ssh**(1)
-
-# BUGS
-
-- The reconnect window (30 minutes) is not configurable.
 
 # AUTHORS
 

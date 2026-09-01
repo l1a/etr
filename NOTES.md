@@ -9,7 +9,17 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.8.1 — the completions helper could overwrite the binary it was asked to read
+## Current state: v0.8.2 — man page documentation for --reconnect-timeout
+## Current State (v0.8.2)
+
+Documentation fix (145 tests, unchanged).
+
+- **Documented `--reconnect-timeout` and `ETR_SERVER_NETWORK_TMOUT` in `man/etrs.1.md`.**
+  Added `--reconnect-timeout <SECS>` to OPTIONS and `ETR_SERVER_NETWORK_TMOUT` to ENVIRONMENT.
+- **Removed stale BUGS section from `man/etrs.1.md`.**
+  Removed the false claim that *"The reconnect window (30 minutes) is not configurable"*, which had been stale since v0.4.6.
+
+## Previous: v0.8.1 — the completions helper could overwrite the binary it was asked to read
 
 Tooling only; no runtime change (145 tests, unchanged).
 `scripts/install_completions.py` → **template v3**.
@@ -42,7 +52,7 @@ Tooling only; no runtime change (145 tests, unchanged).
   canonical LF file brings the two back into agreement, which is why this is a 50-line diff rather
   than a whole-file rewrite.
 
-## Current state: v0.8.0 — `-4`/`-6` address-family preference
+## Previous: v0.8.0 — `-4`/`-6` address-family preference
 
 New in v0.8.0 (client + server feature; 112 → 145 tests, one new e2e recipe).
 
@@ -104,13 +114,10 @@ New in v0.8.0 (client + server feature; 112 → 145 tests, one new e2e recipe).
   wrong family. `PROTOCOL.md` §2 documents `ETRPREFER:` (and `ETRX11:`, which it had never
   listed) plus the forward-compatibility rule that makes both safe.
 
-### Found while doing this, NOT fixed here
+### Found while doing this, ~~NOT fixed here~~ (Fixed in v0.8.2)
 
-- **`man/etrs.1.md`'s BUGS section still says "The reconnect window (30 minutes) is not
-  configurable."** It has been configurable since v0.4.6 — `--reconnect-timeout`,
-  `ETR_SERVER_NETWORK_TMOUT`, or `[server] reconnect_timeout` — and that flag is not
-  documented in the page's OPTIONS either. Left for its own PR rather than widened into
-  this one; it is a documentation defect, not a behaviour one.
+- ~~**`man/etrs.1.md`'s BUGS section still says "The reconnect window (30 minutes) is not
+  configurable."**~~ **Fixed in v0.8.2**: Documented `--reconnect-timeout` in OPTIONS and `ETR_SERVER_NETWORK_TMOUT` in ENVIRONMENT; removed stale BUGS entry.
 
 ## Previous: v0.7.9 — the release checklist no longer deletes the handoff file
 
