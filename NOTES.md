@@ -9,8 +9,60 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.9.0 — COPR and Homebrew, and packaging that cannot drift
-## Current State (v0.9.0)
+## Current state: v0.9.1 — three corrections to text v0.9.0 got wrong
+## Current State (v0.9.1)
+
+Documentation and one new guard (145 tests, unchanged; no Rust change).
+
+Three corrections, two of them to claims **v0.9.0 itself introduced**, which is the honest
+framing: this release fixes things the previous one got wrong rather than discovering old rot.
+
+- **The COPR project description named the wrong comparator.** It opened *"Unlike mosh, etr
+  needs no pre-running daemon and no UDP port opened in advance…"*. **mosh does not need a
+  pre-running daemon** — `mosh-server` is started on demand over SSH, exactly etr's model. The
+  program that does need one is **et** (`etserver`). The repo already had this right in the
+  wiki's `Compared-to-et-and-mosh.md` ("ET requires a pre-running daemon … etr starts the
+  server on the fly like mosh"), so the new text contradicted the project's own documentation.
+  - **The port half was wrong too, and swapping mosh→et would have shipped a second false
+    claim.** etr binds an OS-assigned *ephemeral* UDP port (`etrs -p` pins one); mosh defaults
+    to UDP 60000–61000. Both need inbound UDP, and a random high port is *harder* to
+    pre-authorise in a firewall, not easier. The sentence now states the bootstrap honestly
+    and says outright that a port must be reachable.
+- **The "Vibe coded" disclaimer was false in the direction that costs credibility.** It said
+  the project *"has not been reviewed by an experienced systems or networking engineer"* —
+  but the networking and systems design is directed by a network architect whose production
+  background is large-scale multi-national networks (100,000+ nodes). That is precisely the
+  review the sentence disclaimed.
+  - **The correction that matters is not the flattering half.** Understating review is not the
+    safe side: it invites the wrong reviewers and leaves the real gap unnamed. The disclaimer
+    now names the two reviews actually wanted — **working Rust programmers** (idiomatic style,
+    API design, async/concurrency correctness) and **cryptography/protocol-security experts**
+    (the SSH-bootstrapped certificate pinning, session passkey handling, replay and reconnect
+    semantics, and the retired ML-KEM story). The AI-authorship disclosure is unchanged.
+  - Fixed in **both** copies, which are byte-identical: `README.md` and the wiki's `Home.md`.
+- **`packaging/copr/etr.spec`'s seed `%changelog` entry had the wrong weekday.** The v0.9.0
+  COPR build logged `warning: bogus date in %changelog: Sat Sep 13 2026` — 2026-09-13 is a
+  Sunday. The package built and shipped anyway, which is exactly why it needed a check.
+  - **The generator was never at fault, and that is the instructive part.**
+    `render_packaging.prepend_changelog` derives the weekday with `strftime`, so any entry it
+    writes is correct. But it is deliberately *idempotent* — on finding an entry for the
+    version already present it declines to add a second — so it stepped over the hand-written
+    seed entry and **preserved the wrong date**. A safety property (no duplicate entries)
+    protected a defect. Every future version gets a correct weekday automatically; only a
+    hand-written entry can be wrong.
+  - New `check_changelog_dates` in `scripts/packaging_check.py` asserts every entry's weekday
+    against its date, so the class is closed rather than the instance. Watched failing on the
+    real defect: reverting the spec to `Sat` makes `just check` exit 1 naming the entry.
+    Negative controls also cover an impossible date (`Feb 30`), prose asterisks that must
+    *not* parse as entries, and a file with no entries at all — "no entries matched" is a
+    format change, not a pass.
+  - The month table is spelled out rather than parsed with `strptime("%b")`, whose output
+    follows `LC_TIME` and would misparse on a non-English host.
+
+**The live COPR project page was corrected out of band** with `copr-cli modify`; it is not
+updated by a merge, only by a tag or an explicit push.
+
+## Previous: v0.9.0 — COPR and Homebrew, and packaging that cannot drift
 
 Packaging and release tooling (145 tests, unchanged — no Rust code changed).
 
