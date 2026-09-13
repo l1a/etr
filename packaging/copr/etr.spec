@@ -131,5 +131,5 @@ cargo test --release --locked
 %{fish_completions_dir}/etrs.fish
 
 %changelog
-* Sat Sep 13 2026 Ken Tobias <634380+l1a@users.noreply.github.com> - 0.9.0-1
+* Sun Sep 13 2026 Ken Tobias <634380+l1a@users.noreply.github.com> - 0.9.0-1
 - Initial COPR packaging

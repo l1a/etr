@@ -30,6 +30,7 @@ text to the repository, so it is an explicit, separate act (`just github-metadat
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import re
 import subprocess
@@ -51,6 +52,14 @@ except ModuleNotFoundError:  # pragma: no cover - only on Python < 3.11
     raise SystemExit(1)
 
 SENTINEL_RE = re.compile(r"@[A-Z0-9_]+@")
+
+# rpm changelog months are always these three-letter English abbreviations, independent of
+# the machine's locale -- which is why they are spelled out rather than parsed with
+# strptime("%b"), whose output follows LC_TIME and would misparse on a non-English host.
+MONTHS = {
+    "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+    "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
+}
 
 # Each template, and the sentinels it MUST still contain. Naming them individually rather
 # than "at least one sentinel" is the point: the AUR pair restates four checksums, and a
@@ -288,6 +297,64 @@ def check_both_binaries(root: Path = REPO_ROOT) -> list[str]:
     return problems
 
 
+def check_changelog_dates(root: Path = REPO_ROOT) -> list[str]:
+    """Every `%changelog` entry's weekday must match its date.
+
+    rpm writes changelog dates as `* <Day> <Mon> <DD> <YYYY> …` and rpmbuild warns
+    `bogus date in %changelog` when the weekday disagrees with the date. It is only a warning,
+    so it does not fail a build -- which is exactly why it needs a check here: the v0.9.0 COPR
+    build carried `Sat Sep 13 2026` for a Sunday, and the package shipped regardless.
+
+    **The generator was never the problem, and that is the interesting part.**
+    `render_packaging.prepend_changelog` derives the weekday with `strftime`, so an entry it
+    writes is always right. But it is deliberately idempotent -- on finding an entry for the
+    version already present it declines to add a second -- so the hand-written seed entry it
+    skipped over kept its wrong weekday. The guard therefore has to read the committed file,
+    not the rendered output, because that is where a human can still get it wrong.
+    """
+    problems = []
+    rel = "packaging/copr/etr.spec"
+    try:
+        text = _read(root, rel)
+    except FileNotFoundError:
+        return [f"{rel}: missing"]
+
+    # Anchored to the line start and requiring the full `* Day Mon DD YYYY` shape, so prose
+    # containing an asterisk (or a `%description` bullet) is never mistaken for an entry.
+    entry_re = re.compile(
+        r"^\* (?P<dow>Mon|Tue|Wed|Thu|Fri|Sat|Sun) "
+        r"(?P<mon>Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) "
+        r"(?P<day>\d{2}) (?P<year>\d{4}) ",
+        re.M,
+    )
+    found = 0
+    for m in entry_re.finditer(text):
+        found += 1
+        try:
+            actual = datetime.date(
+                int(m.group("year")),
+                MONTHS[m.group("mon")],
+                int(m.group("day")),
+            )
+        except ValueError:
+            problems.append(
+                f"{rel}: changelog entry has an impossible date: "
+                f"{m.group('mon')} {m.group('day')} {m.group('year')}"
+            )
+            continue
+        expected = actual.strftime("%a")
+        if expected != m.group("dow"):
+            problems.append(
+                f"{rel}: changelog entry '{m.group(0).strip()}' says {m.group('dow')} but "
+                f"{actual.isoformat()} is a {expected} -- rpmbuild warns 'bogus date in "
+                f"%changelog'. Hand-written entries are the only ones that can be wrong; "
+                f"render_packaging.py derives the weekday."
+            )
+    if found == 0:
+        problems.append(f"{rel}: no %changelog entries matched -- has the format changed?")
+    return problems
+
+
 def check_copr_project_text(meta: dict, root: Path = REPO_ROOT) -> list[str]:
     """The COPR project page's Markdown renders as prose, not as code blocks.
 
@@ -345,6 +412,7 @@ def run_all(root: Path = REPO_ROOT) -> list[str]:
         *check_channels_agree(meta, root),
         *check_locked_not_dropped(root),
         *check_both_binaries(root),
+        *check_changelog_dates(root),
         *check_copr_project_text(meta, root),
         *check_github_metadata(meta),
     ]
@@ -421,6 +489,8 @@ def sync_github(meta: dict, *, dry_run: bool) -> int:
 
 
 def _self_test() -> int:
+    import tempfile
+
     failures: list[str] = []
 
     def check(name: str, cond: bool, detail: str = "") -> None:
@@ -463,8 +533,6 @@ def _self_test() -> int:
 
     # A template that lost its sentinel must be reported. Built as a throwaway tree rather
     # than by editing the real one.
-    import tempfile
-
     with tempfile.TemporaryDirectory() as td:
         fake = Path(td)
         for rel in REQUIRED_SENTINELS:
@@ -480,6 +548,42 @@ def _self_test() -> int:
         # And a missing file must be reported rather than crashing the run.
         (fake / "packaging/copr/etr.spec").unlink()
         check("missing template caught", any("missing" in p for p in check_sentinels(fake)))
+
+    # The changelog weekday guard, watched failing on the exact defect it was written for.
+    # v0.9.0 really did ship `Sat Sep 13 2026` for a Sunday, and rpmbuild only warned.
+    with tempfile.TemporaryDirectory() as td:
+        fake = Path(td)
+        (fake / "packaging/copr").mkdir(parents=True)
+        spec = fake / "packaging/copr/etr.spec"
+
+        spec.write_text(
+            "%changelog\n* Sun Sep 13 2026 X <x@y> - 0.9.0-1\n- ok\n", encoding="utf-8"
+        )
+        check("changelog correct weekday passes", not check_changelog_dates(fake),
+              f"a correct entry was flagged: {check_changelog_dates(fake)}")
+
+        spec.write_text(
+            "%changelog\n* Sat Sep 13 2026 X <x@y> - 0.9.0-1\n- the v0.9.0 defect\n",
+            encoding="utf-8",
+        )
+        problems = check_changelog_dates(fake)
+        check("changelog wrong weekday caught", len(problems) == 1, f"got {problems}")
+
+        # An impossible date must be reported rather than crash the whole run.
+        spec.write_text("%changelog\n* Mon Feb 30 2026 X <x@y> - 1.0-1\n- nope\n", encoding="utf-8")
+        check("changelog impossible date caught", bool(check_changelog_dates(fake)))
+
+        # Prose containing an asterisk is not a changelog entry and must not be parsed as one.
+        spec.write_text(
+            "%description\n* a bulleted line\n\n%changelog\n* Sun Sep 13 2026 X <x@y> - 1.0-1\n",
+            encoding="utf-8",
+        )
+        check("changelog ignores prose asterisks", not check_changelog_dates(fake),
+              f"prose was parsed as an entry: {check_changelog_dates(fake)}")
+
+        # A file with no entries at all is a format change, not a pass.
+        spec.write_text("Name: etr\n", encoding="utf-8")
+        check("changelog absence caught", bool(check_changelog_dates(fake)))
 
     # The COPR indent trap, in both directions.
     with tempfile.TemporaryDirectory() as td:
