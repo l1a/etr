@@ -1,0 +1,135 @@
+# COPR spec for etr. See packaging/aur/PKGBUILD.in for the sibling packaging target.
+#
+# THIS IS A TEMPLATE. Its Version: field is a sentinel filled in by render_packaging.py,
+# .copr/Makefile runs when it builds the SRPM -- so the version comes from Cargo.toml in the
+# checkout COPR cloned, and nothing in this file records a release. See that script for why
+# recording it is the wrong shape.
+#
+# Source0 is a LOCAL tarball, not a URL. .copr/Makefile builds it from the checkout, so this
+# spec needs neither a published tag nor network access to find its source:
+#   - a PR can build its own SRPM, which it could not while Source0 pinned a tag tarball that
+#     only exists after a release;
+#   - the built package is the code COPR actually cloned, rather than a re-download that is
+#     merely expected to match it.
+# The rendered %changelog entry is generated in the same pass as Version:, so the two cannot
+# disagree (rpmlint's incoherent-version-in-changelog).
+#
+# This spec is written for COPR with "Enable internet access during builds" ON, so
+# `cargo build` resolves crates.io at build time and there is no vendor tarball. Two
+# consequences, both deliberate:
+#   1. --locked is load-bearing. With network access and no vendoring it is the only thing
+#      pinning what gets resolved to what was actually tested. Never drop it.
+#   2. This will NOT build in koji. Fedora proper requires offline builds, so shipping there
+#      would need a vendor tarball as Source1. COPR is the endpoint.
+
+Name:           etr
+Version:        @VERSION@
+Release:        1%{?dist}
+Summary:        Reconnecting remote shell over QUIC
+
+License:        GPL-3.0-only
+URL:            https://github.com/l1a/etr
+Source0:        %{name}-%{version}.tar.gz
+
+ExclusiveArch:  x86_64 aarch64
+
+BuildRequires:  cargo
+BuildRequires:  rust
+BuildRequires:  gcc
+# src/login.rs links libutempter so sessions appear in `last`. The -devel package supplies
+# the header and the link target; the runtime library is picked up as an automatic
+# dependency, so it is deliberately NOT listed under Requires.
+BuildRequires:  libutempter-devel
+
+# etr bootstraps the remote session by SSHing to the host and starting etrs there, so an ssh
+# client is a genuine runtime requirement of the CLIENT rather than a nicety.
+Requires:       openssh-clients
+# The setgid-utmp helper that libutempter delegates to. Without it the session still works
+# and simply does not appear in `last`, so this is Recommends rather than Requires -- a
+# container install should not drag it in.
+Recommends:     libutempter
+
+%description
+etr is a persistent remote shell in the mould of Eternal Terminal and mosh:
+the session keeps running on the server when the network drops, and the
+client reconnects transparently when it comes back.
+
+It needs no pre-running daemon on the server. The client SSHes to the host,
+starts etrs on the fly, and then connects to it over QUIC (TLS 1.3) with the
+server's certificate pinned. Local and remote TCP/UDP port forwarding and
+X11 forwarding are supported.
+
+This package installs both the client (etr) and the per-session server
+(etrs).
+
+%prep
+%autosetup -n %{name}-%{version}
+
+%build
+# Keep cargo's state inside the build tree rather than $HOME.
+export CARGO_HOME=%{_builddir}/cargo-home
+
+# Fedora's own rustc flags, from rust-srpm-macros. Three reasons to use them rather than
+# cargo's defaults:
+#   1. Hardening and codegen policy the distro expects.
+#   2. They carry -Cdebuginfo=2 -Cstrip=none, which is what makes rpm's debuginfo extraction
+#      work. Without them a Rust release build has no DWARF, rpm finds nothing, and the build
+#      fails on an empty debuginfo package.
+#   3. This is NOT "shipping a debug build" -- -Copt-level=3 is in there; rpm moves the
+#      symbols into separate -debuginfo/-debugsource subpackages and strips the binary in the
+#      main package.
+# Deliberately NOT using rust-packaging's %%cargo_prep/%%cargo_build: those assume Fedora's
+# offline, vendored-dependency workflow and write a cargo config with offline = true, which
+# would fight the network-enabled build this spec is designed around.
+export RUSTFLAGS="%{build_rustflags}"
+
+cargo build --release --locked
+
+%install
+# Not stripped here: with debuginfo present, rpm's own pass extracts the symbols into the
+# debuginfo subpackage and strips these binaries. Stripping first would leave that empty.
+install -Dpm0755 target/release/etr  %{buildroot}%{_bindir}/etr
+install -Dpm0755 target/release/etrs %{buildroot}%{_bindir}/etrs
+
+# The COMMITTED man pages are installed as-is; they are NOT regenerated with mandown.
+# Regenerating would make the packaged page depend on which mandown build ran, and the pages
+# are tracked precisely so a tag tarball carries them (see the `man` recipe in the justfile).
+install -Dpm0644 man/etr.1  %{buildroot}%{_mandir}/man1/etr.1
+install -Dpm0644 man/etrs.1 %{buildroot}%{_mandir}/man1/etrs.1
+
+# Generated by the binaries just built, so they cannot disagree with the actual CLI.
+# Safe because COPR builds each arch natively; a cross-build would need a host binary.
+install -d %{buildroot}%{bash_completions_dir}
+install -d %{buildroot}%{zsh_completions_dir}
+install -d %{buildroot}%{fish_completions_dir}
+for b in etr etrs; do
+    target/release/$b --completions bash > %{buildroot}%{bash_completions_dir}/$b
+    target/release/$b --completions zsh  > %{buildroot}%{zsh_completions_dir}/_$b
+    target/release/$b --completions fish > %{buildroot}%{fish_completions_dir}/$b.fish
+done
+
+%check
+export CARGO_HOME=%{_builddir}/cargo-home
+# The suite is hermetic: no network, no ssh, no PTY session. The e2e recipes that DO need
+# those live in the justfile and are deliberately not run here.
+cargo test --release --locked
+
+%files
+%license LICENSE
+%doc README.md
+%{_bindir}/etr
+%{_bindir}/etrs
+# The glob is load-bearing: rpm compresses man pages on install, so the packaged path is
+# etr.1.gz. Asserting the uncompressed name reports it missing when it is present.
+%{_mandir}/man1/etr.1*
+%{_mandir}/man1/etrs.1*
+%{bash_completions_dir}/etr
+%{bash_completions_dir}/etrs
+%{zsh_completions_dir}/_etr
+%{zsh_completions_dir}/_etrs
+%{fish_completions_dir}/etr.fish
+%{fish_completions_dir}/etrs.fish
+
+%changelog
+* Sat Sep 13 2026 Ken Tobias <634380+l1a@users.noreply.github.com> - 0.9.0-1
+- Initial COPR packaging

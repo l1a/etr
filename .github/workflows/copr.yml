@@ -1,0 +1,133 @@
+name: COPR Rebuild
+
+# Rebuilds the COPR package when a release is tagged, and pushes the COPR project page's
+# description and instructions from packaging/copr/project-*.md.
+#
+# WHY THE TAG IS THE TRIGGER, AND WHY THAT IS SAFE HERE
+#
+# packaging/copr/etr.spec is a TEMPLATE: `.copr/Makefile` renders its version from Cargo.toml
+# when it builds the SRPM. So at the moment vX is pushed, main's Cargo.toml says X and the
+# tree the tag names IS X -- the tag is the event, with no post-tag packaging commit needed
+# and therefore no version bump forced by one.
+#
+# That Cargo.toml-derived version is only safe because of the guard below. A rebuild fired
+# while main is ahead of the last tag would publish a version with no GitHub release and no
+# crates.io upload, and a published COPR NEVRA cannot be recalled.
+
+on:
+  push:
+    tags: [ "v*" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      # fetch-depth: 0 so a workflow_dispatch run can ask git for the last released tag. A
+      # tag-triggered run gets it from the ref and does not need the history, but the guard
+      # below must work identically either way -- a check that is skipped on one of its two
+      # entry points is not a check.
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install copr-cli
+        run: dnf -y install copr-cli git python3
+
+      - name: Refuse unless Cargo.toml matches the released tag
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$PWD"
+          V=$(python3 scripts/render_packaging.py --print-version)
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            TAG="$GITHUB_REF_NAME"
+          else
+            TAG=$(git describe --tags --abbrev=0)
+            echo "manual run: comparing against the last tag, $TAG"
+          fi
+          echo "Cargo.toml: $V"
+          echo "tag:        $TAG"
+          if [ "v$V" != "$TAG" ]; then
+            echo "::error::Cargo.toml is $V but the tag is $TAG — refusing to build a version that was not released"
+            exit 1
+          fi
+          echo "will build etr $V"
+
+      - name: Configure copr-cli
+        env:
+          COPR_LOGIN: ${{ secrets.COPR_LOGIN }}
+          COPR_USERNAME: ${{ secrets.COPR_USERNAME }}
+          COPR_TOKEN: ${{ secrets.COPR_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Guard rather than fail: a fork has no secrets, and a red check there would be
+          # noise about a credential the fork is not supposed to have.
+          if [ -z "${COPR_LOGIN:-}" ] || [ -z "${COPR_TOKEN:-}" ] || [ -z "${COPR_USERNAME:-}" ]; then
+            echo "::notice::COPR credentials not configured; skipping the rebuild"
+            echo "skip=true" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          mkdir -p ~/.config
+          # Written from env, never echoed. Actions masks the values in logs.
+          {
+            echo "[copr-cli]"
+            echo "login = $COPR_LOGIN"
+            echo "username = $COPR_USERNAME"
+            echo "token = $COPR_TOKEN"
+            echo "copr_url = https://copr.fedorainfracloud.org"
+          } > ~/.config/copr
+          chmod 600 ~/.config/copr
+          echo "skip=false" >> "$GITHUB_ENV"
+
+      # THE COPR PROJECT PAGE IS THE ONE PIECE OF COPR TEXT NO BUILD CARRIES.
+      #
+      # The spec's Summary/%description ship inside the RPM, but the description and install
+      # instructions shown on copr.fedorainfracloud.org are stored on the PROJECT, and nothing
+      # else publishes them -- which is how the sibling repo's page came to quote one
+      # machine's benchmark numbers from a release that was long gone. They are pushed from
+      # the committed files on every release, after the same guard `just check` runs, so text
+      # that fails it is never sent. Before the build rather than after it: the text is
+      # version-independent, and a failed build must not leave a stale page behind.
+      # `$(cat ...)` rather than inline text, because COPR renders Markdown and a paragraph
+      # indented 4 spaces becomes a code block.
+      - name: Sync the COPR project description and instructions
+        if: env.skip != 'true'
+        run: |
+          set -euo pipefail
+          python3 scripts/packaging_check.py
+          copr-cli modify \
+            --description "$(cat packaging/copr/project-description.md)" \
+            --instructions "$(cat packaging/copr/project-instructions.md)" \
+            kentobias/etr
+          echo "COPR project description and instructions synced from packaging/copr/project-*.md"
+
+      - name: Rebuild the COPR package
+        if: env.skip != 'true'
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            REF="$GITHUB_REF_NAME"
+          else
+            REF=$(git describe --tags --abbrev=0)
+          fi
+
+          # `buildscm --commit` rather than `build-package`, and the difference is a race.
+          # `build-package` rebuilds from the package's stored SCM config, whose committish is
+          # `main` -- so a merge landing in the minute after a tag push would make COPR clone a
+          # tree AHEAD of the release and publish a version nobody released. Naming the tag
+          # removes the window entirely: COPR builds exactly what vX points at.
+          #
+          # --method make_srpm matches the stored config (.copr/Makefile generates the SRPM);
+          # no --subdir, because COPR runs the Makefile from the repository root. --enable-net
+          # on is stated rather than inherited: the build resolves crates.io, and a silently
+          # net-less buildroot fails deep inside cargo.
+          copr-cli buildscm \
+            --clone-url https://github.com/l1a/etr.git \
+            --commit "$REF" \
+            --method make_srpm \
+            --enable-net on \
+            kentobias/etr

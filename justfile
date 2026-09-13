@@ -17,7 +17,7 @@ INSTALL    := home_directory() + "/.cargo/bin"
 # etr is the TWO-BINARY case the shared standard exists for: the COMMON block below is
 # written against these, so it stays byte-identical to the siblings that ship one binary.
 BINS      := "etr etrs"
-MAN_PAGES := "man/build/etr.1 man/build/etrs.1"
+MAN_PAGES := "man/etr.1 man/etrs.1"
 
 # Do NOT edit inside the markers. Edit templates/justfile-common.just and the two vendored
 # helpers, bump their versions, and propagate to the siblings in their own PRs.
@@ -136,8 +136,27 @@ audit:
     cargo audit
 
 # Run all static checks: fmt + clippy (suitable as a pre-push gate)
-check: fmt-check clippy standard-check
+check: fmt-check clippy standard-check man-check packaging-check
     @echo "All checks passed."
+
+# Every packaging guard, all offline.
+#
+# Wired into `check` deliberately: etr now publishes to five channels, each restating the
+# summary and licence in its own vocabulary, and nothing else would notice one drifting. The
+# sibling repo's AUR package reached ELEVEN releases of drift with every CI run green,
+# because no check was looking. This is the check that looks.
+#
+# Both scripts carry their own `--self-test`, run first: a guard whose own tests are not run
+# is a guard nobody has watched fail.
+
+# Offline packaging guards: templates intact, every channel agrees
+packaging-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [ "{{PY}}" != "PYTHON-NOT-FOUND" ] || { echo "error: no python3/python on PATH" >&2; exit 1; }
+    "{{PY}}" scripts/render_packaging.py --self-test
+    "{{PY}}" scripts/packaging_check.py --self-test
+    "{{PY}}" scripts/packaging_check.py
 
 # Pre-PR gate: run all automated checks and print manual checklist before opening a PR.
 # All items must pass before calling `gh pr create`. See AGENTS.md Part 2 §4.
@@ -328,10 +347,52 @@ merge-pr:
     git branch -D "$BRANCH" 2>/dev/null || true
     python3 scripts/reset_wip.py
 
-# Publish to crates.io (dry-run first; aborts if dry-run fails)
+# Publish the CURRENT version to crates.io, the AUR and the Homebrew tap.
+#
+# COPR is deliberately absent: .github/workflows/copr.yml rebuilds it from the tag itself, so
+# by the time this runs COPR is already building. GitHub releases are likewise built by
+# release.yml on the tag. This recipe covers the three channels that need a push from a
+# workstation.
+#
+# ORDER MATTERS: crates.io first (it is the only irreversible one), then the two that depend
+# on the GitHub release assets existing.
+
+# Publish the current version to crates.io, the AUR and the Homebrew tap
 publish:
     #!/usr/bin/env bash
     set -euo pipefail
+    VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+
+    # REFUSE UNLESS HEAD IS THE TAG FOR THE VERSION ABOUT TO BE UPLOADED.
+    #
+    # `cargo publish` uploads whatever the worktree says, and a crates.io version can be
+    # YANKED BUT NEVER DELETED. The sibling repo came one command away from putting an
+    # untagged 0.17.4 on the index this way -- Cargo.toml had moved ahead of the last tag and
+    # nothing checked. A clean working tree does not help: the tree was clean, it was simply
+    # a version nobody had released.
+    #
+    # Override deliberately with PUBLISH_ANY_REF=1. That is for a genuine exception, not for
+    # getting past a surprise.
+    if [ "${PUBLISH_ANY_REF:-}" != "1" ]; then
+        HEAD_SHA=$(git rev-parse HEAD)
+        TAG_SHA=$(git rev-parse -q --verify "refs/tags/v${VERSION}^{commit}" || true)
+        if [ -z "$TAG_SHA" ]; then
+            echo "ERROR: Cargo.toml is ${VERSION} but there is no tag v${VERSION} in this clone." >&2
+            echo "       Tag and push the release first (git fetch --tags if it was tagged elsewhere)." >&2
+            exit 1
+        fi
+        if [ "$HEAD_SHA" != "$TAG_SHA" ]; then
+            echo "ERROR: HEAD is not v${VERSION}." >&2
+            echo "       HEAD        $HEAD_SHA" >&2
+            echo "       v${VERSION}  $TAG_SHA" >&2
+            echo "       Publishing here would upload source that is not what the tag names." >&2
+            exit 1
+        fi
+        echo "==> HEAD is v${VERSION} (${HEAD_SHA})"
+    else
+        echo "==> PUBLISH_ANY_REF=1: skipping the HEAD-is-the-tag check"
+    fi
+
     echo "==> Verifying working tree is clean..."
     if ! git diff --quiet || ! git diff --cached --quiet; then
         echo "ERROR: working tree has uncommitted changes. Commit or discard them first." >&2
@@ -344,9 +405,12 @@ publish:
     fi
     echo "==> Dry-run passed. Publishing to crates.io..."
     cargo publish
-    echo "==> Published $(grep '^version' Cargo.toml | head -1 | sed 's/.*\"\(.*\)\"/\1/') to crates.io."
+    echo "==> Published ${VERSION} to crates.io."
     echo "==> Publishing AUR package..."
     just publish-aur
+    echo "==> Publishing Homebrew formula..."
+    just brew-publish "${VERSION}"
+    echo "==> crates.io, AUR and Homebrew done. COPR builds from the tag via copr.yml."
 
 # Publish/update the AUR package (etr-terminal-bin) from the current version's GitHub release
 publish-aur:
@@ -374,6 +438,8 @@ publish-aur:
     WORK=$(mktemp -d)
     trap 'rm -rf "$WORK"' EXIT
 
+    # Checksums are COMPUTED from the assets that will actually be downloaded by makepkg,
+    # never copied from a committed field -- nothing in this repo records one.
     echo "==> Downloading release assets and computing sha256 checksums..."
     declare -A SHA
     for a in "${ASSETS[@]}"; do
@@ -382,30 +448,155 @@ publish-aur:
         echo "    ${a}  ${SHA[$a]}"
     done
 
-    # Render PKGBUILD and .SRCINFO from the same templates with the same
-    # substitutions so the two can never disagree.
-    render() {
-        sed -e "s/@VERSION@/${VERSION}/g" \
-            -e "s/@SHA_ETR_X86_64@/${SHA[etr-linux-x86_64]}/g" \
-            -e "s/@SHA_ETRS_X86_64@/${SHA[etrs-linux-x86_64]}/g" \
-            -e "s/@SHA_ETR_AARCH64@/${SHA[etr-linux-aarch64]}/g" \
-            -e "s/@SHA_ETRS_AARCH64@/${SHA[etrs-linux-aarch64]}/g" \
-            "$1"
-    }
+    # PKGBUILD and .SRCINFO are rendered from the same four values by the SAME renderer, so
+    # the two cannot disagree -- the classic AUR footgun, and the reason .SRCINFO is never
+    # hand-written. The renderer refuses a placeholder checksum and refuses to emit a file
+    # with a surviving sentinel, so neither can reach the AUR.
+    SHA_ARGS=(
+        --sha256 "SHA_ETR_X86_64=${SHA[etr-linux-x86_64]}"
+        --sha256 "SHA_ETRS_X86_64=${SHA[etrs-linux-x86_64]}"
+        --sha256 "SHA_ETR_AARCH64=${SHA[etr-linux-aarch64]}"
+        --sha256 "SHA_ETRS_AARCH64=${SHA[etrs-linux-aarch64]}"
+    )
 
     echo "==> Cloning ${AUR_REMOTE}..."
+    # Cloned fresh each time rather than kept as a working copy: a long-lived clone is how
+    # the sibling repo's AUR checkout drifted eleven releases out of date.
     git clone "${AUR_REMOTE}" "${WORK}/aur"
-    render "{{justfile_directory()}}/packaging/aur/PKGBUILD.in" > "${WORK}/aur/PKGBUILD"
-    render "{{justfile_directory()}}/packaging/aur/SRCINFO.in"  > "${WORK}/aur/.SRCINFO"
+    "{{PY}}" scripts/render_packaging.py --target aur-pkgbuild --version "${VERSION}" \
+        "${SHA_ARGS[@]}" --out "${WORK}/aur/PKGBUILD"
+    "{{PY}}" scripts/render_packaging.py --target aur-srcinfo --version "${VERSION}" \
+        "${SHA_ARGS[@]}" --out "${WORK}/aur/.SRCINFO"
 
-    if [ -z "$(git -C "${WORK}/aur" status --porcelain)" ]; then
+    # Stage FIRST, then ask the index whether anything changed. `git diff --quiet` compares
+    # the worktree to the index and does NOT see untracked files, so on an empty repo it
+    # reports "no changes" and this would exit 0 having published nothing.
+    git -C "${WORK}/aur" add PKGBUILD .SRCINFO
+    if git -C "${WORK}/aur" diff --cached --quiet; then
         echo "==> AUR package already up to date (v${VERSION}); nothing to push."
         exit 0
     fi
-    git -C "${WORK}/aur" add PKGBUILD .SRCINFO
     git -C "${WORK}/aur" commit -m "Update to v${VERSION}"
     git -C "${WORK}/aur" push
     echo "==> Published ${AUR_PKG} v${VERSION} to the AUR."
+
+# ── Homebrew ──────────────────────────────────────────────────────────────────
+#
+# packaging/homebrew/etr.rb is the SOURCE, not a reference copy. `brew-publish` renders it and
+# pushes exactly that file to the tap; `packaging-check` guards it. The sibling repo's AUR
+# pair spent eleven releases as an inert reference copy nothing rendered or checked -- this
+# does not repeat that.
+
+# Render the formula for a released tag and push it to the tap at l1a/homebrew-etr.
+#
+# Takes the version rather than reading Cargo.toml, for the same reason `install-tag` does:
+# the formula is a template, and this is the moment the released version and its checksum come
+# into existence. Nothing in the repo holds a value to bump.
+
+# Render the Homebrew formula for a released tag and push it to the tap
+brew-publish VERSION:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; BOLD='\033[1m'; NC='\033[0m'
+    pass() { echo -e "${GREEN}[✓]${NC} $1"; }
+    fail() { echo -e "${RED}[✗]${NC} $1"; exit 1; }
+    info() { echo -e "${YELLOW}[→]${NC} $1"; }
+
+    TAP_REPO="git@github.com:l1a/homebrew-etr.git"
+    VER="{{VERSION}}"; VER="${VER#v}"
+    [ -n "$VER" ] || fail "brew-publish needs a version, e.g. just brew-publish 0.9.0"
+
+    "{{PY}}" scripts/packaging_check.py || fail "packaging checks failed — not publishing"
+    pass "packaging checks pass"
+
+    # The checksum is COMPUTED from the tarball Homebrew will actually download, never copied
+    # from a committed field. Written to a file rather than piped, so the byte count is
+    # inspectable if the hash ever looks wrong.
+    WORK=$(mktemp -d)
+    trap 'rm -rf "$WORK"' EXIT
+    URL="https://github.com/l1a/etr/archive/refs/tags/v${VER}.tar.gz"
+    info "Downloading and checksumming the v$VER tarball..."
+    curl -sfL -o "$WORK/src.tar.gz" "$URL" \
+        || fail "no release tarball at $URL — tag and release v$VER first"
+    SHA=$("{{PY}}" -c "import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$WORK/src.tar.gz")
+    pass "v$VER tarball: $(wc -c < "$WORK/src.tar.gz" | tr -d ' ') bytes, sha256 $SHA"
+
+    "{{PY}}" scripts/render_packaging.py --target brew --version "$VER" --sha256 "SHA256=$SHA" \
+        --out "$WORK/etr.rb"
+    pass "rendered formula for v$VER"
+
+    echo
+    echo -e "${BOLD}About to publish etr $VER to the Homebrew tap.${NC}"
+    echo "This is public and immediate: $TAP_REPO"
+    echo ""
+    # Takes its answer from BREW_CONFIRM, an interactive stdin, or piped input under a bound --
+    # mirroring `pr`'s PR_CONFIRM and `clean-procs`'s CLEAN_CONFIRM, for the v0.7.2 reason: a
+    # bare `read` can only be answered by a human at a terminal, so a script or agent either
+    # blocks on a stdin that will never answer or dies without saying why, and that failure
+    # reads as the gate REFUSING the publish rather than as a question nobody could hear. This
+    # widens who can answer, not what counts as an answer.
+    if [ -n "${BREW_CONFIRM:-}" ]; then
+        CONFIRM="$BREW_CONFIRM"
+        echo "Type 'yes' to continue: $CONFIRM   (answered by BREW_CONFIRM)"
+    elif [ -t 0 ]; then
+        echo -n "Type 'yes' to continue: "; read -r CONFIRM
+    else
+        read -r -t 10 CONFIRM || CONFIRM=""
+        echo "$CONFIRM"
+        [ -n "$CONFIRM" ] || fail "no terminal and nothing on stdin. Re-run with BREW_CONFIRM=yes"
+    fi
+    [ "$CONFIRM" = "yes" ] || { echo -e "${RED}Aborted.${NC}"; exit 1; }
+
+    info "Cloning the tap..."
+    git clone -q "$TAP_REPO" "$WORK/tap" \
+        || fail "could not clone $TAP_REPO — does the tap exist, and is the SSH key registered?"
+    mkdir -p "$WORK/tap/Formula"
+    cp "$WORK/etr.rb" "$WORK/tap/Formula/etr.rb"
+
+    # A brand-new tap has no commits and therefore no branch, and which name git invents
+    # depends on the host's `init.defaultBranch` -- unset on at least one machine in this
+    # fleet, which would make the tap's default branch differ per publisher. Pin it, but ONLY
+    # when the repo is genuinely empty: doing this unconditionally would move HEAD on a
+    # populated tap without touching the index, which is a quiet way to lose work.
+    if ! git -C "$WORK/tap" rev-parse --verify -q HEAD >/dev/null 2>&1; then
+        git -C "$WORK/tap" symbolic-ref HEAD refs/heads/main
+        info "empty tap: default branch pinned to main"
+    fi
+
+    # A fresh clone does not inherit this repo's commit identity, and GitHub rejects a push
+    # authored with a private email.
+    git -C "$WORK/tap" config user.name  "$(git -C "{{justfile_directory()}}" config user.name)"
+    git -C "$WORK/tap" config user.email "$(git -C "{{justfile_directory()}}" config user.email)"
+
+    # Stage FIRST, then ask the index. See the same note in publish-aur: `git diff --quiet`
+    # cannot see untracked files, so on a brand-new empty tap it reports "no changes" and this
+    # would exit 0 having published nothing -- the worst available outcome.
+    git -C "$WORK/tap" add Formula/etr.rb
+    if git -C "$WORK/tap" diff --cached --quiet; then
+        pass "tap already has this exact formula — nothing to push"
+        exit 0
+    fi
+    git -C "$WORK/tap" commit -q -m "etr $VER"
+    git -C "$WORK/tap" push -q origin HEAD
+    pass "published etr $VER to $TAP_REPO"
+
+# Render the COPR spec as .copr/Makefile will and print it (no network, no rpm tooling).
+#
+# There is no `copr-bump`, because there is nothing to bump: the spec's Version: is @VERSION@
+# and .copr/Makefile renders it from Cargo.toml when COPR builds the SRPM. This recipe exists
+# so a human can see what COPR will be handed without running rpmbuild.
+
+# Print the COPR spec as .copr/Makefile will render it (offline)
+copr-render VERSION="":
+    @"{{PY}}" scripts/render_packaging.py --target copr {{ if VERSION != "" { "--version " + VERSION } else { "" } }}
+
+# Set the GitHub repository description and topics from packaging/metadata.toml, then read
+# them back. Runs the packaging guards first, so text that fails them is never pushed. Pass
+# --dry-run to see the difference without changing anything.
+
+# Push the GitHub About-box description and topics from metadata.toml
+github-metadata *ARGS:
+    @"{{PY}}" scripts/packaging_check.py --sync-github "$@"
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 
@@ -425,7 +616,22 @@ build-stress:
 
 # ── Man pages ────────────────────────────────────────────────────────────────
 
-# Build man pages from man/*.md using mandown
+# Build man pages from man/*.md using mandown.
+#
+# THE RENDERED PAGES ARE TRACKED (man/etr.1, man/etrs.1), and that is a packaging
+# requirement rather than a preference. A GitHub tag tarball contains only tracked files,
+# and both the COPR spec and the Homebrew formula install a man page OUT OF that tarball —
+# so while the pages lived in the gitignored man/build/ neither channel could ship one, and
+# `just install-tag` had to report them "not tracked at that tag". Committing them is also
+# what retch does, for the further reason that regenerating at package-build time makes the
+# packaged page depend on which mandown build happened to run.
+#
+# The consequence to remember: the .TH line embeds the version, so EVERY version bump
+# dirties these two files. That is why AGENTS.md §4.10 says to re-run `just man` after the
+# bump, and why `man-check` below is wired into `just check` — a stale committed page is now
+# a failing gate rather than an invisible wart.
+
+# Build man pages from man/*.md with mandown (output is TRACKED)
 man:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -434,10 +640,48 @@ man:
         exit 1
     fi
     VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-    mkdir -p man/build
-    mandown man/etr.1.md ETR 1  | sed "1s|.*|.TH \"ETR\" \"1\" \"\" \"etr $VERSION\" \"User Commands\"|"  > man/build/etr.1
-    mandown man/etrs.1.md ETRS 1 | sed "1s|.*|.TH \"ETRS\" \"1\" \"\" \"etr $VERSION\" \"User Commands\"|" > man/build/etrs.1
-    echo "Built man/build/etr.1 and man/build/etrs.1 (version $VERSION)"
+    mandown man/etr.1.md ETR 1  | sed "1s|.*|.TH \"ETR\" \"1\" \"\" \"etr $VERSION\" \"User Commands\"|"  > man/etr.1
+    mandown man/etrs.1.md ETRS 1 | sed "1s|.*|.TH \"ETRS\" \"1\" \"\" \"etr $VERSION\" \"User Commands\"|" > man/etrs.1
+    echo "Built man/etr.1 and man/etrs.1 (version $VERSION)"
+
+# Fail if the committed man pages are not what `just man` produces right now.
+#
+# Run by `just check`, so a version bump that forgets `just man` cannot reach a PR. Skips
+# (rather than fails) where mandown is absent: refusing `just check` on a contributor's
+# machine for a tool that only maintainers need would make the repo harder to work on, not
+# safer — the same reasoning scripts/hooks/pre-push already applies to a missing `just`.
+#
+# Compares BYTES via cmp, not `git diff --quiet`: the latter answers about the index, and on
+# a Syncthing-shared tree checked out on three OSes the worktree is the thing that gets
+# packaged. The rebuild goes to a temp file so a failing check never leaves a half-written
+# page behind.
+
+# Fail if the committed man pages are not what `just man` produces now
+man-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! command -v mandown >/dev/null 2>&1; then
+        echo "man-check: mandown not installed — skipping (cargo install mandown)"
+        exit 0
+    fi
+    VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+    # Temp files inside the destination directory, never /tmp: on this Syncthing-synced tree
+    # a cross-filesystem `mv` from tmpfs carries the user_tmp_t SELinux label into ~/Sync and
+    # wedges the whole folder (~/AGENTS.md §12). Nothing is moved here, but the same rule
+    # keeps the pattern correct if anyone adds a `mv` later.
+    TMP=$(mktemp -d "man/.man-check.XXXXXX")
+    trap 'rm -rf "$TMP"' EXIT
+    mandown man/etr.1.md ETR 1  | sed "1s|.*|.TH \"ETR\" \"1\" \"\" \"etr $VERSION\" \"User Commands\"|"  > "$TMP/etr.1"
+    mandown man/etrs.1.md ETRS 1 | sed "1s|.*|.TH \"ETRS\" \"1\" \"\" \"etr $VERSION\" \"User Commands\"|" > "$TMP/etrs.1"
+    for p in etr.1 etrs.1; do
+        if ! cmp -s "$TMP/$p" "man/$p"; then
+            echo "error: man/$p is stale — run 'just man' and commit the result." >&2
+            echo "       (the .TH line embeds the version, so a version bump always changes it)" >&2
+            diff -u "man/$p" "$TMP/$p" | head -20 >&2 || true
+            exit 1
+        fi
+    done
+    echo "man pages are current (version $VERSION)"
 
 # ── Local end-to-end testing ─────────────────────────────────────────────────
 

@@ -1,0 +1,59 @@
+# The one place etr's channel descriptions and licence are written.
+#
+# Most channels carry their text inside the artifact they publish: crates.io reads the
+# published Cargo.toml and README, the AUR the PKGBUILD, COPR's RPM the spec, Homebrew the
+# formula. Those files keep their own readable copy -- Cargo.toml cannot be templated, and
+# the rest are read by people -- and `scripts/packaging_check.py`, run by `just check`,
+# fails when any copy drifts from what is written here.
+#
+# Two channels keep their text on the SERVICE instead, where no artifact ever reaches it:
+# the COPR project page and the GitHub repository's About box. Those are PUSHED from here --
+# COPR by .github/workflows/copr.yml on every tag, GitHub by `just github-metadata` --
+# because nothing publishes them otherwise, which is how retch's COPR page came to quote one
+# machine's benchmark numbers from a release that was long gone.
+#
+# ADDING A CHANNEL MEANS ADDING ITS COPY TO THE CHECK, not just to this file. A description
+# that lives here and is enforced nowhere is a description that drifts silently.
+
+# THE LONG FORM. Cargo.toml's `description` must BEGIN with this (crates.io shows it as the
+# one-liner), and the AUR `pkgdesc` must EQUAL it. Neither has a length limit worth caring
+# about: crates.io wraps, and makepkg does not complain.
+summary = "Reconnecting remote shell over QUIC — a Rust implementation of Eternal Terminal (et)"
+
+# THE SHORT FORM, for the two channels that enforce a length. It is not a style preference:
+#   - rpmlint reports `summary-too-long` above 79 characters, and `summary` is 84;
+#   - `brew audit` caps `desc` at 80 AND rejects a leading article, a trailing full stop, and
+#     the formula's own name appearing in it.
+# One string satisfies both, so there is one field rather than two. `scripts/packaging_check.py`
+# asserts every one of those rules, so a future edit cannot quietly violate one.
+short_summary = "Reconnecting remote shell over QUIC"
+
+# The SPDX identifier every channel must declare, each in its own vocabulary. Note the AUR
+# spells it in a `license=()` array and rpm in a bare `License:` field, but the string is the
+# same one -- `GPL-3.0-only`, matching Cargo.toml. It is NOT `-or-later`: etr's LICENSE is
+# GPLv3 without the "any later version" clause, and retch's `-or-later` is the wrong model to
+# copy here.
+license = "GPL-3.0-only"
+
+[github]
+# Shown in the repository's About box. GitHub caps it at 350 characters.
+description = "Rust reimplementation of Eternal Terminal — persistent remote shell that reconnects automatically over QUIC"
+# At most 20; lowercase letters, digits and hyphens. Set as an exact list, so a topic removed
+# here is removed from the repository too.
+topics = [
+    "cli",
+    "eternal-terminal",
+    "mosh",
+    "quic",
+    "remote-shell",
+    "reconnect",
+    "rust",
+    "ssh",
+    "terminal",
+]
+
+[copr]
+# The COPR project page's description and installation instructions, as Markdown. Every
+# paragraph line at column zero: COPR renders a line indented 4+ spaces as a code block.
+description = "packaging/copr/project-description.md"
+instructions = "packaging/copr/project-instructions.md"
