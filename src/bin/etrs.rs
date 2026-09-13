@@ -1561,20 +1561,19 @@ async fn run_udp_reverse_listener_socket(
                         vlog!(3, "[etrs] UDP reverse fwd: rx reader task started");
                         while let Ok(Some(env)) = quic::read_msg(&mut rx).await {
                             if let Some(Payload::UdpDatagram(dg)) = env.payload
-                                && !dg.peer_addr.is_empty()
-                                && dg.peer_port > 0
+                                // Shared with the client's `-L` path so both sides agree on what
+                                // a routable peer is. It also rejects a port above 65535, which
+                                // the previous `dg.peer_port as u16` silently truncated into a
+                                // plausible-looking port rather than dropping.
+                                && let Some(addr) =
+                                    etr::forward::datagram_peer_addr(&dg.peer_addr, dg.peer_port)
                             {
-                                // Parse peer_addr as IpAddr (not SocketAddr) so that bare
-                                // IPv6 addresses like "::1" are accepted without brackets.
-                                if let Ok(ip) = dg.peer_addr.parse::<std::net::IpAddr>() {
-                                    let addr = std::net::SocketAddr::new(ip, dg.peer_port as u16);
-                                    vlog!(
-                                        3,
-                                        "[etrs] UDP reverse fwd rx: sending reply of {} bytes to {addr}",
-                                        dg.data.len()
-                                    );
-                                    let _ = socket_send.send_to(&dg.data, addr).await;
-                                }
+                                vlog!(
+                                    3,
+                                    "[etrs] UDP reverse fwd rx: sending reply of {} bytes to {addr}",
+                                    dg.data.len()
+                                );
+                                let _ = socket_send.send_to(&dg.data, addr).await;
                             }
                         }
                         vlog!(3, "[etrs] UDP reverse fwd rx: rx reader task ended");

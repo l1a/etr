@@ -9,8 +9,86 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.9.1 — three corrections to text v0.9.0 got wrong
-## Current State (v0.9.1)
+## Current state: v0.9.2 — the UDP throughput number was measuring a sleep
+## Current State (v0.9.2)
+
+UDP forwarding fast path, and the measurement that misdiagnosed it (145 → 152 tests).
+
+- **The documented UDP bottleneck did not exist.** This file said, for several releases:
+  *"UDP (~9 Mb/s) is still limited by per-datagram protobuf encoding overhead."* Both halves
+  were wrong.
+  - **The 9 Mb/s was the test harness's own `thread::sleep`.** `tools/stress`'s `udp-pump`
+    ended every iteration with `thread::sleep(Duration::from_millis(1))`, capping it at ≤1000
+    datagrams/s. At 1400 bytes that is **11.2 Mb/s of offered load before etr is involved at
+    all**, and Linux lands a 1 ms sleep at ~1.1–1.3 ms, giving ~770–900 dgram/s → 8.6–10.1
+    Mb/s. The reported figure was the timer, to three significant figures.
+  - **The `tcp-pump` next door has never had a sleep**, so the headline comparison
+    "TCP ~320 Mb/s vs UDP ~9 Mb/s" was a throughput measurement against a stopwatch.
+  - **Protobuf was never plausible as the cause.** Measured: the full encode + decode path
+    costs ~345 ns/datagram, a ceiling near **32 Gb/s** at 1400 bytes — about 3,600× above the
+    number it was being blamed for. One benchmark would have refuted it.
+  - *This is the failure the v0.7.7 entry below already describes in another context:* an
+    entry that "reasoned from a plausible mechanism and got the mechanism wrong". It went
+    unchallenged longer here because it came with a number attached.
+- **What etr's UDP forwarding actually sustains: ≥ 100 Mb/s with zero loss**, and the real
+  limit was not reached. New `just stress-udp-rate` sweeps the offered rate, because for a
+  protocol with no flow control a single offered rate says almost nothing:
+
+  | offered | delivered | loss |
+  |---|---|---|
+  | 10.5 Mb/s | 10.5 Mb/s | 0 % |
+  | 42.6 Mb/s | 42.6 Mb/s | 0 % |
+  | 100.7 Mb/s | 100.7 Mb/s | 0 % |
+  | 1239 Mb/s (flat out) | 0.3 Mb/s | 100 % |
+
+  - **The top of that sweep is the pacer's ceiling, not etr's**, and saying so matters as much
+    as the number: `thread::sleep` cannot pace finer than ~100 µs, so a requested 50 µs step
+    actually lands at 111 µs ≈ 100 Mb/s. Every paced row showing ~0 % loss means only that etr
+    sustains *at least* the fastest row. Finding the true knee needs a busy-wait pacer — left
+    as follow-up rather than guessed at.
+  - The flat-out row is not a throughput result either: UDP has no flow control, so an
+    unthrottled pump on loopback just outruns the tunnel and fills buffers. Both extremes
+    mislead, which is why the recipe prints a sweep and tells you to read the knee.
+- **The hot path is now allocation-free per datagram, and 3.75× cheaper.** It previously cost
+  four heap allocations and two stream writes per datagram: `ip().to_string()`,
+  `buf[..n].to_vec()`, `encode_to_vec()`, then `write_all(len)` + `write_all(body)`. New
+  `forward::UdpFrameEncoder` keeps the framing buffer, the payload buffer and the formatted
+  peer string, caching the last on the address it came from — a forwarded port overwhelmingly
+  carries one peer, and a changing peer degrades to the old cost rather than misbehaving.
+  Criterion, 1400-byte datagrams: **199.9 ns → 53.3 ns**.
+  - **The bytes are identical, and that is the property that matters.** A faster encoder that
+    changed the wire format would be a silent protocol break between an updated and a
+    non-updated peer, which no negotiation would catch because nothing announces it. A unit
+    test asserts byte-equality against the old inline path across IPv4, IPv6, empty payloads,
+    65507-byte payloads and alternating peers. Watched failing: flipping one protobuf field
+    tag fails four tests.
+  - `quic::write_msg` now emits the length prefix and body in **one** `write_all` instead of
+    two. That is free everywhere, not just here — and it matches what the v0.4.x throughput
+    work already concluded for this codebase: *"more syscalls, not fewer copies, determines
+    throughput here."*
+- **A real, if small, bug fixed on the way:** the server resolved a reply address with
+  `dg.peer_port as u16`, which silently truncates — port 65536 becomes 0, 65537 becomes 1 —
+  sending the datagram somewhere plausible and wrong. Both sides now share
+  `forward::datagram_peer_addr`, which rejects a zero or out-of-range port and parses the
+  address rather than round-tripping it through `format!` and back.
+  - *Checked and found NOT to be a bug, so it is not claimed as one:* the old
+    `format!("{}:{}", addr, port)` looks broken for IPv6 because it produces the unbracketed
+    `::1:5000`, but `to_socket_addrs` splits at the **last** colon, so it resolved correctly.
+    The motivation for the typed helper is cost and clarity, not a latent fault.
+- **The harness itself had two more defects that made its numbers untrustworthy**, both
+  pre-existing and both fixed here: a full socket buffer (`ENOBUFS`/`EAGAIN`) and an ICMP
+  port-unreachable (`ECONNREFUSED`, routine while the forward listener is still binding) were
+  each treated as fatal, so pumps exited within milliseconds and the justfile divided by a
+  near-zero interval — printing a few MiB "in 0.0s" as a Mb/s figure. Both are now transient.
+
+### Still open
+
+- **The real UDP knee is unmeasured** — above 100 Mb/s, needs a busy-wait pacer.
+- **Three of `stress-local`'s four pumps still report `in 0.0s`.** The two UDP ones are fixed;
+  the TCP pumps still exit early on the first write error. Their Mb/s figures are arithmetic
+  over a near-zero interval and should not be quoted until that is fixed.
+
+## Previous: v0.9.1 — three corrections to text v0.9.0 got wrong
 
 Documentation and one new guard (145 tests, unchanged; no Rust change).
 
@@ -1476,7 +1554,7 @@ just install-tag 0.9.0
 
 # Code quality gate — run before every commit
 just check            # fmt + clippy, and: standard-check, man-check, packaging-check
-just test             # cargo test (145 tests)
+just test             # cargo test (152 tests)
 
 # Man pages are TRACKED (man/etr.1, man/etrs.1) because tag tarballs carry only tracked
 # files and COPR/Homebrew install them from there. Re-run after every version bump.
@@ -1639,7 +1717,11 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
   tested but regressed throughput from 2.1 → 1.8 Gbits/s because it produces one tiny
   `write_all` per Quinn frame instead of coalescing them into our 256 KB read buffer —
   more syscalls, not fewer copies, determines throughput here.
-  UDP (~9 Mb/s) is still limited by per-datagram protobuf encoding overhead.
+  ~~UDP (~9 Mb/s) is still limited by per-datagram protobuf encoding overhead.~~
+  **Wrong on both counts, corrected in v0.9.2.** The 9 Mb/s was the stress pump's own 1 ms
+  `thread::sleep` (≤1000 dgram/s ≈ 11.2 Mb/s offered, before etr is involved); the encode path
+  costs ~345 ns/datagram, a ceiling near 32 Gb/s. Measured sustained UDP forwarding is
+  **≥100 Mb/s at 0% loss** and the true limit is still unmeasured — see `just stress-udp-rate`.
 - ~~**UDP forward target resolution should prefer IPv6 when genuinely available**~~ **Done**: `etr::forward::resolve_udp_target` (new helper in `src/forward.rs`) resolves the target, tries IPv6 candidates first, and probes routing via a no-packet UDP `connect()` call.  The first address whose routing probe succeeds is used.  Falls back to IPv4 if no IPv6 route exists.  The stress-tool UDP echo server now also binds `[::1]:port` alongside `0.0.0.0:port` so both families reach it in tests.
   *Since v0.8.0 the IPv6-first order is the **default** rather than the only behaviour:
   `-4`/`-6` override it, and the routing probe was factored out into `addrfam::first_routable`
@@ -1651,7 +1733,7 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
 
 ---
 
-## Test coverage (145 tests)
+## Test coverage (152 tests)
 
 | Module | What's tested |
 |--------|--------------|
@@ -1663,5 +1745,5 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
 | `login` | no-panic checks for record_login / record_logout with invalid fd |
 | `bin/etr` | CLI defaults, port parsing, target parsing, `-4`/`-6` short and long forms, their mutual exclusion, a family flag ahead of a remote command, CLI-beats-config precedence, no --cipher flag, custom --log-path and --server-log-path overrides, config fallback for log paths, terminal-restore sequences (cursor-safe modes cover mouse/paste/cursor and never move the cursor; screen reset leaves alt-screen without clearing scrollback) |
 | `config` | TOML parse (full section, partial, empty), default values, `gateway_ports` / `forward` / `reverse_forward` / `x11` / `x11_trusted` / `address_family` config keys, `merge_defaults` idempotence |
-| `forward` | `-L`/`-R` spec parsing: TCP/UDP/IPv6, explicit proto, bad port, empty host, Display; bind address parsing (explicit IP, `[::1]`, wildcard `*`); `get_bind_addresses` with and without gateway flag; `resolve_udp_target`: localhost prefers IPv6, explicit IPv4, unresolvable host, `-4` overriding the IPv6-first default, fallback to the other family; `connect_tcp_preferred`: reaches an IPv4 listener, falls back across families, errors on an unresolvable host; `X11Display` parsing |
+| `forward` | UDP fast path: `UdpFrameEncoder` byte-identical to the pre-0.9.2 inline encoder (IPv4/IPv6, empty and 65507-byte payloads), alternating peers, port-only change, round trip through the decoder; `datagram_peer_addr` accepts both families and rejects port 0, ports above 65535 and non-literals. `-L`/`-R` spec parsing: TCP/UDP/IPv6, explicit proto, bad port, empty host, Display; bind address parsing (explicit IP, `[::1]`, wildcard `*`); `get_bind_addresses` with and without gateway flag; `resolve_udp_target`: localhost prefers IPv6, explicit IPv4, unresolvable host, `-4` overriding the IPv6-first default, fallback to the other family; `connect_tcp_preferred`: reaches an IPv4 listener, falls back across families, errors on an unresolvable host; `X11Display` parsing |
 | `addrfam` | `AddrPref` from flags / config aliases / `ETRPREFER:` wire values (unknown → `Auto` in every direction), `or` fallback, ssh flag mapping, `order_by_family` (preferred family first, stable within a family, identity for `Auto`, single-family and empty input), `first_routable`, `resolve_preferred`, `family_available` |

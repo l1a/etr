@@ -120,5 +120,79 @@ fn bench_all(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_all);
+/// Per-datagram cost of the UDP forwarding path, measured without a network.
+///
+/// WHY A CPU-ONLY BENCH, when `just stress-local` exists: the stress harness measures a whole
+/// system (two pumps, an echo server, a QUIC link and the kernel's UDP buffers) and is
+/// therefore very easy to misread. It was misread — its UDP pump slept 1 ms between sends, so
+/// the "~9 Mb/s" it reported was the sleep, and NOTES.md attributed that number to
+/// "per-datagram protobuf encoding overhead". This bench isolates exactly the code that claim
+/// was about, so the claim can be checked rather than repeated.
+///
+/// 1400 bytes is the payload size the stress pump uses and a typical sub-MTU datagram.
+fn bench_udp_forward(c: &mut Criterion) {
+    use etr::protocol::{Envelope, Payload, UdpDatagram};
+    use prost::Message;
+    use std::net::SocketAddr;
+
+    let payload = vec![0xABu8; 1400];
+    let src: SocketAddr = "192.168.1.50:54321".parse().unwrap();
+
+    // The send half, BOTH WAYS, so the improvement is reproducible rather than asserted.
+    //
+    // `_inline` is the shape the forwarding loops used before v0.9.2: a fresh `Envelope` per
+    // datagram, `to_string` for the peer, `to_vec` for the payload, `encode_to_vec` for the
+    // body. `_reused` is what ships now. They are required to emit identical bytes — a unit
+    // test in `forward.rs` pins that, because a faster encoder that changed the wire format
+    // would be a silent protocol break rather than an optimisation.
+    c.bench_function("udp_forward_encode_inline_1400b", |b| {
+        b.iter(|| {
+            let env = Envelope {
+                payload: Some(Payload::UdpDatagram(UdpDatagram {
+                    peer_addr: src.ip().to_string(),
+                    peer_port: src.port() as u32,
+                    data: payload[..].to_vec(),
+                })),
+            };
+            let body = env.encode_to_vec();
+            let mut framed = Vec::with_capacity(4 + body.len());
+            framed.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            framed.extend_from_slice(&body);
+            std::hint::black_box(framed.len())
+        })
+    });
+
+    c.bench_function("udp_forward_encode_reused_1400b", |b| {
+        let mut enc = etr::forward::UdpFrameEncoder::new();
+        b.iter(|| std::hint::black_box(enc.frame(src, &payload).len()))
+    });
+
+    // The receive half: decode, then work out where the datagram has to be sent. Resolving the
+    // destination is part of the per-datagram cost and is easy to leave out of a benchmark by
+    // accident — which would flatter exactly the code being changed.
+    let wire = Envelope {
+        payload: Some(Payload::UdpDatagram(UdpDatagram {
+            peer_addr: src.ip().to_string(),
+            peer_port: src.port() as u32,
+            data: payload.clone(),
+        })),
+    }
+    .encode_to_vec();
+
+    c.bench_function("udp_forward_decode_and_resolve_1400b", |b| {
+        b.iter(|| {
+            let env = Envelope::decode(wire.as_slice()).unwrap();
+            let mut out = 0usize;
+            if let Some(Payload::UdpDatagram(dg)) = env.payload {
+                let dest: SocketAddr =
+                    etr::forward::datagram_peer_addr(&dg.peer_addr, dg.peer_port)
+                        .expect("benchmark address must parse");
+                out = dg.data.len() + dest.port() as usize;
+            }
+            std::hint::black_box(out)
+        })
+    });
+}
+
+criterion_group!(benches, bench_all, bench_udp_forward);
 criterion_main!(benches);

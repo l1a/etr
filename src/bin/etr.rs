@@ -2072,17 +2072,17 @@ async fn run_udp_forward_client_socket(
     let local_socket2 = Arc::clone(&local_socket);
 
     // Local UDP datagrams → QUIC (as UdpDatagram envelopes).
+    //
+    // The encoder is hoisted out of the loop deliberately: it owns the framing buffer, the
+    // payload buffer and the formatted peer address, so the steady state runs without a single
+    // heap allocation per datagram. The bytes it produces are identical to building an
+    // `Envelope` inline — this is how they are built, not what is sent.
     let mut dgram_in = tokio::spawn(async move {
         let mut buf = vec![0u8; 65535];
+        let mut enc = etr::forward::UdpFrameEncoder::new();
         while let Ok((n, src)) = local_socket2.recv_from(&mut buf).await {
-            let env = Envelope {
-                payload: Some(Payload::UdpDatagram(UdpDatagram {
-                    peer_addr: src.ip().to_string(),
-                    peer_port: src.port() as u32,
-                    data: buf[..n].to_vec(),
-                })),
-            };
-            if quic::write_msg(&mut quic_send, &env).await.is_err() {
+            let framed = enc.frame(src, &buf[..n]);
+            if quic::write_framed(&mut quic_send, framed).await.is_err() {
                 break;
             }
         }
@@ -2092,11 +2092,11 @@ async fn run_udp_forward_client_socket(
     let mut dgram_out = tokio::spawn(async move {
         while let Ok(Some(env)) = quic::read_msg(&mut quic_recv).await {
             if let Some(Payload::UdpDatagram(dg)) = env.payload
-                && !dg.peer_addr.is_empty()
-                && dg.peer_port > 0
+                && let Some(dest) = etr::forward::datagram_peer_addr(&dg.peer_addr, dg.peer_port)
             {
-                let dest = format!("{}:{}", dg.peer_addr, dg.peer_port);
-                let _ = local_socket.send_to(&dg.data, &dest).await;
+                // A typed `SocketAddr` rather than a formatted string, so `send_to` does not
+                // parse text back into the address the peer already sent us.
+                let _ = local_socket.send_to(&dg.data, dest).await;
             }
         }
     });

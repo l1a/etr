@@ -5,7 +5,7 @@
 //!   stress_tool tcp-echo <port>
 //!   stress_tool udp-echo <port>
 //!   stress_tool tcp-pump <port>
-//!   stress_tool udp-pump <port>
+//!   stress_tool udp-pump <port> [pace_us]   (pace_us omitted or 0 = send flat out)
 //!
 //! Each pump prints one stats line to stdout on SIGTERM:
 //!   TCP sent=<bytes> recv=<bytes> elapsed=<seconds>
@@ -53,7 +53,10 @@ fn main() {
             unsafe {
                 libc::signal(libc::SIGTERM, on_sigterm as *const () as libc::sighandler_t);
             }
-            udp_pump(port)
+            // Optional pacing, in microseconds between sends. Absent or 0 = flat out.
+            // See the comment in udp_pump for why the default is unthrottled.
+            let pace_us: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+            udp_pump(port, pace_us)
         }
         other => {
             eprintln!("Unknown command: {other}");
@@ -175,9 +178,12 @@ fn tcp_pump(port: u16) {
     );
 }
 
-/// Send UDP datagrams to a port and drain replies, matching the Python pump
-/// rate-limiting (1 ms sleep between sends) to avoid saturating UDP buffers.
-fn udp_pump(port: u16) {
+/// Send UDP datagrams to a port and drain replies, as fast as the socket accepts them.
+///
+/// `pace_us` > 0 inserts that many microseconds between sends, for a deliberate low-rate
+/// soak. It defaults to 0 (flat out) because an always-on 1 ms sleep is what made the old
+/// "UDP ~9 Mb/s" figure a measurement of the timer rather than of etr.
+fn udp_pump(port: u16, pace_us: u64) {
     let socket = UdpSocket::bind("127.0.0.1:0").expect("udp_pump: bind");
     socket
         .connect(format!("127.0.0.1:{port}"))
@@ -207,12 +213,63 @@ fn udp_pump(port: u16) {
         }
     });
 
+    // PACING IS OPT-IN, AND THAT IS THE WHOLE POINT OF THIS LOOP.
+    //
+    // This loop used to end in an unconditional `thread::sleep(Duration::from_millis(1))`,
+    // which capped the pump at <=1000 datagrams/s. At 1400 bytes that is 11.2 Mb/s of offered
+    // load before etr is involved at all, and Linux's 1 ms sleep typically lands at 1.1-1.3 ms,
+    // so the real ceiling was ~770-900 dgram/s => 8.6-10.1 Mb/s.
+    //
+    // **The project measured ~9 Mb/s and recorded it in NOTES.md as "limited by per-datagram
+    // protobuf encoding overhead".** It was not: it was this sleep. The encode+decode path
+    // costs ~345 ns/datagram, a ceiling near 32 Gb/s at this size — about 3,600x above the
+    // number being explained. The tcp-pump next door has never had a sleep, so the headline
+    // "TCP 320 Mb/s vs UDP 9 Mb/s" compared a throughput measurement against a timer.
+    //
+    // Unthrottled is now the default so the figure means what its name says. UDP has no flow
+    // control, so a flat-out pump will also expose loss — that is information, not a defect,
+    // and it is why the stats line reports sent AND recv. Pass a microsecond delay as the
+    // third argument when you deliberately want a paced, low-rate soak instead:
+    //     stress_tool udp-pump <port> 1000    # ~1000 dgram/s, the old behaviour
     while !STOP.load(Ordering::Relaxed) {
         match socket.send(&chunk) {
-            Ok(n) => bytes_sent.fetch_add(n as u64, Ordering::Relaxed),
+            Ok(n) => {
+                bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
+            }
+            // A FULL SOCKET BUFFER IS BACK-PRESSURE, NOT A FAILURE.
+            //
+            // Sending flat out reaches ENOBUFS/EAGAIN almost immediately on loopback, and
+            // treating that as fatal ends the pump within milliseconds. The stats line then
+            // reports a few MiB "in 0.0s", which the justfile turns into a Mb/s figure computed
+            // over a near-zero interval — a number that looks like a throughput result and is
+            // arithmetic noise. Yield and retry instead, so the loop measures the rate the path
+            // actually sustains.
+            // ConnectionRefused on a *connected UDP socket* is an ICMP port-unreachable from a
+            // listener that is not up yet -- which is exactly the state this pump starts in,
+            // because the recipe probes the TCP forward port for readiness and has never had an
+            // equivalent probe for the UDP one. Treating it as fatal is why three of the four
+            // pumps reported "in 0.0s": they exited within milliseconds and the justfile then
+            // divided by a near-zero interval. It is transient, so keep going.
+            Err(ref e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::OutOfMemory
+                        | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                thread::yield_now();
+            }
+            // ENOBUFS has no stable ErrorKind across platforms, so match the raw errno too
+            // rather than relying on the classification above catching it.
+            Err(ref e) if e.raw_os_error() == Some(libc::ENOBUFS) => {
+                thread::yield_now();
+            }
             Err(_) => break,
-        };
-        thread::sleep(Duration::from_millis(1));
+        }
+        if pace_us > 0 {
+            thread::sleep(Duration::from_micros(pace_us));
+        }
     }
 
     let elapsed = start.elapsed().as_secs_f64();

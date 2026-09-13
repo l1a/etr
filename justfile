@@ -1814,6 +1814,104 @@ e2e-udp-concurrent: check-tools install
     echo ""
     echo "==> Concurrent UDP sender regression test passed."
 
+# Find the UDP forwarding rate that actually survives the tunnel.
+#
+# WHY THIS EXISTS, AND WHY `stress-local` CANNOT ANSWER IT
+#
+# UDP has no flow control, so a single offered rate tells you almost nothing. `stress-local`
+# pumps flat out, which on loopback offers ~1-2 Gb/s and delivers almost none of it: the
+# useful figure is not "how fast can we push" but "how fast can we push before the tunnel
+# starts dropping". Before v0.9.2 the pump slept 1 ms between sends, so it offered ~800
+# dgram/s and delivered nearly all of it -- and the resulting ~9 Mb/s was recorded in NOTES.md
+# as a throughput limit caused by "per-datagram protobuf encoding overhead". It was neither:
+# it was the sleep. The encode path costs ~53 ns/datagram, a ceiling three orders of magnitude
+# above that number.
+#
+# This recipe sweeps the offered rate and reports delivered vs offered at each step, so the
+# knee is visible rather than inferred from one point.
+
+# Sweep the offered UDP rate and report delivered vs offered, to find the sustainable rate
+stress-udp-rate: check-tools install build-stress
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    source scripts/e2e_procs.sh
+    ETRS_PRE=$(procs_snapshot etrs)
+    STRESS_PRE=$(procs_snapshot stress_tool)
+
+    CLIENT_LOG="${XDG_STATE_HOME:-$HOME/.local/state}/etr/etr.log"
+    TMUX_RATE="etr_udp_rate"
+    UDP_ECHO_PORT=19351
+    UDP_FWD_PORT=19352
+    SECONDS_PER_STEP="${SECONDS_PER_STEP:-6}"
+
+    cleanup() {
+        echo ""
+        echo "--- cleanup ---"
+        kill "${UDP_ECHO_PID:-}" 2>/dev/null || true
+        tmux kill-session -t "$TMUX_RATE" 2>/dev/null || true
+        procs_reap stress_tool "${STRESS_PRE:-}"
+        procs_reap etrs "${ETRS_PRE:-}"
+    }
+    trap cleanup EXIT
+
+    mkdir -p "$(dirname "$CLIENT_LOG")"
+    > "$CLIENT_LOG"
+
+    echo "==> UDP echo server on :${UDP_ECHO_PORT}"
+    "{{STRESS_BIN}}" udp-echo "${UDP_ECHO_PORT}" &
+    UDP_ECHO_PID=$!
+    sleep 0.3
+
+    echo "==> etr -L ${UDP_FWD_PORT}:127.0.0.1:${UDP_ECHO_PORT}/udp"
+    tmux new-session -d -s "$TMUX_RATE" -x 200 -y 50 -- \
+        "{{INSTALL}}/etr" -v -L "${UDP_FWD_PORT}:127.0.0.1:${UDP_ECHO_PORT}/udp" localhost
+
+    READY=0
+    for i in $(seq 1 30); do
+        sleep 1
+        grep -q '\[etr\] Connected\.' "$CLIENT_LOG" 2>/dev/null && { READY=1; break; }
+    done
+    [[ $READY -eq 1 ]] || { echo "ERROR: etr did not connect" >&2; exit 1; }
+    sleep 1.0  # let the -L listener bind
+
+    echo ""
+    printf "  %-12s %-14s %-14s %-8s\n" "pace(us)" "offered(Mb/s)" "delivered(Mb/s)" "loss"
+    # 1400-byte datagrams. The pace is the delay between sends, so the offered rate is
+    # roughly 1400*8/pace bits/s -- 2000us ~= 5.6 Mb/s, 50us ~= 224 Mb/s.
+    for PACE in 2000 1000 500 200 100 50 0; do
+        OUT="$(mktemp -p . .udprate.XXXXXX)"
+        "{{STRESS_BIN}}" udp-pump "${UDP_FWD_PORT}" "$PACE" > "$OUT" &
+        PUMP_PID=$!
+        sleep "$SECONDS_PER_STEP"
+        kill -TERM "$PUMP_PID" 2>/dev/null || true
+        wait "$PUMP_PID" 2>/dev/null || true
+        awk -v pace="$PACE" '
+            /^UDP/ {
+                for (i = 1; i <= NF; i++) {
+                    split($i, kv, "=")
+                    v[kv[1]] = kv[2]
+                }
+                if (v["elapsed"] + 0 <= 0) next
+                off = v["sent"] * 8 / v["elapsed"] / 1e6
+                del = v["recv"] * 8 / v["elapsed"] / 1e6
+                loss = (v["sent"] > 0) ? (1 - v["recv"] / v["sent"]) * 100 : 0
+                printf "  %-12s %-14.1f %-14.1f %-7.1f%%\n", (pace == 0 ? "0 (flat)" : pace), off, del, loss
+            }' "$OUT"
+        rm -f "$OUT"
+    done
+
+    echo ""
+    echo "Read the knee, not any single row: the highest offered rate whose loss is still"
+    echo "near zero is what this path sustains. A high offered rate with high loss is the"
+    echo "pump outrunning the tunnel, not a throughput measurement."
+    echo ""
+    echo "CAVEAT -- the top of this sweep is the PACER's ceiling, not etr's. thread::sleep"
+    echo "cannot pace finer than roughly 100 us, so a requested 50 us step actually lands near"
+    echo "111 us: about 100 Mb/s at 1400 bytes. If every paced row shows ~0% loss, all you have"
+    echo "learned is that etr sustains at least the fastest row -- the real knee is above it and"
+    echo "needs a busy-wait pacer to find."
+
 # Stress-test all five stream types simultaneously while watching etrs memory.
 #
 # Opens: 1 PTY stream + 2 -L forward streams (TCP + UDP) + 2 -R forward streams
