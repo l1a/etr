@@ -108,16 +108,30 @@ pub async fn read_tag(recv: &mut RecvStream) -> io::Result<u8> {
 }
 
 /// Write a 4-byte-length-prefixed protobuf [`Envelope`] to a send stream.
+///
+/// The length prefix and the body go out in **one** `write_all`. They used to be two, which
+/// doubled the number of stream writes for every message on every stream. That matters most on
+/// the UDP forward path, where one message is one datagram — but it is free everywhere else too,
+/// and the v0.4.x throughput work already recorded the general lesson for this codebase: "more
+/// syscalls, not fewer copies, determines throughput here".
 pub async fn write_msg(send: &mut SendStream, env: &Envelope) -> io::Result<()> {
-    let bytes = env.encode_to_vec();
-    let len = (bytes.len() as u32).to_be_bytes();
-    send.write_all(&len)
+    let body_len = env.encoded_len();
+    let mut framed = Vec::with_capacity(4 + body_len);
+    framed.extend_from_slice(&(body_len as u32).to_be_bytes());
+    env.encode(&mut framed)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    write_framed(send, &framed).await
+}
+
+/// Write an already-framed `[4-byte big-endian length][body]` message.
+///
+/// This is the escape hatch for hot paths that build their own frame to avoid per-message
+/// allocation — see [`forward::UdpFrameEncoder`](crate::forward::UdpFrameEncoder). The bytes
+/// must already carry the length prefix; nothing here inspects or adds one.
+pub async fn write_framed(send: &mut SendStream, framed: &[u8]) -> io::Result<()> {
+    send.write_all(framed)
         .await
-        .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()))?;
-    send.write_all(&bytes)
-        .await
-        .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()))?;
-    Ok(())
+        .map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e.to_string()))
 }
 
 /// Read a 4-byte-length-prefixed protobuf [`Envelope`] from a recv stream.

@@ -316,11 +316,29 @@ copr-cli get-package --name etr kentobias/etr                # or the COPR web U
 git ls-remote https://github.com/l1a/homebrew-etr HEAD       # tap moved
 ```
 
-**The AUR RPC lies for a few minutes after a push** — this has been observed twice on this
-fleet. `rpc/v5/info` serves a cached response naming the *previous* version while cgit and the
-package page already show the new one. Do not read one endpoint and conclude the push failed;
-the push output naming a commit range is itself proof the server-side hook parsed `.SRCINFO`
-and accepted it.
+**The AUR serves stale reads for a few minutes after a push, and "check cgit instead" is NOT a
+sufficient workaround.** This was believed to be an RPC-only problem until the v0.9.0 release,
+when one minutes-old push produced all of this *simultaneously*:
+
+| endpoint | reported |
+|---|---|
+| `rpc/v5/info` | **stale** — the previously known case |
+| `cgit/…/plain/.SRCINFO?h=…` | **stale** — and this is the endpoint the old advice named |
+| `cgit/…/plain/PKGBUILD?h=…` | fresh |
+| `cgit/…/log/?h=…` | fresh |
+| `git clone ssh://aur@aur.archlinux.org/…` | fresh — **authoritative** |
+
+So cgit is not uniformly fresh: two of its views were current while a third was not, and the
+stale one was the file being checked. **Verify an AUR push with a fresh clone**, never with a
+single HTTP endpoint:
+
+```bash
+git clone ssh://aur@aur.archlinux.org/etr-terminal-bin.git /tmp/aurcheck
+grep -E '^pkgver' /tmp/aurcheck/PKGBUILD
+```
+
+Do not read one endpoint and conclude the push failed; the push output naming a commit range
+is itself proof the server-side hook parsed `.SRCINFO` and accepted it.
 
 ### One-time prerequisites
 

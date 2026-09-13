@@ -17,6 +17,7 @@
 //! ```
 use crate::addrfam::AddrPref;
 use crate::protocol::ForwardProto;
+use std::net::{IpAddr, SocketAddr};
 
 /// A parsed `-L` or `-R` forwarding specification.
 #[derive(Debug, Clone)]
@@ -610,6 +611,121 @@ pub fn get_xauth_cookie(display_str: &str) -> Result<(String, Vec<u8>), String> 
     Err(format!("no xauth cookie found for display {}", display_str))
 }
 
+/// Reusable encoder for the UDP forwarding hot path.
+///
+/// Both forwarding loops used to build a fresh [`Envelope`](crate::protocol::Envelope) per
+/// datagram and hand it to `quic::write_msg`, which cost **four heap allocations and two stream
+/// writes for every datagram**:
+///
+/// 1. `src.ip().to_string()` — formatting an address that is already in hand;
+/// 2. `buf[..n].to_vec()` — copying the payload out of the receive buffer;
+/// 3. `encode_to_vec()` — allocating the protobuf body and copying the payload again;
+/// 4. `write_all(&len)` then `write_all(&bytes)` — two separate writes for one message.
+///
+/// This keeps all of it: the framed output buffer, the payload buffer inside the reused
+/// `UdpDatagram`, and the formatted peer string. The last one is cached on the address it was
+/// produced from, because a forwarded port overwhelmingly carries traffic from **one** peer (a
+/// DNS resolver, a game client, a syslog sender), so the format runs once per peer rather than
+/// once per datagram. A changing peer degrades to the old cost rather than misbehaving.
+///
+/// **The wire format is byte-for-byte unchanged.** This is purely how the same bytes get built,
+/// so an old peer on either side is unaffected — there is no negotiation and nothing to detect.
+pub struct UdpFrameEncoder {
+    /// Reused message. Its `data` and `peer_addr` keep their allocations between datagrams.
+    dgram: crate::protocol::UdpDatagram,
+    /// The address `dgram.peer_addr` currently holds the text for, so a repeat peer skips the
+    /// formatting entirely. `None` until the first datagram.
+    cached_ip: Option<IpAddr>,
+    /// Framed output: `[4-byte big-endian length][protobuf body]`, built in one buffer so the
+    /// message costs a single `write_all` instead of two.
+    out: Vec<u8>,
+}
+
+impl Default for UdpFrameEncoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl UdpFrameEncoder {
+    /// A new encoder with buffers sized for one maximum-size UDP datagram, so the steady state
+    /// performs no reallocation at all.
+    pub fn new() -> Self {
+        Self {
+            dgram: crate::protocol::UdpDatagram {
+                peer_addr: String::new(),
+                peer_port: 0,
+                data: Vec::with_capacity(65535),
+            },
+            cached_ip: None,
+            // 64 KiB payload plus protobuf and length-prefix overhead.
+            out: Vec::with_capacity(65600),
+        }
+    }
+
+    /// Frame one datagram, returning `[len][body]` ready for a single `write_all`.
+    ///
+    /// The returned slice borrows the encoder's internal buffer and is valid until the next
+    /// call, which is what makes the steady state allocation-free.
+    pub fn frame(&mut self, peer: SocketAddr, payload: &[u8]) -> &[u8] {
+        let ip = peer.ip();
+        if self.cached_ip != Some(ip) {
+            // `to_string` allocates; writing through `fmt::Write` into the existing String
+            // reuses the buffer we already hold.
+            use std::fmt::Write as _;
+            self.dgram.peer_addr.clear();
+            let _ = write!(self.dgram.peer_addr, "{ip}");
+            self.cached_ip = Some(ip);
+        }
+        self.dgram.peer_port = peer.port() as u32;
+        self.dgram.data.clear();
+        self.dgram.data.extend_from_slice(payload);
+
+        // `Payload` owns its message, so encode the `UdpDatagram` field by hand rather than
+        // moving `self.dgram` into an `Envelope` and losing the reused allocations. Tag 12 is
+        // `Payload::UdpDatagram`; see `protocol::Payload`, where the numbers are pinned.
+        let body_len = prost::encoding::message::encoded_len(12, &self.dgram);
+
+        self.out.clear();
+        self.out.extend_from_slice(&(body_len as u32).to_be_bytes());
+        prost::encoding::message::encode(12, &self.dgram, &mut self.out);
+        debug_assert_eq!(self.out.len(), 4 + body_len);
+        &self.out
+    }
+}
+
+/// Turn a [`UdpDatagram`](crate::protocol::UdpDatagram)'s `peer_addr` + `peer_port` into a
+/// [`SocketAddr`], without going through a formatted string.
+///
+/// The obvious way to use those two fields is `format!("{peer_addr}:{peer_port}")` and hand the
+/// string to `send_to`, and that is what both forwarding loops used to do. It costs an
+/// allocation and a format on every datagram, and then `send_to` has to parse the string
+/// straight back into the `SocketAddr` the sender already had — so the round trip through text
+/// is pure overhead on the hottest path in the forwarder.
+///
+/// **The string form is not broken for IPv6, which is worth stating because it looks as though
+/// it should be.** `format!("{}:{}", "::1", 5000)` yields the unbracketed `::1:5000`, and the
+/// canonical spelling is `[::1]:5000` — but `to_socket_addrs` splits at the *last* colon, so
+/// `::1:5000` and `2001:db8::1:5000` both resolve correctly. Checked rather than assumed; the
+/// motivation here is cost, not a latent bug.
+///
+/// Taking the typed route is still better than a string that happens to parse: it cannot be
+/// mis-assembled by a future edit, and it makes the two rejections below explicit.
+///
+/// Returns `None` when `peer_addr` is not a valid IP literal or the port is out of range; the
+/// caller drops the datagram, which is the correct response to an unroutable peer.
+pub fn datagram_peer_addr(peer_addr: &str, peer_port: u32) -> Option<SocketAddr> {
+    // A port of 0 is not a usable destination, and `as u16` would silently truncate anything
+    // above 65535 into a plausible-looking port -- exactly the kind of quiet wrong answer this
+    // codebase keeps recording. Reject both.
+    let port = u16::try_from(peer_port).ok()?;
+    if port == 0 {
+        return None;
+    }
+    let ip: IpAddr = peer_addr.parse().ok()?;
+    Some(SocketAddr::new(ip, port))
+}
+
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
     if !s.len().is_multiple_of(2) {
         return None;
@@ -618,4 +734,151 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
         .step_by(2)
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
         .collect()
+}
+
+#[cfg(test)]
+mod udp_fastpath_tests {
+    use super::*;
+    use crate::protocol::{Envelope, Payload, UdpDatagram};
+    use prost::Message;
+
+    /// Frame a datagram the way the forwarding loops did before v0.9.2.
+    fn old_framed(peer: SocketAddr, payload: &[u8]) -> Vec<u8> {
+        let env = Envelope {
+            payload: Some(Payload::UdpDatagram(UdpDatagram {
+                peer_addr: peer.ip().to_string(),
+                peer_port: peer.port() as u32,
+                data: payload.to_vec(),
+            })),
+        };
+        let body = env.encode_to_vec();
+        let mut out = Vec::with_capacity(4 + body.len());
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// **The load-bearing test of the whole optimisation.**
+    ///
+    /// `UdpFrameEncoder` exists only to build the same bytes more cheaply. If it ever emits
+    /// something different, that is not a faster encoder — it is an undetected wire-format
+    /// change between an updated and a non-updated peer, which no version negotiation would
+    /// catch because nothing announces it.
+    #[test]
+    fn encoder_is_byte_identical_to_the_old_inline_path() {
+        let mut enc = UdpFrameEncoder::new();
+        let cases: Vec<(SocketAddr, Vec<u8>)> = vec![
+            ("192.168.1.50:54321".parse().unwrap(), vec![0xAB; 1400]),
+            ("127.0.0.1:53".parse().unwrap(), vec![0x00; 1]),
+            // Empty payload: a real thing on the wire (a zero-length UDP datagram is legal).
+            ("10.0.0.1:1".parse().unwrap(), Vec::new()),
+            ("[::1]:5000".parse().unwrap(), vec![0xFF; 9000]),
+            (
+                "[2001:db8::dead:beef]:65535".parse().unwrap(),
+                vec![0x7F; 64],
+            ),
+            // Largest payload a UDP datagram can carry over IPv4.
+            ("172.16.0.9:9999".parse().unwrap(), vec![0x42; 65507]),
+        ];
+        for (peer, payload) in &cases {
+            assert_eq!(
+                enc.frame(*peer, payload),
+                old_framed(*peer, payload).as_slice(),
+                "framing differs for {peer} with a {}-byte payload",
+                payload.len()
+            );
+        }
+    }
+
+    /// The peer string is cached, so the cache must not outlive the peer it was built for.
+    /// Alternating senders on one forwarded port is the case that would expose a stale cache,
+    /// and it is exactly what a busy DNS or game forward looks like.
+    #[test]
+    fn encoder_handles_alternating_peers() {
+        let mut enc = UdpFrameEncoder::new();
+        let a: SocketAddr = "1.2.3.4:10".parse().unwrap();
+        let b: SocketAddr = "[fe80::1]:20".parse().unwrap();
+        for _ in 0..4 {
+            assert_eq!(enc.frame(a, b"first"), old_framed(a, b"first").as_slice());
+            assert_eq!(enc.frame(b, b"second"), old_framed(b, b"second").as_slice());
+        }
+    }
+
+    /// Same address, different port: the cache keys on the IP, so the port must still be
+    /// re-encoded every time rather than being carried over with the cached string.
+    #[test]
+    fn encoder_updates_port_when_only_the_port_changes() {
+        let mut enc = UdpFrameEncoder::new();
+        let p1: SocketAddr = "192.0.2.7:1000".parse().unwrap();
+        let p2: SocketAddr = "192.0.2.7:2000".parse().unwrap();
+        assert_eq!(enc.frame(p1, b"x"), old_framed(p1, b"x").as_slice());
+        assert_eq!(enc.frame(p2, b"x"), old_framed(p2, b"x").as_slice());
+    }
+
+    /// What the encoder emits must survive the decoder the far side actually uses.
+    #[test]
+    fn encoder_output_round_trips_through_the_decoder() {
+        let mut enc = UdpFrameEncoder::new();
+        let peer: SocketAddr = "[2001:db8::1]:4433".parse().unwrap();
+        let payload = vec![0x5Au8; 1400];
+        let framed = enc.frame(peer, &payload);
+
+        let len = u32::from_be_bytes(framed[..4].try_into().unwrap()) as usize;
+        assert_eq!(
+            len,
+            framed.len() - 4,
+            "length prefix disagrees with the body"
+        );
+
+        let env = Envelope::decode(&framed[4..]).expect("body must decode");
+        let Some(Payload::UdpDatagram(dg)) = env.payload else {
+            panic!("decoded to the wrong payload variant");
+        };
+        assert_eq!(dg.data, payload);
+        assert_eq!(datagram_peer_addr(&dg.peer_addr, dg.peer_port), Some(peer));
+    }
+
+    #[test]
+    fn datagram_peer_addr_accepts_both_families() {
+        assert_eq!(
+            datagram_peer_addr("127.0.0.1", 53),
+            Some("127.0.0.1:53".parse().unwrap())
+        );
+        // Bare IPv6, no brackets -- which is how it travels on the wire.
+        assert_eq!(
+            datagram_peer_addr("::1", 5000),
+            Some("[::1]:5000".parse().unwrap())
+        );
+    }
+
+    /// Port 0 is not a destination, and a port above 65535 must be dropped rather than
+    /// truncated. `dg.peer_port as u16` -- what the server used to do -- turns 65536 into 0 and
+    /// 65537 into 1, quietly sending the datagram somewhere plausible and wrong.
+    #[test]
+    fn datagram_peer_addr_rejects_unusable_ports() {
+        assert_eq!(datagram_peer_addr("127.0.0.1", 0), None, "port 0");
+        assert_eq!(
+            datagram_peer_addr("127.0.0.1", 65536),
+            None,
+            "just over u16"
+        );
+        assert_eq!(
+            datagram_peer_addr("127.0.0.1", 4_294_967_295),
+            None,
+            "u32::MAX"
+        );
+        assert_eq!(65536u32 as u16, 0, "the truncation this guards against");
+    }
+
+    #[test]
+    fn datagram_peer_addr_rejects_non_addresses() {
+        assert_eq!(datagram_peer_addr("", 53), None);
+        assert_eq!(datagram_peer_addr("not-an-ip", 53), None);
+        // A host name is not accepted: this field carries a literal, and resolving here would
+        // put a DNS lookup on the per-datagram path.
+        assert_eq!(datagram_peer_addr("localhost", 53), None);
+        // Already-bracketed text is not what the wire carries, and must not be accepted as a
+        // bare IP literal.
+        assert_eq!(datagram_peer_addr("[::1]", 53), None);
+    }
 }
