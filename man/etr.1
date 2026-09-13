@@ -1,0 +1,399 @@
+.TH "ETR" "1" "" "etr 0.9.0" "User Commands"
+
+.SH "NAME"
+.PP
+etr \- Eternal Terminal client
+
+.SH "SYNOPSIS"
+.PP
+\fBetr\fP [\fIOPTIONS\fP] [\fIuser\fP@]\fIhost\fP [\fIcommand\fP [\fIargs\fP\.\.\.]]
+.PP
+\fBetr\fP \fB\-\-completions\fP \fISHELL\fP
+
+.SH "DESCRIPTION"
+.PP
+\fBetr\fP connects to a remote host and starts a persistent terminal session
+that survives network interruptions\. Unlike SSH, the session keeps running
+on the server when the connection drops, and \fBetr\fP reconnects transparently
+when the network comes back\.
+.PP
+\fBetr\fP requires no pre\-running daemon on the server\. It bootstraps the
+session by SSHing to the remote host, starting \fBetrs\fP(1) on the fly, and
+then connecting to it over QUIC (TLS 1\.3)\. Certificate pinning is used in
+place of a CA: the server certificate is transmitted over the authenticated
+SSH channel and pinned for subsequent QUIC connections\.
+
+.SH "OPTIONS"
+\fB\fI[user@]host\fP\fP
+.RS
+.PP
+Remote host to connect to\. May include an optional \fIuser\fP prefix
+(e\.g\. \fBalice@example\.com\fP)\. If omitted, help is printed\.
+.RE
+\fB\fIcommand\fP [\fIargs\fP\.\.\.]\fP
+.RS
+.PP
+Optional remote command to execute instead of an interactive shell\.
+All words after \fIhost\fP are joined with spaces and passed to \fBsh \-c\fP
+on the remote host, so shell metacharacters work as expected\.
+The command runs under a PTY, so full\-screen programs like \fBbtop\fP,
+\fBvim\fP, and \fBdistrobox\fP work correctly\.
+When the command exits the session ends\.
+.PP
+Examples:
+.RS
+.PP
+.nf
+etr host 'distrobox \-\- btop'
+etr host ls \-la /tmp
+etr host 'tail \-f /var/log/syslog | grep error'
+.fi
+.RE
+.RE
+\fB\fB\-s\fP, \fB\-\-ssh\-port\fP \fIPORT\fP\fP
+.RS
+.PP
+SSH port to use for the initial bootstrap connection\. Defaults to 22,
+or the value of \fBssh_port\fP in the config file\.
+.RE
+\fB\fB\-4\fP, \fB\-\-prefer\-ipv4\fP\fP
+.RS
+.PP
+Prefer IPv4 when the host resolves to both families\.
+.RE
+\fB\fB\-6\fP, \fB\-\-prefer\-ipv6\fP\fP
+.RS
+.PP
+Prefer IPv6 when the host resolves to both families\.
+.PP
+These are a \fBpreference, not a restriction\fP \-\- unlike \fBssh\fP(1)'s
+\fB\-4\fP/\fB\-6\fP\. The requested family is tried first for the SSH bootstrap,
+the QUIC session, and the targets of \fB\-R\fP forwards; the other family is
+still used when the host has no address of the preferred one, or has one
+the kernel cannot route to\. \fBetr\fP therefore never fails purely because
+the requested family was unavailable, and the fallback is reported at
+\fB\-v\fP\.
+.PP
+The preference is also sent to \fBetrs\fP(1), which applies it when
+resolving the targets of \fB\-L\fP forwards on its own side\.
+.PP
+The two flags are mutually exclusive\. Config file equivalent:
+\fBaddress_family\fP under \fB[client]\fP\.
+.RE
+\fB\fB\-v\fP\fP
+.RS
+.PP
+Increase verbosity\. May be repeated up to three times:
+.PP
+\fB\-v\fP \-\- connection lifecycle events
+.PP
+\fB\-vv\fP \-\- QUIC details and session ID
+.PP
+\fB\-vvv\fP \-\- per\-stream trace
+.PP
+When running interactively, verbose output is written to
+\fB$XDG_STATE_HOME/etr/etr\.log\fP (default: \fB~/\.local/state/etr/etr\.log\fP)
+to avoid corrupting the raw\-mode terminal display\. Before the session
+enters raw mode, output goes to stderr\.
+.RE
+\fB\fB\-L\fP [\fIbind_address\fP:]\fIlocal_port\fP:\fIremote_host\fP:\fIremote_port\fP[/\fItcp\fP|/\fIudp\fP]\fP
+.RS
+.PP
+Forward a local port to a remote destination, similar to \fBssh \-L\fP\.
+The protocol defaults to TCP if not specified\. By default, the local listener
+binds to both \fB127\.0\.0\.1\fP and \fB[::1]\fP loopback interfaces\.
+.PP
+If \fIbind_address\fP is specified as \fB*\fP, \fB0\.0\.0\.0\fP, or \fB::\fP, the listener binds
+a single dual\-stack \fB[::]\fP socket, which accepts both IPv4 and IPv6 connections\.
+Alternatively, it can bind to a specific interface IP\.
+The \fB\-g\fP / \fB\-\-gateway\-ports\fP flag can also be used to bind all forwards to all interfaces\.
+.PP
+This option may be repeated to open multiple forwards concurrently alongside the PTY
+session\.
+.PP
+Examples:
+.RS
+.PP
+.nf
+\-L 8080:localhost:80
+\-L *:3000:localhost:3000
+\-L [::1]:8080:localhost:80
+\-L 5353:8\.8\.8\.8:53/udp
+\-L 5432:db\.internal:5432/tcp
+.fi
+.RE
+.RE
+\fB\fB\-R\fP [\fIbind_address\fP:]\fIremote_port\fP:\fIlocal_host\fP:\fIlocal_port\fP[/\fItcp\fP|/\fIudp\fP]\fP
+.RS
+.PP
+Forward a remote port on the server to a local destination, similar to \fBssh \-R\fP\.
+The protocol defaults to TCP if not specified\. By default, the remote listener
+on the server binds to both \fB127\.0\.0\.1\fP and \fB[::1]\fP loopback interfaces\.
+.PP
+If \fIbind_address\fP is specified as \fB*\fP, \fB0\.0\.0\.0\fP, or \fB::\fP, the remote listener binds
+a single dual\-stack \fB[::]\fP socket on the server\. Alternatively, it can bind to a specific
+interface IP\.  The \fB\-g\fP / \fB\-\-gateway\-ports\fP flag also causes remote listeners to bind
+to all interfaces on the server\.
+.PP
+This option may be repeated to open multiple reverse forwards concurrently alongside the PTY
+session\.
+.PP
+Examples:
+.RS
+.PP
+.nf
+\-R 8080:localhost:80
+\-R 0\.0\.0\.0:3000:localhost:3000
+\-R 5353:127\.0\.0\.1:53/udp
+.fi
+.RE
+.RE
+\fB\fB\-g\fP, \fB\-\-gateway\-ports\fP\fP
+.RS
+.PP
+Allow remote hosts to connect to forwarded ports\. Similar to \fBssh \-g\fP\.
+Binds both local (\fB\-L\fP) and remote (\fB\-R\fP) forwarded ports to a single dual\-stack
+\fB[::]\fP socket, which accepts both IPv4 and IPv6 connections on all interfaces,
+instead of binding to loopback only\.
+.RE
+\fB\fB\-X\fP\fP
+.RS
+.PP
+Enable X11 forwarding\. Extracts the local X11 display cookie from the active display (via \fBxauth\fP) and securely forwards it to the server\.
+.RE
+\fB\fB\-Y\fP\fP
+.RS
+.PP
+Enable trusted X11 forwarding\. Treated identically to \fB\-X\fP\.
+.RE
+\fB\fB\-\-server\-path\fP \fIPATH\fP\fP
+.RS
+.PP
+Path to the \fBetrs\fP binary on the remote host\. Defaults to \fBetrs\fP
+(relies on \fBPATH\fP), or the value of \fBserver_path\fP in the config file\.
+.RE
+\fB\fB\-\-log\-path\fP \fIPATH\fP\fP
+.RS
+.PP
+Path to the client log file\. Defaults to \fB$XDG_STATE_HOME/etr/etr\.log\fP\.
+.RE
+\fB\fB\-\-server\-log\-path\fP \fIPATH\fP\fP
+.RS
+.PP
+Path to the server log file on the remote host\. Defaults to \fB$XDG_STATE_HOME/etr/etrs\.log\fP\.
+.RE
+\fB\fB\-\-completions\fP \fISHELL\fP\fP
+.RS
+.PP
+Print shell completion script for the given shell and exit\. Supported
+shells: \fBbash\fP, \fBzsh\fP, \fBfish\fP, \fBelvish\fP, \fBpowershell\fP, \fBnushell\fP\.
+.RE
+\fB\fB\-h\fP, \fB\-\-help\fP\fP
+.RS
+.PP
+Print help and exit\.
+.RE
+\fB\fB\-V\fP, \fB\-\-version\fP\fP
+.RS
+.PP
+Print version and exit\.
+.RE
+
+.SH "CONFIGURATION"
+.PP
+\fBetr\fP reads a TOML config file from
+\fB$XDG_CONFIG_HOME/etr/config\.toml\fP (default: \fB~/\.config/etr/config\.toml\fP)\.
+All fields are optional\. CLI flags take precedence over config values\.
+.RS
+.PP
+.nf
+[client]
+# Default SSH port (default: 22)
+ssh_port = 22
+
+# Path to etrs on remote hosts (default: "etrs", relies on PATH)
+server_path = "/usr/local/bin/etrs"
+
+# Which IP version to try first: "ipv4", "ipv6" or "auto" (default)
+address_family = "auto"
+
+# Default path to the client log file
+log_path = "/tmp/client\.log"
+
+# Default path to the server log file on the remote host
+server_log_path = "/tmp/server\.log"
+
+# Allow remote hosts to connect to local forwarded ports (default: false)
+gateway_ports = true
+
+# Default local port forwards
+forward = ["8080:localhost:80", "*:3000:localhost:3000"]
+
+# Default remote port forwards
+reverse_forward = ["9090:localhost:90"]
+
+# Enable X11 forwarding (default: false)
+x11 = false
+
+# Enable trusted X11 forwarding (default: false)
+x11_trusted = false
+.fi
+.RE
+
+.SH "FILES"
+\fB\fB~/\.config/etr/config\.toml\fP\fP
+.RS
+Client configuration file (XDG_CONFIG_HOME honoured)\.
+.RE
+\fB\fB~/\.local/state/etr/etr\.log\fP\fP
+.RS
+Client verbose log file written during raw\-mode sessions
+(XDG_STATE_HOME honoured)\.
+.RE
+
+.SH "ENVIRONMENT"
+\fB\fBTERM\fP\fP
+.RS
+Passed to the remote shell via the bootstrap protocol\. Defaults to
+\fBxterm\-256color\fP if unset\.
+.RE
+\fB\fBSHELL\fP\fP
+.RS
+Not used by \fBetr\fP itself; used by \fBetrs\fP(1) on the server to
+determine which shell to launch\.
+.RE
+\fB\fBXDG_CONFIG_HOME\fP\fP
+.RS
+Base directory for the config file\. Defaults to \fB~/\.config\fP\.
+.RE
+\fB\fBXDG_STATE_HOME\fP\fP
+.RS
+Base directory for the log file\. Defaults to \fB~/\.local/state\fP\.
+.RE
+
+.SH "EXAMPLES"
+.PP
+Connect to a remote host:
+.RS
+.PP
+.nf
+etr user@example\.com
+.fi
+.RE
+.PP
+Connect on a non\-standard SSH port:
+.RS
+.PP
+.nf
+etr \-s 2222 user@example\.com
+.fi
+.RE
+.PP
+Connect with verbose logging:
+.RS
+.PP
+.nf
+etr \-vv user@example\.com
+.fi
+.RE
+.PP
+Prefer IPv6 for a dual\-stack host (falls back to IPv4 if there is no
+usable IPv6 address):
+.RS
+.PP
+.nf
+etr \-6 user@example\.com
+.fi
+.RE
+.PP
+Forward a local port to a remote database:
+.RS
+.PP
+.nf
+etr \-L 5432:db\.internal:5432 user@example\.com
+.fi
+.RE
+.PP
+Forward a UDP port (DNS) through a jump host:
+.RS
+.PP
+.nf
+etr \-L 5353:8\.8\.8\.8:53/udp user@jumphost
+.fi
+.RE
+.PP
+Reverse forward a remote port on the server to a local web server:
+.RS
+.PP
+.nf
+etr \-R 8080:localhost:80 user@example\.com
+.fi
+.RE
+.PP
+Reverse forward allowing external connections to the server's port:
+.RS
+.PP
+.nf
+etr \-R 0\.0\.0\.0:8080:localhost:80 user@example\.com
+.fi
+.RE
+.PP
+Run a remote command under a PTY (session ends when the command exits):
+.RS
+.PP
+.nf
+etr user@example\.com 'distrobox \-\- btop'
+etr user@example\.com ls \-la /tmp
+.fi
+.RE
+.PP
+Generate zsh completions:
+.RS
+.PP
+.nf
+etr \-\-completions zsh > ~/\.zfunc/_etr
+.fi
+.RE
+
+.SH "ESCAPE SEQUENCES"
+.PP
+While a session is active, \fBetr\fP recognises SSH\-style escape sequences at
+the start of a line (after a newline or at session start):
+\fB\fB~\.\fP\fP
+.RS
+Force\-disconnect and exit\. Use this when the server is unreachable and
+the normal reconnect loop is not making progress\.
+.RE
+\fB\fB~~\fP\fP
+.RS
+Send a literal `\f[CR]~\fP` to the remote shell\.
+.RE
+
+.SH "EXIT STATUS"
+\fB\fB0\fP\fP
+.RS
+Clean disconnect\.
+.RE
+\fB\fBnon\-zero\fP\fP
+.RS
+Connection or session error\.
+.RE
+
+.SH "SEE ALSO"
+.PP
+\fBetrs\fP(1), \fBssh\fP(1), \fBssh_config\fP(5)
+
+.SH "BUGS"
+.RS
+.IP \(bu 4
+Session state is not persisted; re\-attaching from a different client
+machine is not supported\.
+.RE
+
+.SH "AUTHORS"
+.PP
+The etr project contributors\. See the source repository for details\.
+
+.SH "LICENSE"
+.PP
+GNU General Public License v3\.0 or later\.

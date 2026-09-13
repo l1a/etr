@@ -1,8 +1,8 @@
 [package]
 name = "etr"
-version = "0.8.3"
+version = "0.9.0"
 edition = "2024"
-description = "A Rust implementation of Eternal Terminal (et)"
+description = "Reconnecting remote shell over QUIC — a Rust implementation of Eternal Terminal (et)"
 license = "GPL-3.0-only"
 repository = "https://github.com/l1a/etr"
 readme = "README.md"
@@ -17,6 +17,8 @@ exclude = [
     "scripts/",
     "packaging/",
     ".github/",
+    # Packaging machinery for COPR: only ever run by COPR's mock buildroot.
+    ".copr/",
 ]
 
 [dependencies]

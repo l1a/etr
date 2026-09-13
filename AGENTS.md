@@ -111,7 +111,7 @@ and `just pr` will hard-fail the gate if either is missed:
 
 | Step | Why unconditional |
 |------|------------------|
-| **Man page regen (4.5)** | Verifies mandown still builds both man pages; the version header must match the bumped version. |
+| **Man page regen (4.5)** | The rendered pages are TRACKED and their `.TH` line carries the version, so a bump that skips `just man` leaves them stale — and they are what COPR and Homebrew package. |
 | **Version bump (4.10)** | Every merged PR changes the codebase; the published version must reflect that. Use **patch** for fixes, tests, and doc improvements; **minor** for new user-visible features. |
 
 Rationalising either of these away — "it's only docs", "it's only tests", "no behaviour
@@ -128,7 +128,7 @@ and hard-fails on the first problem:
 1. Confirms you are on a feature branch, not `main`.
 2. Confirms `Cargo.toml`'s version has been bumped past the last git tag.
 3. Confirms `NOTES.md` has a `## Current state: v<version>` header matching the bumped version.
-4. Regenerates man pages (`just man`) and fails if `mandown` errors out. `man/build/` is gitignored, so there is nothing to diff or commit here — this step only proves the man pages still build and the version header is current.
+4. Regenerates man pages (`just man`) and fails if `mandown` errors out, then fails again (via `just check`'s `man-check`) if the rendered pages differ from the committed `man/etr.1` / `man/etrs.1`. **Since v0.9.0 these are tracked**, because a GitHub tag tarball carries only tracked files and both the COPR spec and the Homebrew formula install a man page out of it. Commit them with the version bump.
 5. Runs `cargo check` and fails if `Cargo.lock` changed but wasn't committed.
 6. Runs `just check` (`cargo fmt --check` + `cargo clippy --all-targets -D warnings`).
 7. Runs `cargo test`.
@@ -165,7 +165,13 @@ and hard-fails on the first problem:
 - [ ] Run `just man` and verify it succeeds (requires `mandown` — `cargo install mandown`).
 - [ ] If a new flag or behaviour was added, update the relevant section in
       `man/etr.1.md` or `man/etrs.1.md` before running `just man`.
-- [ ] `man/build/` is gitignored — do not commit its contents.
+- [ ] **Commit the rendered `man/etr.1` and `man/etrs.1`.** They are tracked as of v0.9.0.
+      The `.TH` line embeds the version, so *every* version bump changes them — `just check`
+      runs `man-check` and fails on a stale page, so this cannot be forgotten silently.
+- [ ] Rationale, so nobody "tidies" it back: a tag tarball contains only tracked files, and
+      the COPR spec and Homebrew formula both `install` a man page from that tarball. While
+      the pages lived in a gitignored `man/build/`, neither channel could ship one and
+      `just install-tag` had to report them "not tracked at that tag".
 
 ### 4.6 Config file
 - [ ] If a new config key was added to `config.toml` support, document it in the
@@ -213,7 +219,7 @@ and hard-fails on the first problem:
       git clean -fdx --exclude=target --exclude=WIP.md --exclude=.claude   # remove
       ```
       Better still for a routine release, remove the specific artifacts you know
-      about (`rm -rf man/build`, `rm -f *.json.gz`) rather than reaching for a
+      about (`rm -f *.json.gz`) rather than reaching for a
       whole-tree clean at all. Reserve `git clean` for a tree you have inspected.
 
       The original claim was half right and that is what made it dangerous:
@@ -245,9 +251,89 @@ Fast-forward an existing clone first (`git pull --ff-only`), or clone freshly
 - [ ] Body summarises *what* changed and *why* (not just a commit list).
 - [ ] Test plan lists manual verification steps the reviewer can follow.
 
+### 4.13 Packaging (five channels since v0.9.0)
+
+`just check` runs `packaging-check`, which covers most of this automatically. The items
+here are the ones a human has to decide.
+
+- [ ] If the one-line summary, the description or the licence changed, change it in
+      **`packaging/metadata.toml`** and nowhere else first, then update each channel's copy
+      until `just packaging-check` passes. That file is the single source of truth for
+      crates.io, the AUR, COPR, Homebrew and the GitHub About box.
+- [ ] **Never paste a version or a checksum into a packaging template.** They carry
+      `@VERSION@` / `@SHA…@` sentinels and are rendered at publish time by
+      `scripts/render_packaging.py`. A template that has become a concrete file renders
+      "successfully" while publishing a frozen version, which is why `packaging-check`
+      asserts every sentinel individually.
+- [ ] If a new runtime dependency was added, add it to the COPR spec's `Requires:` and the
+      PKGBUILD's `depends=()`. Homebrew resolves Rust deps itself and needs nothing.
+- [ ] If a binary, man page or completion was added or renamed, update **all three** of the
+      spec's `%install`/`%files`, the formula's `install`, and the PKGBUILD's `package()`.
+      `packaging-check` asserts both binaries reach every channel, but it cannot know about
+      a third.
+- [ ] After the release, verify each channel actually serves the new version rather than
+      assuming the push worked — see §6.
+
 ## 5. Merging
 After a PR is merged, run `just merge-pr` to switch to `main`, pull, delete the local
 feature branch, and reset `WIP.md` (`Active Branch: none (main is current)`, latest
 commit updated).
+
+## 6. Releasing to all five channels
+
+etr publishes to **GitHub releases, crates.io, the AUR, COPR and a Homebrew tap**. Two of
+those happen by themselves on the tag; three are pushed from a workstation.
+
+**The order is not arbitrary** — the AUR and Homebrew both consume artifacts that only exist
+once the GitHub release has been built:
+
+```bash
+# 0. On main, clean, at the version you intend to release.
+git checkout main && git pull && git status --porcelain     # must be empty
+
+# 1. Tag. This alone starts release.yml (GitHub assets) and copr.yml (COPR rebuild).
+git tag v0.9.0 && git push origin v0.9.0
+
+# 2. Wait for release.yml to finish. The AUR and Homebrew steps hard-fail without it.
+gh run watch "$(gh run list --workflow=release.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
+
+# 3. crates.io, then the AUR, then Homebrew.
+just publish
+```
+
+`just publish` **refuses unless `HEAD` is the tag for the version in `Cargo.toml`**. That is
+not bureaucracy: `cargo publish` uploads whatever the worktree says and a crates.io version
+can be yanked but never deleted. Override with `PUBLISH_ANY_REF=1` only for a genuine
+exception, never to get past a surprise.
+
+### Verify afterwards — do not infer a channel from the push output
+
+```bash
+gh release view v0.9.0                                       # GitHub
+curl -sS -A etr-release-check https://crates.io/api/v1/crates/etr | grep -o '"max_version":"[^"]*"'
+curl -sS "https://aur.archlinux.org/cgit/aur.git/plain/.SRCINFO?h=etr-terminal-bin" | grep pkgver
+copr-cli get-package --name etr kentobias/etr                # or the COPR web UI
+git ls-remote https://github.com/l1a/homebrew-etr HEAD       # tap moved
+```
+
+**The AUR RPC lies for a few minutes after a push** — this has been observed twice on this
+fleet. `rpc/v5/info` serves a cached response naming the *previous* version while cgit and the
+package page already show the new one. Do not read one endpoint and conclude the push failed;
+the push output naming a commit range is itself proof the server-side hook parsed `.SRCINFO`
+and accepted it.
+
+### One-time prerequisites
+
+These exist as of v0.9.0 and are recorded so a fresh machine or a new maintainer knows what
+the recipes assume:
+
+- **AUR**: an SSH key registered with an AUR account that co-maintains `etr-terminal-bin`.
+- **Homebrew**: push access to `github.com/l1a/homebrew-etr`. The tap is created by pushing
+  to it; `just brew-publish` handles an empty tap, including pinning its default branch.
+- **COPR**: the `kentobias/etr` project, with **"Enable internet access during builds" ON**
+  (the spec resolves crates.io at build time and there is no vendor tarball), plus the
+  `COPR_LOGIN` / `COPR_USERNAME` / `COPR_TOKEN` repository secrets for `copr.yml`. Without
+  the secrets that workflow *skips* rather than fails, so a fork does not go red — which also
+  means a missing secret looks like success. Check the run's log for the skip notice.
 
 ---

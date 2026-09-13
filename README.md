@@ -58,6 +58,34 @@ paru -S etr-terminal-bin   # or: yay -S etr-terminal-bin
 
 (The AUR packages named `etr`/`etr-bin` are an unrelated traceroute tool.)
 
+### Fedora / RHEL (COPR)
+
+```bash
+sudo dnf copr enable kentobias/etr
+sudo dnf install etr
+```
+
+Builds from source for x86_64 and aarch64, and installs both binaries, both man pages and bash/zsh/fish completions.
+
+### macOS and Linux (Homebrew)
+
+```bash
+brew install l1a/etr/etr
+```
+
+Builds from source, so it needs the Rust toolchain — Homebrew installs that automatically as a build dependency. Both `etr` and `etrs` are installed.
+
+### Which one to use
+
+| You want | Use |
+|---|---|
+| The latest release on any platform with Rust | `cargo install etr` |
+| A prebuilt binary on Arch | the AUR package |
+| System package management on Fedora | COPR |
+| macOS, or Linuxbrew | Homebrew |
+
+**Install it on both ends.** `etr` starts `etrs` on the remote host over SSH, so the server needs `etrs` on its `PATH` too — or point at it explicitly with `etr --server-path /path/to/etrs`.
+
 ## Build from source
 
 ```bash

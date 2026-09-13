@@ -9,8 +9,105 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.8.3 — AGENTS.md §4.11 wiki clone fast-forward requirement
-## Current State (v0.8.3)
+## Current state: v0.9.0 — COPR and Homebrew, and packaging that cannot drift
+## Current State (v0.9.0)
+
+Packaging and release tooling (145 tests, unchanged — no Rust code changed).
+
+etr now publishes to **five** channels: GitHub releases, crates.io, the AUR, **COPR** and a
+**Homebrew tap**. The two new ones are the visible half; the more important half is that
+going from two channels to five would otherwise have multiplied a known failure mode.
+
+- **New: COPR (`kentobias/etr`).** `packaging/copr/etr.spec` builds both binaries from source
+  for x86_64 and aarch64 and installs two man pages plus bash/zsh/fish completions generated
+  by the binaries just built. `.copr/Makefile` produces the SRPM, and
+  `.github/workflows/copr.yml` rebuilds on every tag and pushes the project page's text.
+- **New: Homebrew tap (`l1a/homebrew-etr`).** `packaging/homebrew/etr.rb` builds from the tag
+  tarball. A source build rather than a bottle: a bottle needs CI to build, sign and upload
+  per macOS version and architecture, and the trade — slower first install against no new
+  secrets and no asset plumbing — is not worth taking until install time is a real complaint.
+- **The design decision that matters: no packaging file records a version or a checksum.**
+  Every template carries `@VERSION@`/`@SHA…@` sentinels, and `scripts/render_packaging.py`
+  fills them in at publish time from the tag. Five channels restating one fact is five
+  chances to get it wrong; the sibling repo `retch` paid that bill in full — its
+  `packaging/aur/PKGBUILD` reached **eleven releases** of drift (0.6.12 in-repo while the AUR
+  served 0.6.23) with every CI run green, and its post-tag packaging commit left `main`
+  naming a version that was never released, which came within one command of uploading an
+  untagged `retch-cli 0.17.4` to crates.io. **A stale checksum cannot be committed here
+  because no checksum is committed.** The guards therefore assert only that the sentinels are
+  still present — a much smaller claim, because the failure they would otherwise hunt has
+  become unrepresentable.
+- **`packaging/metadata.toml` is the single source of truth** for the summary, the short
+  summary, the licence, the GitHub About box and the COPR project page.
+  `scripts/packaging_check.py` fails `just check` when any channel's copy drifts from it. It
+  earned its keep immediately: on first run it caught a **pre-existing** disagreement nobody
+  had noticed — the AUR's `pkgdesc` was the good, descriptive one while `Cargo.toml` (and so
+  crates.io) carried a terser line. The AUR wording is now canonical everywhere.
+  - Two fields rather than one, and not for style: the long summary is 84 characters, over
+    **both** `brew audit`'s 80-character cap on `desc` and rpmlint's 79 for `Summary:`. Brew
+    additionally rejects a leading article, a trailing full stop and the formula's own name.
+    All of those are asserted.
+- **Man pages are now TRACKED (`man/etr.1`, `man/etrs.1`); `man/build/` is gone.** This is a
+  packaging requirement, not tidying: a GitHub tag tarball contains only tracked files, and
+  both new channels `install` a man page out of that tarball. While the pages lived in a
+  gitignored directory neither could ship one. It also repairs `just install-tag`, which had
+  to report man pages "not tracked at that tag". `just man-check` (wired into `just check`)
+  fails on a stale page — and since the `.TH` line embeds the version, *every* bump changes
+  them, so this converts a silent wart into a gate.
+- **`just publish` now refuses unless `HEAD` is the tag for the version in `Cargo.toml`.**
+  `cargo publish` uploads whatever the worktree says, and a crates.io version can be yanked
+  but never deleted. A clean working tree is not the same check and would not have caught the
+  sibling's near-miss, where the tree was clean and simply named an unreleased version.
+  `PUBLISH_ANY_REF=1` overrides it for a genuine exception.
+- **The AUR pair moved onto the shared renderer.** `PKGBUILD` and `.SRCINFO` restate the same
+  version and the same four checksums; they are now rendered from one set of values by one
+  renderer, so they cannot disagree. `.SRCINFO` is never hand-written.
+
+### Verified rather than assumed
+
+| Check | Result |
+|---|---|
+| `just check` (now incl. `man-check`, `packaging-check`) | passes |
+| `cargo test` | 145 tests, unchanged |
+| every guard watched **failing** via negative controls in `--self-test` | 13 refusal cases |
+| `packaging_check.py` against the live tree | caught a real pre-existing description drift |
+| COPR source archive: must-not-ship / must-ship guard | 0 forbidden entries; missing files correctly reported |
+| `tar --exclude-vcs-ignores` negative control | **14,347** forbidden entries — the trap is real on this repo |
+| `etr no-such-host.invalid true` (the Homebrew test's error path) | exit 1, no panic |
+
+### Traps worth keeping
+
+1. **GNU tar's `--exclude-vcs-ignores` does not implement `.gitignore` semantics.** Measured
+   here: it would have packed 14,347 entries this repo ignores — `target/`, `.claude/` and
+   `WIP.md` among them — into the SRPM, where they would reach the published `-debugsource`
+   package. An SRPM cannot be recalled, so `.copr/Makefile`'s guard is a hard failure, and it
+   asserts both directions: files that must never ship, and files whose absence would be just
+   as bad (no `Cargo.lock` means unpinned resolution; no `LICENSE` means a GPL obligation
+   shipped unmet).
+2. **`git diff --quiet` cannot see untracked files**, so on a brand-new empty Homebrew tap it
+   reports "no changes" and a publish would exit 0 having pushed nothing — the worst
+   available outcome. Both tap and AUR pushes stage first and then ask `git diff --cached`.
+3. **rpm compresses man pages**, so `%files` must glob `etr.1*`. Asserting the uncompressed
+   name reports a present file as missing.
+4. **`std_cargo_args` already passes `--locked`**; writing the flag out as well makes cargo
+   refuse the build outright. `packaging_check.py` asserts the helper is used *and* that the
+   flag is not also passed explicitly — dropping `--locked` would silently unpin resolution
+   in the two channels that build with network access and no vendoring.
+5. **A sentinel inside a comment is still substituted.** The first render produced a spec
+   whose header comment read "THIS IS A TEMPLATE. `0.8.3` is filled in by…". Harmless, but it
+   makes the published file explain itself wrongly; the comments now describe the sentinels
+   instead of containing them.
+
+### Found while doing this, NOT fixed here
+
+- **The AUR package installs neither man pages nor completions.** `etr-terminal-bin` is a
+  `-bin` package built from release assets, so it has no source tree to take them from, and
+  generating completions by running the downloaded binary would break for the aarch64 package
+  built on an x86_64 host. COPR and Homebrew both ship all three. Closing this means either
+  publishing the man pages as release assets or accepting a native-only completions step —
+  a decision, not a reflex fix, so it belongs in its own PR.
+
+## Previous: v0.8.3 — AGENTS.md §4.11 wiki clone fast-forward requirement
 
 Documentation & release hygiene (145 tests, unchanged).
 
@@ -1321,12 +1418,30 @@ cargo build
 # Install (release): both binaries, man pages and completions for six shells
 just install
 
-# Install a released tag instead -- binaries, completions and man pages all from that tag
-just install-tag 0.7.3
+# Install a released tag instead -- binaries, completions and man pages all from that tag.
+# Since v0.9.0 the man pages are tracked, so this no longer reports them missing at the tag.
+just install-tag 0.9.0
 
 # Code quality gate — run before every commit
-just check            # cargo fmt --check + cargo clippy -D warnings (also runs standard-check)
+just check            # fmt + clippy, and: standard-check, man-check, packaging-check
 just test             # cargo test (145 tests)
+
+# Man pages are TRACKED (man/etr.1, man/etrs.1) because tag tarballs carry only tracked
+# files and COPR/Homebrew install them from there. Re-run after every version bump.
+just man
+just man-check        # fails if the committed pages are stale (run by `just check`)
+```
+
+### Packaging and publishing
+
+```bash
+just packaging-check          # offline: sentinels intact, every channel agrees (in `just check`)
+just copr-render              # what COPR will be handed, without rpm tooling
+just github-metadata --dry-run  # About-box description/topics vs packaging/metadata.toml
+
+# Release: tag first (starts release.yml AND copr.yml), wait for assets, then push the rest.
+git tag v0.9.0 && git push origin v0.9.0
+just publish                  # crates.io -> AUR -> Homebrew; refuses unless HEAD is the tag
 ```
 
 ---
