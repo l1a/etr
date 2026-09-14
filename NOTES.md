@@ -65,6 +65,55 @@ that restoring it was an ~8x WAN win. Measured 4 MB vs 512 KB: +2.4% on the wire
 ceiling — nowhere near. 4 MB is restored because it is the historical value and the upstream
 defect is genuinely fixed, **not** because it buys throughput.
 
+### Why loopback shows etr at 14% — it is MTU, and the obvious fix makes it worse
+
+Loopback is the one path where etr looks bad (3.9-4.1 Gb/s against raw TCP's ~28 Gb/s). The
+cause is packet size, not etr's data path:
+
+| | loopback MTU | segment/datagram size | packets/sec at the measured rate |
+|---|---|---|---|
+| raw TCP | 65536 | 64 KB segments | **53,530 /s** |
+| etr (QUIC) | 65536 | **capped at 1452 B** | **333,592 /s** |
+
+quinn's `MtuDiscoveryConfig::upper_bound` defaults to **1452** — an internet-safe value — so
+QUIC never uses a larger datagram even where the path allows 65536. etr therefore performs
+**6.2x more packet operations**, and unlike TCP segments each one carries AEAD encryption,
+header protection, ACK tracking and congestion bookkeeping. That is the cost of QUIC's
+packet-level security and reliability against a zero-latency memory bus with a jumbo MTU.
+
+**Raising the bound was tried and is 28% SLOWER.** `upper_bound(65527)`, loopback, 10 s runs:
+
+| config | run 1 | run 2 | mean |
+|---|---|---|---|
+| default (1452) | 4074.6 | 3985.1 | **4030 Mb/s** |
+| raised (65527) | 3000.1 | 2821.8 | **2911 Mb/s** |
+
+Reverted; the experiment is not in the tree. Two plausible causes, **neither verified** —
+distinguishing them needs packet-level instrumentation: PMTUD probes on a 600 s interval, so a
+10 s run spends most of its time at the 1200-byte `initial_mtu` while still paying for probe
+packets and any black-hole backoff; and quinn's GSO batching is tuned around ~1452-byte
+segments, so oversized datagrams may miss the batched send path entirely.
+
+**Do not chase the loopback number.** It measures per-packet CPU overhead on a path nobody runs
+over. On both real links etr reaches 97% and 184% of single-stream TCP, because there the
+network binds long before per-packet cost does.
+
+### Worth revisiting: MTU awareness, if quinn improves
+
+Recorded as a deliberate *future* option rather than an open gap, because the measurement above
+says the naive version is a regression today:
+
+- If quinn's MTU discovery gets cheaper or converges faster, raising `upper_bound` becomes a
+  real win on **jumbo-frame LANs (MTU 9000)** and loopback, where the 1452 cap leaves most of
+  the frame unused.
+- **It should cost nothing in the common case.** On standard internet MTUs PMTUD settles near
+  1452 regardless, so an MTU-aware configuration is inert there — the expense only appears on a
+  path that can actually carry more.
+- The safe shape is therefore to raise the bound **conditionally** (a detected local/jumbo path,
+  or an explicit flag) rather than globally, and to re-measure with the one-way tooling before
+  believing any of it. Check both a standard and a jumbo path: the loopback figure alone will
+  mislead in either direction.
+
 ### Traps worth keeping
 
 1. **`-C target-cpu=native` in a user-level cargo config makes cross-host testing SIGILL.** A
