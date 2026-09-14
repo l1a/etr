@@ -9,8 +9,112 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.9.2 — the UDP throughput number was measuring a sleep
-## Current State (v0.9.2)
+## Current state: v0.9.3 — a saturated forward no longer kills the whole session
+## Current State (v0.9.3)
+
+Root-cause fix for a connection-teardown bug (152 → 154 tests).
+
+- **Any sustained port-forward tore down the entire QUIC connection — every other forward and
+  the interactive shell with it.** Both TCP forwards in `just stress-local` died after 0.4–1.0 s
+  and the harness reported their few hundred milliseconds as a throughput figure. The message,
+  which only appeared once `etrs` was taught to log the close reason, was:
+
+  ```text
+  ConnectionClose { error_code: INTERNAL_ERROR, reason: "too many gaps in stream buffer" }
+  ```
+
+### The mechanism is not what the message says
+
+"Gaps" implies packet loss. **There is none.** Across every failing run the kernel's UDP
+`RcvbufErrors` and `SndbufErrors` counters moved by exactly **0**. The real path:
+
+1. A forwarding relay reads a QUIC stream and writes a TCP socket **sequentially**. While
+   `write_all` is blocked by ordinary TCP back-pressure, nothing drains that QUIC stream.
+2. quinn keeps accepting data for it up to `stream_receive_window`, stored as **one chunk per
+   received STREAM frame**.
+3. `Assembler::defragment` does **not** merge them: `try_mark_defragment` marks any chunk whose
+   bytes fill ≥5/6 of their allocation as `defragmented` and keeps it as its own entry — which
+   is exactly what a full-size frame is.
+4. Past **1024** chunks quinn aborts the *connection*.
+
+So the governing relationship is a **count, not a rate**:
+
+```text
+stream_receive_window / frame_payload  <  1024
+```
+
+`stream_receive_window` was **4 MB** — set by the v0.4.x throughput work, up from quinn's
+1.25 MB default. At an internet-typical 1200-byte frame that is ~3500 chunks, 3.4× over the cap,
+so it failed the moment a relay stalled. **The v0.4.x tuning introduced this.**
+
+### The fix, and what it cost: nothing
+
+`stream_receive_window` is now **512 KB** (~437 chunks, a 2.3× margin, safe down to 512-byte
+frames). Measured on loopback, varying only this value:
+
+| window | outcome | throughput |
+|---|---|---|
+| 4 MB | **died in <1 s** | — |
+| 2 MB | survived | 3.05 Gb/s |
+| 1.25 MB (quinn default) | survived | 3.11 Gb/s |
+| 1 MB | survived | 3.03 Gb/s |
+| **512 KB** | **survived** | **3.40 Gb/s** |
+
+The 4 MB window bought **no throughput at all**. Note 2 MB passes *here* only because loopback
+uses ~2 KB frames; at 1200 bytes it is ~1750 chunks and would fail — **do not raise this on the
+strength of a loopback measurement.**
+
+### Verified against the requirement, not just the repro
+
+`just stress-local` with five concurrent streams (PTY + 2 TCP forwards + 2 UDP forwards), 32 s:
+
+| flow | before | after |
+|---|---|---|
+| TCP -L | died at 0.4–1.0 s | **1300 Mb/s, 32.1 s, lossless** |
+| TCP -R | died at 0.4–1.0 s | **1319 Mb/s, 32.1 s, lossless** |
+| interactive shell | killed with them | responsive |
+
+And with the UDP pumps **unpaced** (`UDP_PACE_US=0`), i.e. two floods offering 1885 Mb/s each on
+top of the TCP flows — roughly 6.2 Gb/s offered — every flow still completed the full 32.1 s,
+the shell stayed responsive, and `etrs` RSS growth stayed bounded.
+
+### Two things that look like fixes and are not
+
+Both were implemented, measured, and **reverted**:
+
+- **Enlarging the UDP socket buffers** (`SO_RCVBUF`/`SO_SNDBUF` to 4 MiB).
+- **Shrinking `send_window`** from 32 MB to 2 MB.
+
+Each delayed the failure — one saturating forward went from 2.5 s to 30.7 s of survival — which
+is exactly why they were convincing. Neither *bounds* the chunk count; they only reduce how much
+data is in flight, so the failure stays reachable at a higher rate or on a faster link. **A fix
+that moves the threshold is not a fix**, and the measurement that exposed the difference was the
+one showing zero socket-buffer drops: with no drops, a drop-related explanation could not be
+right. Recorded because the reasoning was wrong in an instructive way, not because it was close.
+
+### Diagnostics that made this findable
+
+- **`etrs` now logs the QUIC close reason**, not just `clean=false`. The transport error existed
+  in quinn the whole time and nothing printed it; both sides said only "connection lost". That
+  single missing line is why this survived several releases.
+- **`tcp-pump` reports why it stopped** instead of breaking silently, and `stress-local` now
+  prints `DIED AFTER 0.41s of 30s -- NOT a throughput measurement` rather than dividing bytes by
+  a near-zero interval. The previous code did `if (elapsed <= 0) elapsed = 0.001`, turning a
+  division by zero into a confident four-digit Mb/s — which is where this project's quoted TCP
+  throughput numbers came from.
+- **Regression test**, negative-controlled: `stream_window_cannot_exceed_assembler_chunk_cap`
+  asserts the relationship rather than the number, so restoring 4 MB fails the test with the
+  reason. Confirmed failing at 4 MB and passing at 512 KB.
+
+### Still open
+
+- **`stress-local`'s TCP rows are now real measurements** (~1.3 Gb/s each, concurrent). The old
+  "~320 Mb/s" figure in the throughput entry below predates all of this and should not be quoted.
+- Under concurrent multi-gigabit TCP load the UDP forwards deliver ~41 of 100 Mb/s offered. UDP
+  has no flow control and is competing with saturating TCP; unmeasured whether this is
+  contention or a forwarder limit.
+
+## Previous: v0.9.2 — the UDP throughput number was measuring a sleep
 
 UDP forwarding fast path, and the measurement that misdiagnosed it (145 → 152 tests).
 
@@ -1554,7 +1658,7 @@ just install-tag 0.9.0
 
 # Code quality gate — run before every commit
 just check            # fmt + clippy, and: standard-check, man-check, packaging-check
-just test             # cargo test (152 tests)
+just test             # cargo test (154 tests)
 
 # Man pages are TRACKED (man/etr.1, man/etrs.1) because tag tarballs carry only tracked
 # files and COPR/Homebrew install them from there. Re-run after every version bump.
@@ -1733,11 +1837,11 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
 
 ---
 
-## Test coverage (152 tests)
+## Test coverage (154 tests)
 
 | Module | What's tested |
 |--------|--------------|
-| `quic` | Cert generation, server/client config, write/read Envelope framing, write/read PTY chunk framing |
+| `quic` | Transport bounds: `stream_receive_window` must stay under quinn's 1024-chunk assembler cap at a 1200-byte frame, with a 2x margin (the v0.9.3 connection-teardown regression). Cert generation, server/client config, write/read Envelope framing, write/read PTY chunk framing |
 | `protocol` | SessionOpen/Accept encode-decode (incl. `gateway_ports`, `reverse_forwards`, and `x11_enabled`/`x11_auth_proto`/`x11_auth_cookie` round-trip), StreamOpen/Close, Heartbeat, Disconnect, UdpDatagram |
 | `session/stream` | Acknowledge edge cases, replay from 0, initial seq values |
 | `session/mod` | Close/ack unknown stream, `last_received_map` semantics, collect_replays, `open_stream` idempotence |

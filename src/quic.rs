@@ -29,27 +29,91 @@ pub fn generate_self_signed_cert() -> (CertificateDer<'static>, Vec<u8>) {
     (cert_der, key_der)
 }
 
-/// QUIC flow-control windows tuned for high-throughput forwarding streams.
+/// QUIC transport tuning.
 ///
-/// Stream receive window: 4 MB per stream — allows the sender to keep the
-/// pipeline full even with RTT latency, and lets a single read_chunk() drain
-/// up to 4 MB before back-pressure picks in.
-/// Connection window: 32 MB — accommodates many concurrent forwarded streams
-/// without the connection-level window becoming the bottleneck.
-/// Send window: 32 MB — symmetric with the receive window.
+/// # `stream_receive_window` is a correctness bound, not a performance dial
 ///
-/// Idle timeout: 30 s.  Application heartbeats every 5 s keep the timer alive
-/// during normal operation; if the peer disappears (crash, reboot, network
-/// partition) the connection is declared dead within 30 s so the client can
-/// reconnect or print a meaningful error.
+/// It was 4 MB from the v0.4.x throughput work until v0.9.3, and that is what made **any**
+/// sustained forward tear down the whole QUIC connection — every forward and the interactive
+/// shell with it:
 ///
-/// Keep-alive interval: 10 s.  Sends QUIC PING frames so that NAT mappings
-/// and firewalls stay open even when no application data is in flight.
+/// ```text
+/// ConnectionClose { error_code: INTERNAL_ERROR, reason: "too many gaps in stream buffer" }
+/// ```
+///
+/// ## The mechanism, which is not what the message suggests
+///
+/// "Gaps" implies packet loss. There is none: measured across every failing run, the kernel's
+/// UDP `RcvbufErrors` and `SndbufErrors` counters did not move at all. The real path is:
+///
+/// 1. A forwarding relay reads a QUIC stream and writes a TCP socket **sequentially**. While
+///    `write_all` is blocked by ordinary TCP back-pressure, nothing drains that QUIC stream.
+/// 2. quinn keeps accepting data for it, up to `stream_receive_window`, storing **one chunk per
+///    received STREAM frame**.
+/// 3. `Assembler::defragment` does *not* merge those chunks. A chunk whose bytes fill ≥5/6 of
+///    their allocation is marked `defragmented` and kept as its own entry
+///    (`try_mark_defragment` in quinn-proto's `assembler.rs`) — which is exactly what a
+///    full-size frame is.
+/// 4. Past **1024** chunks quinn aborts the *connection* with INTERNAL_ERROR.
+///
+/// So the governing relationship is a count, not a rate:
+///
+/// ```text
+/// stream_receive_window / frame_payload  <  1024
+/// ```
+///
+/// At an internet-typical 1200-byte payload, 4 MB is ~3500 chunks — over the cap by 3.4×, so it
+/// fails as soon as a relay stalls, which under load is constantly. **512 KB is ~437 chunks: a
+/// 2.3× margin, and it holds down to 512-byte frames.**
+///
+/// ## It cost nothing to fix
+///
+/// Measured on loopback, 64 KiB writes through a `-L` TCP forward, 10-12 s runs, varying only
+/// this value:
+///
+/// | window | outcome | throughput |
+/// |---|---|---|
+/// | 4 MB | **died in <1 s** | — |
+/// | 2 MB | survived | 3.05 Gb/s |
+/// | 1.25 MB (quinn default) | survived | 3.11 Gb/s |
+/// | 1 MB | survived | 3.03 Gb/s |
+/// | **512 KB** | **survived** | **3.40 Gb/s** |
+///
+/// The 4 MB window bought no throughput whatsoever. Note 2 MB passes *here* only because
+/// loopback uses ~2 KB frames; at 1200 bytes it would be ~1750 chunks and would fail. Do not
+/// raise this value on the strength of a loopback measurement.
+///
+/// **Two things that look like fixes and are not**, both tried and reverted: enlarging the UDP
+/// socket buffers, and shrinking `send_window`. Both only reduce how much data is in flight, so
+/// they delay the chunk count reaching 1024 rather than bounding it — symptom treatment that
+/// leaves the failure reachable at a higher rate or on a faster link.
+///
+/// # The other values
+///
+/// Connection window 32 MB and send window 32 MB are unchanged: they bound bytes, not chunks,
+/// and neither participates in this failure.
+///
+/// Idle timeout 30 s, with application heartbeats every 5 s; keep-alive 10 s so NAT mappings
+/// stay open when no data is in flight.
+/// Per-stream receive window. See [`high_throughput_transport`] for why this is a correctness
+/// bound rather than a tuning knob, and `stream_window_cannot_exceed_assembler_chunk_cap` for
+/// the invariant that keeps it one.
+pub const STREAM_RECEIVE_WINDOW: u32 = 512 * 1024;
+
+/// quinn-proto aborts the **connection** once one stream's reassembler holds more than this
+/// many chunks (`assembler.rs`: `if self.data.len() > 1024 { return Err(TooManyChunks) }`).
+pub const QUINN_ASSEMBLER_CHUNK_CAP: u32 = 1024;
+
+/// Smallest STREAM-frame payload worth planning for: an internet-typical 1200-byte QUIC
+/// datagram. Loopback frames are larger (~2 KB), which is why a loopback test alone will
+/// happily bless a window that fails on a real network.
+pub const MIN_EXPECTED_FRAME_PAYLOAD: u32 = 1200;
+
 fn high_throughput_transport() -> Arc<quinn::TransportConfig> {
     use std::time::Duration;
     let mut t = quinn::TransportConfig::default();
     t.stream_receive_window(
-        quinn::VarInt::from_u32(4 * 1024 * 1024), // 4 MB per stream
+        quinn::VarInt::from_u32(STREAM_RECEIVE_WINDOW), // per stream
     );
     t.receive_window(
         quinn::VarInt::from_u32(32 * 1024 * 1024), // 32 MB connection
@@ -386,5 +450,52 @@ mod tests {
         let result = srv_task.await.unwrap();
         assert!(result.is_err(), "expected error for oversized PTY chunk");
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+}
+
+#[cfg(test)]
+mod transport_bounds_tests {
+    use super::*;
+
+    /// **The regression test for the v0.9.3 connection-teardown bug.**
+    ///
+    /// A forwarding relay that is blocked writing to TCP stops draining its QUIC stream, and
+    /// quinn then buffers up to `STREAM_RECEIVE_WINDOW` as one chunk per received frame —
+    /// chunks it will not merge, because a full-size frame is marked `defragmented` on arrival.
+    /// Past `QUINN_ASSEMBLER_CHUNK_CAP` chunks quinn aborts the whole **connection**, taking
+    /// every other forward and the interactive shell with it.
+    ///
+    /// The window was 4 MB, i.e. ~3500 chunks at a 1200-byte frame — 3.4× over the cap. This
+    /// asserts the relationship rather than the number, so raising the window fails here with
+    /// the reason instead of failing in production under load.
+    #[test]
+    fn stream_window_cannot_exceed_assembler_chunk_cap() {
+        let worst_case_chunks = STREAM_RECEIVE_WINDOW / MIN_EXPECTED_FRAME_PAYLOAD;
+        assert!(
+            worst_case_chunks < QUINN_ASSEMBLER_CHUNK_CAP,
+            "stream_receive_window of {} bytes allows up to {} buffered chunks at a {}-byte \
+             frame, but quinn aborts the CONNECTION past {}. A stalled relay would tear down \
+             every stream on the connection, shell included. Lower the window — it bought no \
+             measurable throughput above 512 KB.",
+            STREAM_RECEIVE_WINDOW,
+            worst_case_chunks,
+            MIN_EXPECTED_FRAME_PAYLOAD,
+            QUINN_ASSEMBLER_CHUNK_CAP,
+        );
+    }
+
+    /// Keep a real safety margin rather than sitting on the cap. quinn's own 1.25 MB default is
+    /// ~1041 chunks at this frame size — already past it — so "matches the default" is not a
+    /// justification for raising this.
+    #[test]
+    fn stream_window_keeps_a_safety_margin() {
+        let worst_case_chunks = STREAM_RECEIVE_WINDOW / MIN_EXPECTED_FRAME_PAYLOAD;
+        assert!(
+            worst_case_chunks * 2 <= QUINN_ASSEMBLER_CHUNK_CAP,
+            "only {}x margin under the {}-chunk cap; want at least 2x so that smaller frames \
+             (a peer with a lower MTU, or a path that fragments) cannot reach it",
+            QUINN_ASSEMBLER_CHUNK_CAP as f32 / worst_case_chunks as f32,
+            QUINN_ASSEMBLER_CHUNK_CAP,
+        );
     }
 }

@@ -1246,7 +1246,19 @@ async fn handle_connection(
     hb_task.abort();
     dispatch_task.abort();
 
-    vlog!(1, "[etrs] connection from {} ended (clean={})", peer, clean);
+    // Report the QUIC-level reason, not just clean/unclean.
+    //
+    // `clean=false` on its own is unactionable, and that is not hypothetical: a forwarding
+    // stream that saturated the link tore the whole connection down with a specific transport
+    // error, and every log on both sides said only "connection lost" / "clean=false". The
+    // reason existed in quinn the entire time and nothing printed it.
+    vlog!(
+        1,
+        "[etrs] connection from {} ended (clean={}, reason={:?})",
+        peer,
+        clean,
+        conn.close_reason()
+    );
     clean
 }
 

@@ -154,7 +154,14 @@ fn tcp_pump(port: u16) {
         let mut buf = vec![0u8; 65536];
         loop {
             match (&recv_stream).read(&mut buf) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => {
+                    eprintln!("tcp-pump: drain saw EOF (peer closed the connection)");
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("tcp-pump: drain stopped: {e} (kind={:?})", e.kind());
+                    break;
+                }
                 Ok(n) => {
                     bytes_recv2.fetch_add(n as u64, Ordering::Relaxed);
                 }
@@ -164,9 +171,26 @@ fn tcp_pump(port: u16) {
 
     while !STOP.load(Ordering::Relaxed) {
         match (&stream).write_all(&chunk) {
-            Ok(()) => bytes_sent.fetch_add(chunk.len() as u64, Ordering::Relaxed),
-            Err(_) => break,
-        };
+            Ok(()) => {
+                bytes_sent.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+            }
+            // SAY WHY, rather than exiting silently into a plausible-looking stats line.
+            //
+            // This arm used to be a bare `break`. A pump that dies 40 ms into a 30 s run still
+            // prints `TCP sent=... recv=... elapsed=0.039`, which the justfile turns into a
+            // Mb/s figure computed over a near-zero interval -- and that figure is what got
+            // quoted as this project's TCP throughput. The stats line cannot distinguish "ran
+            // for 30 s" from "died immediately", so the reason has to reach stderr.
+            Err(e) => {
+                eprintln!(
+                    "tcp-pump: send stopped after {:.3}s: {e} (kind={:?}, errno={:?})",
+                    start.elapsed().as_secs_f64(),
+                    e.kind(),
+                    e.raw_os_error()
+                );
+                break;
+            }
+        }
     }
 
     let elapsed = start.elapsed().as_secs_f64();
