@@ -1,6 +1,6 @@
 [package]
 name = "etr"
-version = "0.9.3"
+version = "0.10.0"
 edition = "2024"
 description = "Reconnecting remote shell over QUIC — a Rust implementation of Eternal Terminal (et)"
 license = "GPL-3.0-only"
@@ -28,7 +28,18 @@ clap_complete = "4.5"
 clap_complete_nushell = "4.6"
 portable-pty = "0.9"
 prost = "0.14"
-quinn = "0.11"
+# MINIMUM 0.11.12 IS A CORRECTNESS REQUIREMENT, NOT A PREFERENCE.
+#
+# quinn 0.11.12 is the first release requiring quinn-proto >= 0.11.18, which carries
+# quinn-rs/quinn#2814. Without it, `Assembler::defragment` keeps contiguous chunks separate and
+# the retained-chunk count scales with `stream_receive_window` -- so a forwarding relay stalled
+# by ordinary TCP back-pressure tears down the WHOLE connection, interactive shell included
+# (etr v0.9.3 shipped a reduced window as a stopgap for exactly this).
+#
+# Expressing the floor here is the guard. cargo then cannot resolve a vulnerable pair at all,
+# which is stronger than any test: a test has to be reached and has to reproduce, and a
+# behavioural one written for this did NOT reproduce in-process -- see src/quic.rs.
+quinn = "0.11.12"
 rcgen = "0.14"
 rustls = "0.23"
 rand = "0.9"

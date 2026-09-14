@@ -1830,6 +1830,187 @@ e2e-udp-concurrent: check-tools install
 # This recipe sweeps the offered rate and reports delivered vs offered at each step, so the
 # knee is visible rather than inferred from one point.
 
+# ONE-WAY throughput, the way iperf3/nuttcp measure it, against a raw-path baseline.
+#
+# WHY THIS EXISTS SEPARATELY FROM `stress-local`
+#
+# `stress-local` and `stress-udp-rate` drive *echo* workloads: every byte crosses the link
+# twice and the number reported is offered load, not goodput. That is right for a soak, and
+# wrong for "how fast is etr" -- it is not comparable to any standard throughput tool.
+#
+# Comparing them anyway produced a real wrong answer here: etr's echo figure was set against
+# nuttcp's one-way number and read as "etr achieves 29% of the path", when a large part of
+# that gap was one number counting the link twice.
+#
+# This recipe measures ONE direction, and measures the raw path with the SAME tool in the
+# same shape, so the ratio means something. The baseline is the point: a throughput figure
+# with nothing to compare it against cannot tell you whether etr or the network is the limit.
+#
+# THROUGHPUT_SECS=n to change the run length (default 15).
+
+# One-way TCP goodput through a -L forward vs the raw loopback path
+throughput-local: check-tools install build-stress
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source scripts/e2e_procs.sh
+    ETRS_PRE=$(procs_snapshot etrs)
+    STRESS_PRE=$(procs_snapshot stress_tool)
+
+    CLIENT_LOG="${XDG_STATE_HOME:-$HOME/.local/state}/etr/etr.log"
+    TMUX_T="etr_throughput"
+    SINK_PORT=19811
+    FWD_PORT=19812
+    SECS="${THROUGHPUT_SECS:-15}"
+
+    cleanup() {
+        echo ""
+        echo "--- cleanup ---"
+        tmux kill-session -t "$TMUX_T" 2>/dev/null || true
+        procs_reap stress_tool "${STRESS_PRE:-}"
+        procs_reap etrs "${ETRS_PRE:-}"
+    }
+    trap cleanup EXIT
+
+    mkdir -p "$(dirname "$CLIENT_LOG")"; : > "$CLIENT_LOG"
+
+    # ── 1. Raw baseline: source -> sink directly, no etr in the path ──────────
+    echo "==> Baseline: raw loopback, one-way, ${SECS}s"
+    "{{STRESS_BIN}}" tcp-sink "$SINK_PORT" > /tmp/.etr_tp_base_$$ 2>/dev/null &
+    SINK_PID=$!
+    sleep 0.5
+    "{{STRESS_BIN}}" tcp-source 127.0.0.1 "$SINK_PORT" "$SECS" > /dev/null
+    sleep 0.5; kill -TERM "$SINK_PID" 2>/dev/null || true; wait "$SINK_PID" 2>/dev/null || true
+    BASE_LINE=$(cat /tmp/.etr_tp_base_$$ 2>/dev/null || echo "")
+    rm -f /tmp/.etr_tp_base_$$
+
+    # ── 2. Through an etr -L forward ──────────────────────────────────────────
+    echo "==> Through etr -L, one-way, ${SECS}s"
+    "{{STRESS_BIN}}" tcp-sink "$SINK_PORT" > /tmp/.etr_tp_etr_$$ 2>/dev/null &
+    SINK_PID=$!
+    sleep 0.5
+    tmux new-session -d -s "$TMUX_T" -x 200 -y 50 -- \
+        "{{INSTALL}}/etr" -v -L "${FWD_PORT}:127.0.0.1:${SINK_PORT}" localhost
+    READY=0
+    for i in $(seq 1 30); do
+        sleep 1
+        grep -q '\[etr\] Connected\.' "$CLIENT_LOG" 2>/dev/null && { READY=1; break; }
+    done
+    [[ $READY -eq 1 ]] || { echo "ERROR: etr did not connect" >&2; exit 1; }
+    sleep 1.0
+    "{{STRESS_BIN}}" tcp-source 127.0.0.1 "$FWD_PORT" "$SECS" > /dev/null
+    sleep 0.5; kill -TERM "$SINK_PID" 2>/dev/null || true; wait "$SINK_PID" 2>/dev/null || true
+    ETR_LINE=$(cat /tmp/.etr_tp_etr_$$ 2>/dev/null || echo "")
+    rm -f /tmp/.etr_tp_etr_$$
+
+    echo ""
+    "{{PY}}" scripts/throughput_report.py "$BASE_LINE" "$ETR_LINE"
+
+# One-way TCP goodput through a -L forward to a REMOTE host, vs the raw path to it.
+#
+# Needs passwordless ssh to HOST and stages two binaries into its /tmp (removed afterwards);
+# the host's own installed etr is never touched, because the session is started with
+# --server-path against the staged copy.
+
+# One-way TCP goodput through a -L forward to HOST, vs the raw path to it
+throughput-remote HOST: check-tools install build-stress
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source scripts/e2e_procs.sh
+    ETRS_PRE=$(procs_snapshot etrs)
+    STRESS_PRE=$(procs_snapshot stress_tool)
+
+    HOST="{{HOST}}"
+    CLIENT_LOG="${XDG_STATE_HOME:-$HOME/.local/state}/etr/etr.log"
+    TMUX_T="etr_throughput_remote"
+    SINK_PORT=19821
+    FWD_PORT=19822
+    SECS="${THROUGHPUT_SECS:-15}"
+    RSINK="/tmp/.etr-tp-stress.$$"
+    RETRS="/tmp/.etr-tp-etrs.$$"
+
+    cleanup() {
+        echo ""
+        echo "--- cleanup ---"
+        tmux kill-session -t "$TMUX_T" 2>/dev/null || true
+        # Kill by recorded pid, never `pkill -f <path>`: this recipe's own command line
+        # contains those paths, so a -f pattern matches the recipe itself (~/AGENTS.md §10).
+        ssh "$HOST" "rm -f '$RSINK' '$RETRS'" 2>/dev/null || true
+        procs_reap stress_tool "${STRESS_PRE:-}"
+        procs_reap etrs "${ETRS_PRE:-}"
+    }
+    trap cleanup EXIT
+
+    # BUILD A PORTABLE etrs FOR THE REMOTE, rather than shipping whatever the local install
+    # happens to be. A developer config carrying `-C target-cpu=native` produces a binary that
+    # SIGILLs on any other CPU -- measured here: an AVX-512 build from a Zen 4 laptop died with
+    # exit 132 on a Comet Lake host, and the `--version` probe is the only thing that catches
+    # it before a confusing mid-measurement failure. Overriding RUSTFLAGS at the `cargo build`
+    # is reliable; passing it through `just install` was NOT (it did not reach the compiler).
+    # Separate target dir so this never churns the main one.
+    # BUILD BOTH HELPERS PORTABLY. A developer config carrying `-C target-cpu=native` produces
+    # binaries that SIGILL on any other CPU -- measured here between a Zen 4 laptop and a Comet
+    # Lake host, exit 132. **Both** binaries need it: the stress helper survived startup and
+    # died only once data was flowing, so a `--version`-style probe does NOT catch it. That is
+    # why the baseline result is checked below rather than trusted.
+    PORT_TARGET="{{justfile_directory()}}/target/portable"
+    RFLAGS="${ETR_REMOTE_RUSTFLAGS:--C target-cpu=x86-64-v2}"
+    echo "==> Building portable helpers for ${HOST} (${RFLAGS})"
+    RUSTFLAGS="$RFLAGS" CARGO_TARGET_DIR="$PORT_TARGET" cargo build --release --quiet --bin etrs
+    RUSTFLAGS="$RFLAGS" CARGO_TARGET_DIR="$PORT_TARGET" \
+        cargo build --release --quiet --manifest-path tools/stress/Cargo.toml
+
+    echo "==> Staging helpers on ${HOST} (its installed etr is not touched)"
+    scp -q "$PORT_TARGET/release/stress_tool" "$HOST:$RSINK"
+    scp -q "$PORT_TARGET/release/etrs" "$HOST:$RETRS"
+    ssh "$HOST" "chmod +x '$RSINK' '$RETRS'"
+    ssh "$HOST" "'$RETRS' --version" >/dev/null 2>&1 || {
+        echo "ERROR: the staged etrs will not run on $HOST (SIGILL / missing libs?)." >&2
+        echo "       Try a lower baseline: ETR_REMOTE_RUSTFLAGS='-C target-cpu=x86-64'" >&2
+        exit 1; }
+
+    mkdir -p "$(dirname "$CLIENT_LOG")"; : > "$CLIENT_LOG"
+
+    # The sink runs in the FOREGROUND of ssh and exits on its own when the source closes the
+    # connection, so its stats line comes straight back over the ssh channel. An earlier
+    # version used nohup + a pid file + a remote kill; every one of those was a way to lose
+    # the measurement silently.
+    echo "==> Baseline: raw path to ${HOST}, one-way, ${SECS}s"
+    ssh "$HOST" "timeout $((SECS + 30)) '$RSINK' tcp-sink $SINK_PORT" > /tmp/.etr_tpr_base_$$ 2>/dev/null &
+    SINK_SSH=$!
+    sleep 2
+    "{{STRESS_BIN}}" tcp-source "$HOST" "$SINK_PORT" "$SECS" > /dev/null
+    wait "$SINK_SSH" 2>/dev/null || true
+    BASE_LINE=$(grep '^SINK' /tmp/.etr_tpr_base_$$ 2>/dev/null || echo "")
+    rm -f /tmp/.etr_tpr_base_$$
+    if [[ -z "$BASE_LINE" ]]; then
+        echo "ERROR: the remote sink produced no result." >&2
+        echo "       Most likely it died on the remote CPU (SIGILL). The helper survives" >&2
+        echo "       startup and fails only once data flows, so a version probe misses it." >&2
+        echo "       Retry with: ETR_REMOTE_RUSTFLAGS='-C target-cpu=x86-64' just throughput-remote $HOST" >&2
+        exit 1
+    fi
+
+    echo "==> Through etr -L to ${HOST}, one-way, ${SECS}s"
+    ssh "$HOST" "timeout $((SECS + 60)) '$RSINK' tcp-sink $SINK_PORT" > /tmp/.etr_tpr_etr_$$ 2>/dev/null &
+    SINK_SSH=$!
+    sleep 2
+    tmux new-session -d -s "$TMUX_T" -x 200 -y 50 -- \
+        "{{INSTALL}}/etr" -v -L "${FWD_PORT}:127.0.0.1:${SINK_PORT}" --server-path "$RETRS" "$HOST"
+    READY=0
+    for i in $(seq 1 40); do
+        sleep 1
+        grep -q '\[etr\] Connected\.' "$CLIENT_LOG" 2>/dev/null && { READY=1; break; }
+    done
+    [[ $READY -eq 1 ]] || { echo "ERROR: etr did not connect to $HOST" >&2; tail -5 "$CLIENT_LOG" >&2; exit 1; }
+    sleep 1.5
+    "{{STRESS_BIN}}" tcp-source 127.0.0.1 "$FWD_PORT" "$SECS" > /dev/null
+    wait "$SINK_SSH" 2>/dev/null || true
+    ETR_LINE=$(grep '^SINK' /tmp/.etr_tpr_etr_$$ 2>/dev/null || echo "")
+    rm -f /tmp/.etr_tpr_etr_$$
+
+    echo ""
+    "{{PY}}" scripts/throughput_report.py "$BASE_LINE" "$ETR_LINE"
+
 # Sweep the offered UDP rate and report delivered vs offered, to find the sustainable rate
 stress-udp-rate: check-tools install build-stress
     #!/usr/bin/env bash
