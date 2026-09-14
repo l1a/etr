@@ -9,8 +9,82 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.9.4 — upstream fix landed, stream window restored
-## Current State (v0.9.4)
+## Current state: v0.10.0 — one-way throughput measurement, and the 4 MB window restored
+## Current State (v0.10.0)
+
+Measurement tooling plus the v0.9.3 stopgap retired (153 tests, unchanged).
+
+### One-way throughput, because the echo figures were being misread
+
+Every throughput number this project had came from an **echo** workload: `stress-local` and
+`stress-udp-rate` bounce data off a remote echo server, so every byte crosses the link twice
+and the figure reported is *offered load*, not goodput. That is fine for a soak and wrong for
+"how fast is etr" — it is not comparable to `iperf3` or `nuttcp`, which measure one direction.
+
+**The misreading was real, not hypothetical.** etr's echo figure was set against a nuttcp
+one-way number and read as *"etr achieves 29% of the path"*. Measured properly, one-way,
+against a baseline taken with the same code back-to-back: **etr reached 97% of the raw
+single-stream TCP baseline** over a WAN link. The 29% was almost entirely an artefact of one
+number counting the link twice.
+
+New in the stress helper: `tcp-sink`/`tcp-source` and `udp-sink`/`udp-source`. The **sink**
+reports what actually arrived (goodput, comparable to iperf3); the **source** reports what was
+offered, so the difference is loss for UDP and in-flight data for TCP. The sources take a
+**host**, which the pumps never did — they hardcode `127.0.0.1`, which is precisely why a raw
+baseline over a real path could not be taken before.
+
+New recipes: **`just throughput-local`** and **`just throughput-remote HOST`**. Both always
+report the baseline alongside etr, because a throughput number with nothing to compare against
+cannot say whether etr or the network is the limit — which is the mistake that started this.
+
+### Measured on the fleet (2026-09-14)
+
+| path | RTT | raw single-stream TCP | via etr | ratio |
+|---|---|---|---|---|
+| irulan (wifi) → gimli | 12.4 ms | 126.7 Mb/s | 122.9 Mb/s | **97%** |
+| corrino → gimli (both wired) | 10.5 ms | 274.0 Mb/s | **504.9 Mb/s** | **184%** |
+
+**The 184% is not etr beating the network**, and the report says so rather than leaving it to
+be misread: the baseline is *one untuned TCP stream*, and QUIC's loss recovery genuinely beats
+that on a path with loss — nuttcp measured this link at 670 Mb/s with 395 retransmits. The
+baseline is a floor, not a capacity. For capacity, use iperf3/nuttcp with parallel streams; the
+value of this tool is that both of its numbers come from the same code, back to back.
+
+### The 4 MB stream window is back (was the v0.9.3 stopgap)
+
+quinn-proto 0.11.18 / quinn 0.11.12 shipped quinn-rs/quinn#2814 on 2026-09-14. `defragment()`
+now keeps a chunk separate only if it is at least `buffered / MAX_CHUNKS` bytes and coalesces
+the rest, so the retained count is **self-limiting by arithmetic** and no longer scales with the
+window. `Cargo.toml` requires `quinn = "0.11.12"`, so cargo cannot resolve a vulnerable pair —
+verified by `cargo update -p quinn --precise 0.11.11` being refused.
+
+**The window turned out not to matter on either real link**, which corrects the earlier claim
+that restoring it was an ~8x WAN win. Measured 4 MB vs 512 KB: +2.4% on the wired path and
++3.3% on wifi, both inside a pooled stdev of ~13-15. A window only binds when
+`RTT x bandwidth` exceeds it, and on a 141 Mb/s path at 12 ms that is 512 KB vs a 339 Mb/s
+ceiling — nowhere near. 4 MB is restored because it is the historical value and the upstream
+defect is genuinely fixed, **not** because it buys throughput.
+
+### Traps worth keeping
+
+1. **`-C target-cpu=native` in a user-level cargo config makes cross-host testing SIGILL.** A
+   Zen 4 build died with exit 132 on a Comet Lake host — and the stress helper survived
+   *startup*, failing only once data flowed, so a `--version` probe does not catch it.
+   `throughput-remote` therefore builds its own portable helpers rather than shipping whatever
+   the local install happens to be. The repo has no `.cargo/config.toml`, so released binaries
+   are unaffected.
+2. **A one-connection sink is destroyed by a readiness probe.** An `ncat -z` check consumed the
+   sink's only connection, it reported `recv=0`, and the real transfer had nothing listening.
+   `tcp-sink` now keeps accepting and only finishes on a connection that carried data.
+3. **`pkill -f <path>` matches the script whose argv contains that path** (`~/AGENTS.md` §10) —
+   hit again here, in a test harness, after being documented twice in this same file. Track
+   pids.
+4. **A stale baseline produces a confident nonsense ratio.** The first corrino→gimli comparison
+   read 207% because the baseline was minutes old and used a different binary. Re-run both
+   sides back-to-back with identical binaries, always.
+
+## Previous: v0.9.4 — upstream fix landed, stream window restored
+## Previous State (v0.9.4)
 
 The v0.9.3 stopgap is retired (154 → 153 tests; no runtime code changed).
 

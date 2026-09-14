@@ -2,17 +2,37 @@
 //! Stress-test helpers for etr: TCP/UDP echo servers and bidirectional pumps.
 //!
 //! Usage:
-//!   stress_tool tcp-echo <port>
-//!   stress_tool udp-echo <port>
-//!   stress_tool tcp-pump <port>
-//!   stress_tool udp-pump <port> [pace_us]   (pace_us omitted or 0 = send flat out)
+//!   stress_tool tcp-echo   <port>
+//!   stress_tool udp-echo   <port>
+//!   stress_tool tcp-pump   <port>
+//!   stress_tool udp-pump   <port> [pace_us]        (omitted or 0 = send flat out)
+//!   stress_tool tcp-sink   <port>                  ONE-WAY receiver
+//!   stress_tool tcp-source <host> <port> <secs>    ONE-WAY sender
+//!   stress_tool udp-sink   <port>                  ONE-WAY receiver
+//!   stress_tool udp-source <host> <port> <secs> [pace_us]
 //!
-//! Each pump prints one stats line to stdout on SIGTERM:
-//!   TCP sent=<bytes> recv=<bytes> elapsed=<seconds>
-//!   UDP sent=<bytes> recv=<bytes> elapsed=<seconds>
+//! ECHO (pump) vs ONE-WAY (source/sink), and why both exist
+//! --------------------------------------------------------
+//! The pumps are an *echo* workload: every byte crosses the link twice and the reported
+//! rate is the offered rate, not goodput. That is the right shape for a soak -- it exercises
+//! both directions of a forward at once -- but it is NOT comparable to what `iperf3`,
+//! `nuttcp` or any other throughput tool reports, because those measure one direction.
 //!
-//! The output format is identical to the Python scripts they replace so the
-//! stress-local justfile recipe needs no changes to the awk parser.
+//! Comparing them anyway is how a real measurement went wrong here: etr's echo pump was set
+//! against nuttcp's one-way figure and the ratio read as "etr achieves 29% of the path",
+//! when a large part of the gap was simply that one number counted the link twice.
+//!
+//! The source/sink pair fixes that. The **sink** reports what it actually received, which is
+//! goodput and directly comparable to `iperf3 -c` / `nuttcp`. The **source** reports what it
+//! offered; the difference is loss (UDP) or in-flight data (TCP).
+//!
+//! Stats lines, one per process on SIGTERM (or on completion for a source):
+//!   TCP    sent=<bytes> recv=<bytes> elapsed=<seconds>      (pump, echo)
+//!   UDP    sent=<bytes> recv=<bytes> elapsed=<seconds>      (pump, echo)
+//!   SOURCE sent=<bytes> elapsed=<seconds>                   (one-way sender)
+//!   SINK   recv=<bytes> elapsed=<seconds>                   (one-way receiver)
+//!
+//! The pump lines are unchanged so the stress-local awk parser needs no edits.
 
 use std::{
     io::{Read, Write},
@@ -33,10 +53,26 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
         eprintln!("Usage: stress_tool <cmd> <port>");
+        eprintln!("       stress_tool tcp-source|udp-source <host> <port> <secs> [pace_us]");
         eprintln!("Commands: tcp-echo  udp-echo  tcp-pump  udp-pump");
+        eprintln!("          tcp-sink  tcp-source  udp-sink  udp-source   (one-way)");
         std::process::exit(1);
     }
-    let port: u16 = args[2].parse().expect("invalid port");
+
+    // The one-way senders take <host> <port> <secs>, so their port is argv[3], not argv[2].
+    // Parsing argv[2] as a port unconditionally would panic on the host argument with a
+    // message about an "invalid port" that names a hostname -- confusing in exactly the place
+    // someone is already fighting a network problem.
+    let is_source = matches!(args[1].as_str(), "tcp-source" | "udp-source");
+    if is_source && args.len() < 5 {
+        eprintln!("Usage: stress_tool {} <host> <port> <secs> [pace_us]", args[1]);
+        std::process::exit(1);
+    }
+    let port: u16 = if is_source {
+        args[3].parse().expect("invalid port")
+    } else {
+        args[2].parse().expect("invalid port")
+    };
 
     match args[1].as_str() {
         "tcp-echo" => tcp_echo(port),
@@ -57,6 +93,27 @@ fn main() {
             // See the comment in udp_pump for why the default is unthrottled.
             let pace_us: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
             udp_pump(port, pace_us)
+        }
+        "tcp-sink" => {
+            unsafe {
+                libc::signal(libc::SIGTERM, on_sigterm as *const () as libc::sighandler_t);
+            }
+            tcp_sink(port)
+        }
+        "tcp-source" => {
+            let secs: u64 = args[4].parse().expect("invalid seconds");
+            tcp_source(&args[2], port, secs)
+        }
+        "udp-sink" => {
+            unsafe {
+                libc::signal(libc::SIGTERM, on_sigterm as *const () as libc::sighandler_t);
+            }
+            udp_sink(port)
+        }
+        "udp-source" => {
+            let secs: u64 = args[4].parse().expect("invalid seconds");
+            let pace_us: u64 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(0);
+            udp_source(&args[2], port, secs, pace_us)
         }
         other => {
             eprintln!("Unknown command: {other}");
@@ -316,4 +373,200 @@ fn tcp_connect_with_retry(port: u16) -> Option<TcpStream> {
     }
     eprintln!("tcp_pump: could not connect to 127.0.0.1:{port} after 5s");
     None
+}
+
+// ── One-way source / sink ─────────────────────────────────────────────────────
+//
+// These exist so etr can be compared against `iperf3`/`nuttcp` on equal terms. The pumps
+// above measure an echo, which counts every byte twice and is not what any standard
+// throughput tool reports. The sink reports goodput: bytes that actually arrived.
+
+/// Accept TCP connections and count every byte received, until SIGTERM or until a connection
+/// that actually carried data closes.
+///
+/// Prints `SINK recv=<bytes> elapsed=<seconds>` on SIGTERM or when the peer closes. The
+/// clock starts at the **first byte**, not at bind: otherwise the seconds spent waiting for
+/// a connection are averaged into the rate and every measurement reads low by however long
+/// the harness took to start the sender.
+fn tcp_sink(port: u16) {
+    let listener = TcpListener::bind(format!("0.0.0.0:{port}")).expect("tcp_sink: bind");
+    listener
+        .set_nonblocking(true)
+        .expect("tcp_sink: set_nonblocking");
+
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut recv: u64 = 0;
+    // FIRST byte to LAST byte, not first byte to SIGTERM. The harness cannot stop a sink at
+    // the exact instant the sender finishes, so any idle tail would be averaged into the rate
+    // and report a throughput lower than what happened.
+    let mut start: Option<Instant> = None;
+    let mut last = Instant::now();
+
+    // KEEP ACCEPTING. A sink that exits after its first closed connection is destroyed by any
+    // probe: a readiness check that merely opens and closes the port consumes the one
+    // connection, the sink reports `recv=0`, and the measurement that follows has nothing
+    // listening. That happened here with an `ncat -z` probe through an etr forward. Only a
+    // connection that actually delivered bytes ends the run.
+    'accept: while !STOP.load(Ordering::Relaxed) {
+        let stream = match listener.accept() {
+            Ok((s, _)) => s,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            Err(_) => break,
+        };
+        stream.set_nodelay(true).ok();
+        if stream.set_nonblocking(false).is_err() {
+            continue;
+        }
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .ok();
+
+        let before = recv;
+        loop {
+            if STOP.load(Ordering::Relaxed) {
+                break 'accept;
+            }
+            match (&stream).read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    start.get_or_insert_with(Instant::now);
+                    last = Instant::now();
+                    recv += n as u64;
+                }
+                Err(ref e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(_) => break,
+            }
+        }
+        // A connection that carried data has finished the transfer; one that carried none was
+        // a probe, so go back to accepting.
+        if recv > before {
+            break;
+        }
+    }
+
+    let elapsed = start
+        .map(|s| last.duration_since(s).as_secs_f64().max(0.001))
+        .unwrap_or(0.001);
+    println!("SINK recv={recv} elapsed={elapsed:.3}");
+}
+
+/// Connect to `host:port` and send flat out for `secs`, then print what was offered.
+///
+/// Takes a host because the pumps hardcode `127.0.0.1`, which makes them useless for
+/// measuring a real path: the raw-link baseline you need to compare etr against cannot be
+/// taken without pointing a sender at the far end directly.
+fn tcp_source(host: &str, port: u16, secs: u64) {
+    let target = format!("{host}:{port}");
+    let stream = match TcpStream::connect(&target) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("tcp-source: cannot connect to {target}: {e}");
+            println!("SOURCE sent=0 elapsed=0.001");
+            return;
+        }
+    };
+    stream.set_nodelay(true).ok();
+
+    let chunk = vec![0u8; 256 * 1024];
+    let start = Instant::now();
+    let deadline = Duration::from_secs(secs);
+    let mut sent: u64 = 0;
+    while start.elapsed() < deadline && !STOP.load(Ordering::Relaxed) {
+        match (&stream).write_all(&chunk) {
+            Ok(()) => sent += chunk.len() as u64,
+            Err(e) => {
+                eprintln!(
+                    "tcp-source: send stopped after {:.3}s: {e} (kind={:?})",
+                    start.elapsed().as_secs_f64(),
+                    e.kind()
+                );
+                break;
+            }
+        }
+    }
+    // Flush what the kernel still holds before reporting, so `sent` is not inflated by data
+    // sitting in the socket buffer when the clock stops.
+    let _ = (&stream).flush();
+    let elapsed = start.elapsed().as_secs_f64();
+    println!("SOURCE sent={sent} elapsed={elapsed:.3}");
+}
+
+/// Count UDP datagrams arriving on `port`. Pairs with `udp-source`; the difference between
+/// its `sent` and this `recv` is loss, which for UDP is the number that matters.
+fn udp_sink(port: u16) {
+    let sock = UdpSocket::bind(format!("0.0.0.0:{port}")).expect("udp_sink: bind");
+    sock.set_read_timeout(Some(Duration::from_millis(200))).ok();
+    let mut buf = vec![0u8; 65535];
+    let mut recv: u64 = 0;
+    // See tcp_sink: first byte to last byte, so the idle tail before SIGTERM is not counted.
+    let mut start: Option<Instant> = None;
+    let mut last = Instant::now();
+    while !STOP.load(Ordering::Relaxed) {
+        match sock.recv(&mut buf) {
+            Ok(n) => {
+                start.get_or_insert_with(Instant::now);
+                last = Instant::now();
+                recv += n as u64;
+            }
+            Err(ref e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => break,
+        }
+    }
+    let elapsed = start
+        .map(|s| last.duration_since(s).as_secs_f64().max(0.001))
+        .unwrap_or(0.001);
+    println!("SINK recv={recv} elapsed={elapsed:.3}");
+}
+
+/// Send 1400-byte UDP datagrams to `host:port` for `secs`.
+///
+/// `pace_us` > 0 inserts that delay between sends. Unpaced is the default for the same
+/// reason as `udp-pump`: an always-on sleep measures the timer rather than the path.
+fn udp_source(host: &str, port: u16, secs: u64, pace_us: u64) {
+    let sock = UdpSocket::bind("0.0.0.0:0").expect("udp_source: bind");
+    let target = format!("{host}:{port}");
+    if let Err(e) = sock.connect(&target) {
+        eprintln!("udp-source: cannot connect to {target}: {e}");
+        println!("SOURCE sent=0 elapsed=0.001");
+        return;
+    }
+    let chunk = vec![0u8; 1400];
+    let start = Instant::now();
+    let deadline = Duration::from_secs(secs);
+    let mut sent: u64 = 0;
+    while start.elapsed() < deadline && !STOP.load(Ordering::Relaxed) {
+        match sock.send(&chunk) {
+            Ok(n) => sent += n as u64,
+            // Back-pressure and a not-yet-listening peer are both transient for UDP; see the
+            // same handling in udp_pump for why treating them as fatal ruins the measurement.
+            Err(ref e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::OutOfMemory
+                        | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                thread::yield_now();
+            }
+            Err(ref e) if e.raw_os_error() == Some(libc::ENOBUFS) => thread::yield_now(),
+            Err(_) => break,
+        }
+        if pace_us > 0 {
+            thread::sleep(Duration::from_micros(pace_us));
+        }
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+    println!("SOURCE sent={sent} elapsed={elapsed:.3}");
 }
