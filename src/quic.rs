@@ -31,6 +31,25 @@ pub fn generate_self_signed_cert() -> (CertificateDer<'static>, Vec<u8>) {
 
 /// QUIC transport tuning.
 ///
+/// # THIS IS A STOPGAP FOR AN UPSTREAM REGRESSION — REVISIT ON A quinn-proto BUMP
+///
+/// The underlying defect is **quinn-rs/quinn#2809**, confirmed by the maintainers as a
+/// regression: `Assembler::defragment` leaves high-utilisation *contiguous* buffers as separate
+/// entries, and the guard then counts retained buffers rather than genuine gaps — so a stream
+/// with **no actual gaps at all** can trip `TooManyChunks`. The fix,
+/// **quinn-rs/quinn#2814** ("proto: coalesce contiguous chunks during defragment"), was merged
+/// on 2026-09-03 and a backport was promised.
+///
+/// As of this commit the newest *published* quinn-proto is 0.11.17 (2026-08-17), which predates
+/// the merge — so there is no released version to upgrade to. Both 0.11.15 (what we pin) and
+/// 0.11.17 reproduce it.
+///
+/// **When a quinn-proto carrying #2814 is released: bump it, then raise this window back.** The
+/// small value costs per-stream bandwidth-delay product — roughly 41 Mb/s at 100 ms RTT against
+/// ~335 Mb/s at 4 MB — which matters for a tool whose whole point is long-distance sessions.
+/// The regression test below encodes the constraint, so it will fail and prompt a decision
+/// rather than letting the window drift back silently.
+///
 /// # `stream_receive_window` is a correctness bound, not a performance dial
 ///
 /// It was 4 MB from the v0.4.x throughput work until v0.9.3, and that is what made **any**

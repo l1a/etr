@@ -23,6 +23,32 @@ Root-cause fix for a connection-teardown bug (152 → 154 tests).
   ConnectionClose { error_code: INTERNAL_ERROR, reason: "too many gaps in stream buffer" }
   ```
 
+### It is an upstream regression, already confirmed and fixed — but not released
+
+The defect is **quinn-rs/quinn#2809**: `Assembler::defragment` leaves high-utilisation
+*contiguous* buffers as separate entries, and the guard counts retained buffers rather than
+genuine gaps — so a stream with **no actual gaps at all** trips `TooManyChunks`. The issue
+reporter measured 2049 retained buffers against **1 disjoint span and 0 actual gaps**. A
+maintainer called it a regression and promised a backport; **#2814** ("proto: coalesce
+contiguous chunks during defragment") was merged 2026-09-03.
+
+**There is nothing to upgrade to yet.** The newest published quinn-proto is 0.11.17
+(2026-08-17), predating the merge, and both 0.11.15 (our pin) and 0.11.17 reproduce it.
+
+So the change below is a **stopgap with a known expiry**: when a quinn-proto carrying #2814 is
+published, bump it and raise the window back. That matters because the small window costs
+per-stream bandwidth-delay product (~41 Mb/s at 100 ms RTT against ~335 Mb/s at 4 MB), which is
+a real price for a tool built for long-distance sessions — invisible on loopback, where 512 KB
+actually measured *fastest*.
+
+**That also sharpens what "our bug" was.** quinn's escalation is the upstream half:
+`TooManyChunks` becomes `TransportError::INTERNAL_ERROR`, which RFC 9000 scopes to the
+*connection* — so one saturated forward kills the interactive shell, breaking exactly the
+stream-independence guarantee that justifies multiplexing them together. The half that is ours
+is that we advertised a 4 MB window to a library that can only retain 1024 buffers: **the window
+and the library's capacity were inconsistent by 3.4x**, which made an upstream latent bug a
+certainty under load rather than a possibility.
+
 ### The mechanism is not what the message says
 
 "Gaps" implies packet loss. **There is none.** Across every failing run the kernel's UDP
