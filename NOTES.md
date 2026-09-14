@@ -9,8 +9,53 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.9.3 — a saturated forward no longer kills the whole session
-## Current State (v0.9.3)
+## Current state: v0.9.4 — upstream fix landed, stream window restored
+## Current State (v0.9.4)
+
+The v0.9.3 stopgap is retired (154 → 153 tests; no runtime code changed).
+
+- **quinn-proto 0.11.18 and quinn 0.11.12 were published on 2026-09-14**, carrying
+  quinn-rs/quinn#2814. `stream_receive_window` is back to **4 MB**, which restores per-stream
+  bandwidth-delay product over distance: ~335 Mb/s at 100 ms RTT against the ~41 Mb/s the 512 KB
+  stopgap allowed.
+- **Why 4 MB is safe again, structurally.** `defragment()` now computes
+  `min_chunk_size = max(buffered / MAX_CHUNKS, MIN_RETAINED_CHUNK_SIZE)` and keeps a chunk
+  separate only if it is at least that large; anything smaller is coalesced into its contiguous
+  run. **The retained-chunk count is therefore self-limiting by arithmetic** — as buffered data
+  grows, the minimum retained chunk size grows with it — so it no longer scales with the window.
+  `MAX_CHUNKS` is still 1024; what changed is that reaching it now requires genuinely disjoint
+  spans rather than a slow reader.
+- **Verified before restoring the window, not after.** 4 MB survives 3/3 twelve-second
+  saturating runs on 0.11.18 (~3.0 Gb/s); the same configuration on 0.11.15 died in under 0.1 s,
+  5/5. The full five-stream soak — two saturating TCP forwards at ~1.12 Gb/s each plus two
+  **unpaced** UDP floods offering ~1.88 Gb/s each, ~6.2 Gb/s total — completes 32 s with every
+  flow intact and the shell responsive.
+
+### The guard moved from a test to the dependency floor, and that was the right call
+
+`Cargo.toml` now requires `quinn = "0.11.12"` — the first release depending on
+quinn-proto >= 0.11.18. **cargo cannot resolve a vulnerable pair at all**, verified by
+`cargo update -p quinn --precise 0.11.11` being refused. That is stronger than a test, which has
+to be reached *and* has to reproduce.
+
+**Two test-shaped guards were written first and both were unfit. Recorded because each failed in
+a way that looked like success:**
+
+1. **Read the pinned quinn-proto version from `Cargo.lock`.** It could never fail: `cargo test`
+   re-resolves and rewrites the lockfile before the test runs, so a deliberate downgrade to
+   0.11.15 was silently undone and the guard always observed a fixed version. Caught by printing
+   the lockfile before *and* after the run — the two differed.
+2. **Reproduce the teardown behaviourally** — stall the reader, fill the window, assert the
+   connection survives. It **passed on the vulnerable 0.11.15 as well**, so it discriminated
+   nothing. The real failure needs the receive path to batch datagrams (GRO) so frames are small
+   slices of large allocations, which is what drives quinn's `over_allocation` past its
+   threshold; an in-process loopback test at modest rate never gets there.
+
+The behavioural coverage that *does* discriminate is `just stress-local`, which died 5/5 on the
+old pair and passes on this one. This is the same lesson as every other entry in this file: **an
+oracle that cannot fail is not a check**, and it is worth the extra step to watch it fail.
+
+## Previous: v0.9.3 — a saturated forward no longer kills the whole session
 
 Root-cause fix for a connection-teardown bug (152 → 154 tests).
 
@@ -23,7 +68,11 @@ Root-cause fix for a connection-teardown bug (152 → 154 tests).
   ConnectionClose { error_code: INTERNAL_ERROR, reason: "too many gaps in stream buffer" }
   ```
 
-### It is an upstream regression, already confirmed and fixed — but not released
+### It is an upstream regression — ~~fixed but not released~~ **RELEASED, see v0.9.4 above**
+
+> **Superseded 2026-09-14.** quinn-proto 0.11.18 / quinn 0.11.12 shipped #2814, the window is
+> back to 4 MB, and the dependency floor in `Cargo.toml` is now the guard. The analysis below
+> remains accurate as the record of the defect; only the "nothing to upgrade to" part is stale.
 
 The defect is **quinn-rs/quinn#2809**: `Assembler::defragment` leaves high-utilisation
 *contiguous* buffers as separate entries, and the guard counts retained buffers rather than
@@ -1684,7 +1733,7 @@ just install-tag 0.9.0
 
 # Code quality gate — run before every commit
 just check            # fmt + clippy, and: standard-check, man-check, packaging-check
-just test             # cargo test (154 tests)
+just test             # cargo test (153 tests)
 
 # Man pages are TRACKED (man/etr.1, man/etrs.1) because tag tarballs carry only tracked
 # files and COPR/Homebrew install them from there. Re-run after every version bump.
@@ -1863,11 +1912,11 @@ By default, remote listeners are bound to both `127.0.0.1` and `[::1]` loopbacks
 
 ---
 
-## Test coverage (154 tests)
+## Test coverage (153 tests)
 
 | Module | What's tested |
 |--------|--------------|
-| `quic` | Transport bounds: `stream_receive_window` must stay under quinn's 1024-chunk assembler cap at a 1200-byte frame, with a 2x margin (the v0.9.3 connection-teardown regression). Cert generation, server/client config, write/read Envelope framing, write/read PTY chunk framing |
+| `quic` | Transport bounds: the window/chunk-cap relationship is asserted as documentation, with the real guard being the `quinn` floor in Cargo.toml (see v0.9.4 — two test-shaped guards were tried and neither could discriminate). Cert generation, server/client config, write/read Envelope framing, write/read PTY chunk framing |
 | `protocol` | SessionOpen/Accept encode-decode (incl. `gateway_ports`, `reverse_forwards`, and `x11_enabled`/`x11_auth_proto`/`x11_auth_cookie` round-trip), StreamOpen/Close, Heartbeat, Disconnect, UdpDatagram |
 | `session/stream` | Acknowledge edge cases, replay from 0, initial seq values |
 | `session/mod` | Close/ack unknown stream, `last_received_map` semantics, collect_replays, `open_stream` idempotence |

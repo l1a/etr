@@ -29,105 +29,87 @@ pub fn generate_self_signed_cert() -> (CertificateDer<'static>, Vec<u8>) {
     (cert_der, key_der)
 }
 
-/// QUIC transport tuning.
-///
-/// # THIS IS A STOPGAP FOR AN UPSTREAM REGRESSION — REVISIT ON A quinn-proto BUMP
-///
-/// The underlying defect is **quinn-rs/quinn#2809**, confirmed by the maintainers as a
-/// regression: `Assembler::defragment` leaves high-utilisation *contiguous* buffers as separate
-/// entries, and the guard then counts retained buffers rather than genuine gaps — so a stream
-/// with **no actual gaps at all** can trip `TooManyChunks`. The fix,
-/// **quinn-rs/quinn#2814** ("proto: coalesce contiguous chunks during defragment"), was merged
-/// on 2026-09-03 and a backport was promised.
-///
-/// As of this commit the newest *published* quinn-proto is 0.11.17 (2026-08-17), which predates
-/// the merge — so there is no released version to upgrade to. Both 0.11.15 (what we pin) and
-/// 0.11.17 reproduce it.
-///
-/// **When a quinn-proto carrying #2814 is released: bump it, then raise this window back.** The
-/// small value costs per-stream bandwidth-delay product — roughly 41 Mb/s at 100 ms RTT against
-/// ~335 Mb/s at 4 MB — which matters for a tool whose whole point is long-distance sessions.
-/// The regression test below encodes the constraint, so it will fail and prompt a decision
-/// rather than letting the window drift back silently.
-///
-/// # `stream_receive_window` is a correctness bound, not a performance dial
-///
-/// It was 4 MB from the v0.4.x throughput work until v0.9.3, and that is what made **any**
-/// sustained forward tear down the whole QUIC connection — every forward and the interactive
-/// shell with it:
-///
-/// ```text
-/// ConnectionClose { error_code: INTERNAL_ERROR, reason: "too many gaps in stream buffer" }
-/// ```
-///
-/// ## The mechanism, which is not what the message suggests
-///
-/// "Gaps" implies packet loss. There is none: measured across every failing run, the kernel's
-/// UDP `RcvbufErrors` and `SndbufErrors` counters did not move at all. The real path is:
-///
-/// 1. A forwarding relay reads a QUIC stream and writes a TCP socket **sequentially**. While
-///    `write_all` is blocked by ordinary TCP back-pressure, nothing drains that QUIC stream.
-/// 2. quinn keeps accepting data for it, up to `stream_receive_window`, storing **one chunk per
-///    received STREAM frame**.
-/// 3. `Assembler::defragment` does *not* merge those chunks. A chunk whose bytes fill ≥5/6 of
-///    their allocation is marked `defragmented` and kept as its own entry
-///    (`try_mark_defragment` in quinn-proto's `assembler.rs`) — which is exactly what a
-///    full-size frame is.
-/// 4. Past **1024** chunks quinn aborts the *connection* with INTERNAL_ERROR.
-///
-/// So the governing relationship is a count, not a rate:
-///
-/// ```text
-/// stream_receive_window / frame_payload  <  1024
-/// ```
-///
-/// At an internet-typical 1200-byte payload, 4 MB is ~3500 chunks — over the cap by 3.4×, so it
-/// fails as soon as a relay stalls, which under load is constantly. **512 KB is ~437 chunks: a
-/// 2.3× margin, and it holds down to 512-byte frames.**
-///
-/// ## It cost nothing to fix
-///
-/// Measured on loopback, 64 KiB writes through a `-L` TCP forward, 10-12 s runs, varying only
-/// this value:
-///
-/// | window | outcome | throughput |
-/// |---|---|---|
-/// | 4 MB | **died in <1 s** | — |
-/// | 2 MB | survived | 3.05 Gb/s |
-/// | 1.25 MB (quinn default) | survived | 3.11 Gb/s |
-/// | 1 MB | survived | 3.03 Gb/s |
-/// | **512 KB** | **survived** | **3.40 Gb/s** |
-///
-/// The 4 MB window bought no throughput whatsoever. Note 2 MB passes *here* only because
-/// loopback uses ~2 KB frames; at 1200 bytes it would be ~1750 chunks and would fail. Do not
-/// raise this value on the strength of a loopback measurement.
-///
-/// **Two things that look like fixes and are not**, both tried and reverted: enlarging the UDP
-/// socket buffers, and shrinking `send_window`. Both only reduce how much data is in flight, so
-/// they delay the chunk count reaching 1024 rather than bounding it — symptom treatment that
-/// leaves the failure reachable at a higher rate or on a faster link.
-///
-/// # The other values
-///
-/// Connection window 32 MB and send window 32 MB are unchanged: they bound bytes, not chunks,
-/// and neither participates in this failure.
-///
-/// Idle timeout 30 s, with application heartbeats every 5 s; keep-alive 10 s so NAT mappings
-/// stay open when no data is in flight.
-/// Per-stream receive window. See [`high_throughput_transport`] for why this is a correctness
-/// bound rather than a tuning knob, and `stream_window_cannot_exceed_assembler_chunk_cap` for
-/// the invariant that keeps it one.
-pub const STREAM_RECEIVE_WINDOW: u32 = 512 * 1024;
+/// Per-stream receive window. Safe at this size **only** on quinn-proto >= [`QUINN_PROTO_FIXED`];
+/// see `high_throughput_transport` and the `quinn` floor in `Cargo.toml`.
+pub const STREAM_RECEIVE_WINDOW: u32 = 4 * 1024 * 1024;
 
-/// quinn-proto aborts the **connection** once one stream's reassembler holds more than this
-/// many chunks (`assembler.rs`: `if self.data.len() > 1024 { return Err(TooManyChunks) }`).
+/// quinn-proto aborts the **connection** once one stream's reassembler retains more than this
+/// many chunks (`assembler.rs`: `MAX_CHUNKS`). Still present in 0.11.18 — what changed is that
+/// contiguous chunks are now coalesced, so the count no longer scales with the window.
 pub const QUINN_ASSEMBLER_CHUNK_CAP: u32 = 1024;
 
 /// Smallest STREAM-frame payload worth planning for: an internet-typical 1200-byte QUIC
-/// datagram. Loopback frames are larger (~2 KB), which is why a loopback test alone will
+/// datagram. Loopback frames are larger (~2 KB), which is why a loopback measurement alone will
 /// happily bless a window that fails on a real network.
 pub const MIN_EXPECTED_FRAME_PAYLOAD: u32 = 1200;
 
+/// First quinn-proto release carrying quinn-rs/quinn#2814, which makes the retained-chunk count
+/// self-limiting. Below this, `STREAM_RECEIVE_WINDOW` must stay under
+/// `QUINN_ASSEMBLER_CHUNK_CAP * MIN_EXPECTED_FRAME_PAYLOAD`.
+pub const QUINN_PROTO_FIXED: (u32, u32, u32) = (0, 11, 18);
+
+/// QUIC transport tuning.
+///
+/// # `stream_receive_window` is coupled to the quinn-proto version — do not decouple them
+///
+/// This was 4 MB from the v0.4.x throughput work, dropped to 512 KB in v0.9.3, and restored to
+/// 4 MB in v0.9.4 once the upstream defect was fixed. The history matters, because the window
+/// on its own is not the safety property.
+///
+/// ## What went wrong
+///
+/// **quinn-rs/quinn#2809**, confirmed a regression by the quinn maintainers: `defragment()`
+/// kept high-utilisation *contiguous* buffers as separate entries, and the guard counted
+/// retained buffers rather than genuine gaps. A stream with **no actual gaps at all** could
+/// therefore trip `TooManyChunks`, which becomes `TransportError::INTERNAL_ERROR` — and RFC 9000
+/// scopes that to the **connection**. In etr that meant a saturated `-L`/`-R` forward tore down
+/// every other forward *and* the user's interactive shell.
+///
+/// The trigger was ordinary TCP back-pressure, not loss: a relay blocked in `write_all` stops
+/// draining its QUIC stream, quinn buffers up to the window as one chunk per frame, and 4 MB is
+/// ~3500 chunks at a 1200-byte frame against a 1024 cap. Measured across every failing run, the
+/// kernel's UDP `RcvbufErrors`/`SndbufErrors` were **0** — there was never any packet loss.
+///
+/// ## Why 4 MB is safe again
+///
+/// **quinn-proto 0.11.18** carries the fix (#2814). `defragment()` now computes
+/// `min_chunk_size = max(buffered / MAX_CHUNKS, MIN_RETAINED_CHUNK_SIZE)` and only keeps a
+/// chunk separate when it is at least that large; everything smaller is coalesced into its
+/// contiguous run. **The retained count is therefore self-limiting by arithmetic** — as buffered
+/// data grows, the minimum retained chunk size grows with it — so it no longer scales with the
+/// window. That is a structural fix upstream, not a bigger limit.
+///
+/// Verified here before restoring the window: 4 MB survives 3/3 twelve-second saturating runs on
+/// 0.11.18 (~3.0 Gb/s), and the full five-stream soak — two saturating TCP forwards plus two
+/// unpaced UDP floods offering ~1.9 Gb/s each, ~6.2 Gb/s total — completes 32 s with every flow
+/// intact and the shell responsive. The same configuration on 0.11.15 died in under 0.1 s, 5/5.
+///
+/// ## The coupling, and where it is enforced
+///
+/// A 4 MB window is safe **only** on a quinn-proto that coalesces, so `Cargo.toml` requires
+/// `quinn = "0.11.12"` — the first release depending on quinn-proto >= 0.11.18. cargo then
+/// cannot resolve a vulnerable pair at all, which is a stronger guarantee than a test: verified
+/// by `cargo update -p quinn --precise 0.11.11` being refused.
+///
+/// Two test-shaped guards were tried first and rejected as unfit — one could never fail, the
+/// other passed on the broken version too. The reasoning is recorded in `transport_bounds_tests`
+/// because "we tried a test and it did not discriminate" is worth more than a silent absence.
+///
+/// ## Two things that looked like fixes and were not
+///
+/// Both implemented, measured and reverted during the v0.9.3 investigation: enlarging the UDP
+/// socket buffers, and shrinking `send_window`. Each only reduces how much data is in flight, so
+/// they moved the threshold (one forward went from 2.5 s to 30.7 s of survival) without bounding
+/// the chunk count. Kept here because the reasoning was wrong in an instructive way: a fix that
+/// relocates a limit is not a fix.
+///
+/// # The other values
+///
+/// Connection window 32 MB and send window 32 MB: they bound bytes, not chunks, and neither
+/// participated in this failure.
+///
+/// Idle timeout 30 s, with application heartbeats every 5 s; keep-alive 10 s so NAT mappings
+/// stay open when no data is in flight.
 fn high_throughput_transport() -> Arc<quinn::TransportConfig> {
     use std::time::Duration;
     let mut t = quinn::TransportConfig::default();
@@ -476,45 +458,39 @@ mod tests {
 mod transport_bounds_tests {
     use super::*;
 
-    /// **The regression test for the v0.9.3 connection-teardown bug.**
+    /// The window is only this large because the dependency floor guarantees a quinn-proto that
+    /// coalesces contiguous chunks. This asserts the two stay coupled in the *documentation*
+    /// sense; the enforcement lives in `Cargo.toml`, not here.
     ///
-    /// A forwarding relay that is blocked writing to TCP stops draining its QUIC stream, and
-    /// quinn then buffers up to `STREAM_RECEIVE_WINDOW` as one chunk per received frame —
-    /// chunks it will not merge, because a full-size frame is marked `defragmented` on arrival.
-    /// Past `QUINN_ASSEMBLER_CHUNK_CAP` chunks quinn aborts the whole **connection**, taking
-    /// every other forward and the interactive shell with it.
+    /// **Why the enforcement is not a test, which is the interesting part.** Two attempts were
+    /// made and both were unfit:
     ///
-    /// The window was 4 MB, i.e. ~3500 chunks at a 1200-byte frame — 3.4× over the cap. This
-    /// asserts the relationship rather than the number, so raising the window fails here with
-    /// the reason instead of failing in production under load.
+    /// 1. *Read the pinned quinn-proto version from `Cargo.lock`.* It could never fail —
+    ///    `cargo test` re-resolves and rewrites the lockfile before the test runs, so a
+    ///    downgrade was silently undone and the guard always saw a fixed version.
+    /// 2. *Reproduce the teardown behaviourally* — stall the reader, fill the window, assert the
+    ///    connection survives. It **passed on the vulnerable quinn-proto 0.11.15 as well**, so it
+    ///    discriminated nothing. The real failure needs the receive path to batch datagrams (GRO)
+    ///    so that frames are small slices of large allocations, which is what drives quinn's
+    ///    `over_allocation` past its threshold. An in-process loopback test at modest rate never
+    ///    gets there.
+    ///
+    /// So the floor is expressed as `quinn = "0.11.12"` in `Cargo.toml`, where cargo enforces it
+    /// at resolution time and cannot select a vulnerable pair at all. Verified: `cargo update -p
+    /// quinn --precise 0.11.11` is refused. The behavioural coverage that *does* discriminate is
+    /// `just stress-local`, which died 5/5 on the old pair and passes on this one.
     #[test]
-    fn stream_window_cannot_exceed_assembler_chunk_cap() {
+    fn window_and_chunk_cap_relationship_is_documented() {
         let worst_case_chunks = STREAM_RECEIVE_WINDOW / MIN_EXPECTED_FRAME_PAYLOAD;
         assert!(
-            worst_case_chunks < QUINN_ASSEMBLER_CHUNK_CAP,
-            "stream_receive_window of {} bytes allows up to {} buffered chunks at a {}-byte \
-             frame, but quinn aborts the CONNECTION past {}. A stalled relay would tear down \
-             every stream on the connection, shell included. Lower the window — it bought no \
-             measurable throughput above 512 KB.",
-            STREAM_RECEIVE_WINDOW,
-            worst_case_chunks,
-            MIN_EXPECTED_FRAME_PAYLOAD,
-            QUINN_ASSEMBLER_CHUNK_CAP,
-        );
-    }
-
-    /// Keep a real safety margin rather than sitting on the cap. quinn's own 1.25 MB default is
-    /// ~1041 chunks at this frame size — already past it — so "matches the default" is not a
-    /// justification for raising this.
-    #[test]
-    fn stream_window_keeps_a_safety_margin() {
-        let worst_case_chunks = STREAM_RECEIVE_WINDOW / MIN_EXPECTED_FRAME_PAYLOAD;
-        assert!(
-            worst_case_chunks * 2 <= QUINN_ASSEMBLER_CHUNK_CAP,
-            "only {}x margin under the {}-chunk cap; want at least 2x so that smaller frames \
-             (a peer with a lower MTU, or a path that fragments) cannot reach it",
-            QUINN_ASSEMBLER_CHUNK_CAP as f32 / worst_case_chunks as f32,
-            QUINN_ASSEMBLER_CHUNK_CAP,
+            worst_case_chunks > QUINN_ASSEMBLER_CHUNK_CAP,
+            "STREAM_RECEIVE_WINDOW now allows only {worst_case_chunks} chunks, which is safe on \
+             ANY quinn-proto. That is fine, but high_throughput_transport's comment and the \
+             Cargo.toml floor both claim the size depends on quinn-proto >= {}.{}.{} — update \
+             them rather than leaving a rationale that no longer applies.",
+            QUINN_PROTO_FIXED.0,
+            QUINN_PROTO_FIXED.1,
+            QUINN_PROTO_FIXED.2,
         );
     }
 }
