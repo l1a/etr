@@ -2075,8 +2075,20 @@ stress-local: check-tools install build-stress
     "$STRESS_BIN" tcp-pump "$TCP_FWD_PORT" > "$TCP_PUMP_OUT" &
     TCP_PUMP_PID=$!
 
-    echo "==> UDP -L pump on :${UDP_FWD_PORT}..."
-    "$STRESS_BIN" udp-pump "$UDP_FWD_PORT" > "$UDP_PUMP_OUT" &
+    # THE UDP PUMPS ARE PACED HERE, AND THE TWO RECIPES DIFFER ON PURPOSE.
+    #
+    # `stress-udp-rate` pumps flat out as one step of a sweep, because finding the knee needs
+    # the far side of it. This recipe is a *mixed-load soak*: one PTY stream plus four forwards
+    # sharing a single QUIC connection. An unpaced UDP pump offers >1 Gb/s with ~100% loss,
+    # which is not a workload anyone runs -- and because every stream shares the connection, the
+    # loss it induces tears down the TCP forwards and the interactive shell with them. That
+    # tests "does a flood kill us" (it does -- see NOTES.md) rather than "does sustained mixed
+    # traffic stay healthy", which is what this recipe is for.
+    #
+    # 50 us ~= 100 Mb/s at 1400 bytes: the fastest rate measured to deliver at 0% loss.
+    UDP_PACE_US="${UDP_PACE_US:-50}"
+    echo "==> UDP -L pump on :${UDP_FWD_PORT} (paced ${UDP_PACE_US}us)..."
+    "$STRESS_BIN" udp-pump "$UDP_FWD_PORT" "$UDP_PACE_US" > "$UDP_PUMP_OUT" &
     UDP_PUMP_PID=$!
 
     # ── -R pumps (etrs binds these after the QUIC session is fully up) ────────
@@ -2086,8 +2098,8 @@ stress-local: check-tools install build-stress
     "$STRESS_BIN" tcp-pump "$TCP_R_FWD_PORT" > "$TCP_R_PUMP_OUT" &
     TCP_R_PUMP_PID=$!
 
-    echo "==> UDP -R pump on :${UDP_R_FWD_PORT}..."
-    "$STRESS_BIN" udp-pump "$UDP_R_FWD_PORT" > "$UDP_R_PUMP_OUT" &
+    echo "==> UDP -R pump on :${UDP_R_FWD_PORT} (paced ${UDP_PACE_US}us)..."
+    "$STRESS_BIN" udp-pump "$UDP_R_FWD_PORT" "$UDP_PACE_US" > "$UDP_R_PUMP_OUT" &
     UDP_R_PUMP_PID=$!
 
     # ── Sample RSS every 2 s ──────────────────────────────────────────────────
@@ -2138,16 +2150,30 @@ stress-local: check-tools install build-stress
 
     echo ""
     echo "==> Throughput (Mb/s = megabits per second):"
+    # A PUMP THAT DIED EARLY DOES NOT HAVE A THROUGHPUT.
+    #
+    # This used to read `if (elapsed <= 0) elapsed = 0.001` and print whatever came out: a pump
+    # that died 40 ms into a 30 s run produced a confident four-digit Mb/s figure computed over
+    # a near-zero interval, and that is where this project's quoted TCP numbers came from. The
+    # guard stopped a division by zero and replaced it with a wrong answer, which is worse --
+    # the same "check that cannot fail" shape recorded throughout ~/AGENTS.md.
+    #
+    # A run that covers less than 90% of DURATION is reported as a FAILURE with its duration,
+    # not as a rate. The pump itself prints the reason to stderr.
     throughput_report() {
         local line="$1" label="$2"
         if [[ -z "$line" ]]; then echo "  ${label}: no stats available"; return; fi
-        echo "$line" | awk -v label="$label" '{
+        echo "$line" | awk -v label="$label" -v want="$DURATION" '{
             for (i=1; i<=NF; i++) {
                 if ($i ~ /^sent=/)    sent    = substr($i, 6) + 0
                 if ($i ~ /^recv=/)    recv    = substr($i, 6) + 0
                 if ($i ~ /^elapsed=/) elapsed = substr($i, 9) + 0
             }
-            if (elapsed <= 0) elapsed = 0.001
+            if (elapsed < want * 0.9) {
+                printf "  %-8s DIED AFTER %.2fs of %ss -- NOT a throughput measurement (%d MiB sent, %d MiB recv; see the pump stderr above for why)\n", \
+                    label ":", elapsed, want, sent/1048576, recv/1048576
+                next
+            }
             tx = sent * 8 / elapsed / 1000000
             rx = recv * 8 / elapsed / 1000000
             printf "  %-8s tx=%.1f Mb/s  rx=%.1f Mb/s  (%d MiB sent, %d MiB recv in %.1fs)\n", \
