@@ -3,3 +3,8 @@
 tools/stress/target/
 etrs_fwd.json.gz
 WIP.md
+
+# Python bytecode from the scripts/ helpers (they are run directly and imported by
+# their own self-tests, so a stray __pycache__ appears the first time one is imported).
+__pycache__/
+*.pyc

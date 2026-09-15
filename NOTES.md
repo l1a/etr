@@ -1138,7 +1138,7 @@ New in v0.7.1 (tooling only; no Rust code change, test count unchanged at 112):
   Windows `just` tries to translate the interpreter path with `cygpath` and every one of
   them fails before running a line. That gap asked for exactly this fix: *"plain
   (non-shebang) recipes"*. The work now lives in two vendored Python helpers, which need
-  no `sh`, no `cygpath`, no coreutils and nothing from Git's `usrin`.
+  no `sh`, no `cygpath`, no coreutils and nothing from Git's `usr\bin`.
 - **`install` installed the DEBUG binaries, and no completions at all.** It was
   `install: build` plus `cp target/debug/{etr,etrs}`, so `just install` handed you an
   unoptimised build. It is now `install: install-man install-completions` +
@@ -1147,8 +1147,7 @@ New in v0.7.1 (tooling only; no Rust code change, test count unchanged at 112):
   — that is a deliberate, user-visible change to two documented recipes.
 - **nushell completions went where Windows nushell never looks.** `NU_COMP` was
   `$XDG_CONFIG_HOME/nushell/autoload`; on Windows `$nu.user-autoload-dirs` is exactly
-  `%APPDATA%
-ushellutoload` — one entry — and nushell never reads the XDG path. Introduced
+  `%APPDATA%\nushell\autoload` — one entry — and nushell never reads the XDG path. Introduced
   in v0.4.24, which set that path *and* changed the output "to denote auto-loaded state".
   So the recipe wrote a real file somewhere nothing consults and reported success.
 - **The output asserted two things that were false.** It printed
