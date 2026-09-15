@@ -1,6 +1,6 @@
 [package]
 name = "etr"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2024"
 description = "Reconnecting remote shell over QUIC — a Rust implementation of Eternal Terminal (et)"
 license = "GPL-3.0-only"

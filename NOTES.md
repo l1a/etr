@@ -9,8 +9,32 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.10.0 — one-way throughput measurement, and the 4 MB window restored
-## Current State (v0.10.0)
+## Current state: v0.10.1 — the "Vibe coded" disclaimer drops the CV
+## Current State (v0.10.1)
+
+Documentation only (153 tests, unchanged; no Rust change).
+
+- **The "Vibe coded" section no longer recites the human director's credentials.** v0.9.1
+  corrected this paragraph from "has not been reviewed by an experienced systems or
+  networking engineer" — true in the wrong direction — but the replacement carried a clause
+  naming the director's production background (large-scale multi-national networks, 100,000+
+  nodes). The user's judgement is that it reads as egotistical, and it is: the sentence's job
+  is to tell a reader which review the project *has* had, and "the networking and systems
+  design is the part that has had experienced human direction" does that job without the CV.
+- **What v0.9.1 established is deliberately preserved.** The correction that mattered there
+  was never the flattering half — it was naming the two reviews actually wanted (working Rust
+  programmers, and cryptography/protocol-security experts) so the disclaimer stops inviting
+  the wrong reviewers. Both bullets are untouched, and the sentence still asserts that the
+  networking side *has* had direction rather than reverting to the understating claim.
+- **Fixed in both byte-identical copies** — `README.md` and the wiki's `Home.md` — and
+  verified identical after editing, which is the same discipline v0.9.1 used. These two are a
+  single text kept in two places; changing one alone is how they drift.
+- **NOTES.md's own history was left alone by request.** The v0.9.1 entry below still records
+  the claim as written at the time. That is the record of why the text changed, not a live
+  statement, and this file's convention is to keep superseded entries legible.
+
+## Previous: v0.10.0 — one-way throughput measurement, and the 4 MB window restored
+## Previous State (v0.10.0)
 
 Measurement tooling plus the v0.9.3 stopgap retired (153 tests, unchanged).
 
