@@ -267,10 +267,16 @@ here are the ones a human has to decide.
       asserts every sentinel individually.
 - [ ] If a new runtime dependency was added, add it to the COPR spec's `Requires:` and the
       PKGBUILD's `depends=()`. Homebrew resolves Rust deps itself and needs nothing.
-- [ ] If a binary, man page or completion was added or renamed, update **all three** of the
-      spec's `%install`/`%files`, the formula's `install`, and the PKGBUILD's `package()`.
-      `packaging-check` asserts both binaries reach every channel, but it cannot know about
-      a third.
+- [ ] If a binary, man page or completion was added or renamed, update **all four** of the
+      spec's `%install`/`%files`, the formula's `install`, the PKGBUILD's `package()`, and the
+      `extras` job in `.github/workflows/release.yml`. The fourth is not optional and is easy
+      to miss: the AUR package is a `-bin` package with no source tree, so its man pages and
+      completions come out of `etr-extras.tar.gz` — **a PKGBUILD cannot install a file the
+      tarball does not carry**, and the two files cannot see each other, so a name changed in
+      one and not the other builds fine in CI and fails on a user's machine.
+      `packaging-check` asserts both binaries reach every channel, and that every man page and
+      completion reaches the AUR at its exact destination path, but it cannot know about a
+      third binary or a newly-added shell.
 - [ ] After the release, verify each channel actually serves the new version rather than
       assuming the push worked — see §6.
 

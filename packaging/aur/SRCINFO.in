@@ -19,5 +19,7 @@ pkgbase = etr-terminal-bin
 	source_aarch64 = etrs-@VERSION@-linux-aarch64::https://github.com/l1a/etr/releases/download/v@VERSION@/etrs-linux-aarch64
 	sha256sums_aarch64 = @SHA_ETR_AARCH64@
 	sha256sums_aarch64 = @SHA_ETRS_AARCH64@
+	source = etr-extras-@VERSION@.tar.gz::https://github.com/l1a/etr/releases/download/v@VERSION@/etr-extras.tar.gz
+	sha256sums = @SHA_EXTRAS@
 
 pkgname = etr-terminal-bin

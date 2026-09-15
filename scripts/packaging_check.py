@@ -62,7 +62,7 @@ MONTHS = {
 }
 
 # Each template, and the sentinels it MUST still contain. Naming them individually rather
-# than "at least one sentinel" is the point: the AUR pair restates four checksums, and a
+# than "at least one sentinel" is the point: the AUR pair restates five checksums, and a
 # PKGBUILD that lost one of them would still look templated.
 REQUIRED_SENTINELS = {
     "packaging/aur/PKGBUILD.in": [
@@ -71,6 +71,7 @@ REQUIRED_SENTINELS = {
         "@SHA_ETRS_X86_64@",
         "@SHA_ETR_AARCH64@",
         "@SHA_ETRS_AARCH64@",
+        "@SHA_EXTRAS@",
     ],
     "packaging/aur/SRCINFO.in": [
         "@VERSION@",
@@ -78,6 +79,7 @@ REQUIRED_SENTINELS = {
         "@SHA_ETRS_X86_64@",
         "@SHA_ETR_AARCH64@",
         "@SHA_ETRS_AARCH64@",
+        "@SHA_EXTRAS@",
     ],
     "packaging/copr/etr.spec": ["@VERSION@"],
     "packaging/homebrew/etr.rb": ["@VERSION@", "@SHA256@"],
@@ -297,6 +299,87 @@ def check_both_binaries(root: Path = REPO_ROOT) -> list[str]:
     return problems
 
 
+# Where each artefact must land in an Arch package, and the path inside etr-extras.tar.gz it
+# comes from. Both halves are asserted: a `source` that drifts from the tarball's layout fails
+# the build on a user's machine, and a missing `dest` silently ships a package without it --
+# which is the state this guard was written to end.
+AUR_EXTRAS = (
+    ("man/etr.1", "/usr/share/man/man1/etr.1"),
+    ("man/etrs.1", "/usr/share/man/man1/etrs.1"),
+    ("completions/bash/etr", "/usr/share/bash-completion/completions/etr"),
+    ("completions/bash/etrs", "/usr/share/bash-completion/completions/etrs"),
+    ("completions/zsh/_etr", "/usr/share/zsh/site-functions/_etr"),
+    ("completions/zsh/_etrs", "/usr/share/zsh/site-functions/_etrs"),
+    ("completions/fish/etr.fish", "/usr/share/fish/vendor_completions.d/etr.fish"),
+    ("completions/fish/etrs.fish", "/usr/share/fish/vendor_completions.d/etrs.fish"),
+)
+
+
+def check_aur_ships_extras(root: Path = REPO_ROOT) -> list[str]:
+    """The AUR package installs the man pages and completions, from the tarball CI packs.
+
+    Until v0.10.2 `etr-terminal-bin` installed the two binaries and nothing else, while COPR
+    and Homebrew shipped all three kinds of artefact. Nothing noticed, because every guard
+    here asked about binaries. This one asks about the rest.
+
+    It checks BOTH ends of a contract that spans two files which cannot see each other: the
+    tarball is packed by `.github/workflows/release.yml` and unpacked by the PKGBUILD, so a
+    path renamed in one and not the other builds fine here and fails on a user's machine. The
+    workflow is matched on its literal `cp`/`tar` lines rather than parsed as YAML, because
+    what matters is the shell that actually runs.
+    """
+    problems = []
+
+    pkgbuild = _read(root, "packaging/aur/PKGBUILD.in")
+    for source, dest in AUR_EXTRAS:
+        if f'"${{srcdir}}/{source}"' not in pkgbuild:
+            problems.append(f"PKGBUILD.in: package() never reads {source} from the extras tarball")
+        if f'"${{pkgdir}}{dest}"' not in pkgbuild:
+            problems.append(f"PKGBUILD.in: package() does not install {dest}")
+
+    # package() must not EXECUTE a downloaded binary: that is what breaks whenever the build
+    # host's architecture differs from the target's, and it is the whole reason the extras
+    # tarball exists. Checked structurally, on the package() body only.
+    body = pkgbuild.partition("package() {")[2]
+    for forbidden in ("--completions", "$CARCH} --", "/etr --", "/etrs --"):
+        if forbidden in body:
+            problems.append(
+                f"PKGBUILD.in: package() appears to run a downloaded binary ({forbidden!r}); "
+                "completions come from the extras tarball precisely so it does not have to"
+            )
+
+    rel = ".github/workflows/release.yml"
+    try:
+        workflow = _read(root, rel)
+    except FileNotFoundError:
+        return [*problems, f"{rel}: missing"]
+
+    if "dist/etr-extras.tar.gz" not in workflow:
+        problems.append(f"{rel}: nothing packs dist/etr-extras.tar.gz")
+    if "pattern: release-*" not in workflow:
+        problems.append(
+            f"{rel}: the release job does not restrict its download to `release-*`, so the "
+            "raw completions artifacts would be published as loose assets"
+        )
+    # The tarball is packed from these two directories; the per-file names inside them come
+    # from the generation step, which is asserted by shell shape rather than by listing eight
+    # paths twice.
+    if "tar -czf dist/etr-extras.tar.gz -C extras man completions" not in workflow:
+        problems.append(f"{rel}: etr-extras.tar.gz is not packed with the `man`/`completions` layout")
+    if "diff -r" not in workflow:
+        problems.append(
+            f"{rel}: nothing compares the two architectures' completions, so shipping one "
+            "arch-independent copy is unproven"
+        )
+    for shell_gen in ('--completions bash > "completions/bash/$b"',
+                      '--completions zsh  > "completions/zsh/_$b"',
+                      '--completions fish > "completions/fish/$b.fish"'):
+        if shell_gen not in workflow:
+            problems.append(f"{rel}: completions are not generated as `{shell_gen}`")
+
+    return problems
+
+
 def check_changelog_dates(root: Path = REPO_ROOT) -> list[str]:
     """Every `%changelog` entry's weekday must match its date.
 
@@ -412,6 +495,7 @@ def run_all(root: Path = REPO_ROOT) -> list[str]:
         *check_channels_agree(meta, root),
         *check_locked_not_dropped(root),
         *check_both_binaries(root),
+        *check_aur_ships_extras(root),
         *check_changelog_dates(root),
         *check_copr_project_text(meta, root),
         *check_github_metadata(meta),
@@ -599,6 +683,81 @@ def _self_test() -> int:
             "prose\n\n```\n    deeply indented code\n```\n", encoding="utf-8"
         )
         check("copr fence exempt", not check_copr_project_text(m, fake), "fenced code flagged")
+
+    # The AUR extras guard, watched failing on each way it can be defeated. Mutations are made
+    # on a COPY of the real files, so every control runs against the text actually shipped
+    # rather than a hand-written stand-in that could drift from it.
+    real_pkgbuild = _read(REPO_ROOT, "packaging/aur/PKGBUILD.in")
+    real_workflow = _read(REPO_ROOT, ".github/workflows/release.yml")
+
+    def _extras_tree(td: str, *, pkgbuild: str, workflow: str) -> Path:
+        fake = Path(td)
+        (fake / "packaging/aur").mkdir(parents=True)
+        (fake / ".github/workflows").mkdir(parents=True)
+        (fake / "packaging/aur/PKGBUILD.in").write_text(pkgbuild, encoding="utf-8")
+        (fake / ".github/workflows/release.yml").write_text(workflow, encoding="utf-8")
+        return fake
+
+    with tempfile.TemporaryDirectory() as td:
+        fake = _extras_tree(td, pkgbuild=real_pkgbuild, workflow=real_workflow)
+        check("extras positive control", not check_aur_ships_extras(fake),
+              f"the real files were flagged: {check_aur_ships_extras(fake)}")
+
+    # One dropped completion must be named by its destination, not merely counted. This is the
+    # exact state the package was in before v0.10.2, one file at a time.
+    with tempfile.TemporaryDirectory() as td:
+        gutted = real_pkgbuild.replace(
+            '    install -Dm644 "${srcdir}/completions/zsh/_etrs"      '
+            '"${pkgdir}/usr/share/zsh/site-functions/_etrs"\n',
+            "",
+        )
+        check("extras mutation applied", gutted != real_pkgbuild, "the zsh line no longer matches")
+        fake = _extras_tree(td, pkgbuild=gutted, workflow=real_workflow)
+        problems = check_aur_ships_extras(fake)
+        check("extras dropped completion caught",
+              any("/usr/share/zsh/site-functions/_etrs" in p for p in problems),
+              f"got {problems}")
+
+    # A man page dropped the same way.
+    with tempfile.TemporaryDirectory() as td:
+        gutted = real_pkgbuild.replace(
+            '    install -Dm644 "${srcdir}/man/etrs.1" "${pkgdir}/usr/share/man/man1/etrs.1"\n', ""
+        )
+        check("extras man mutation applied", gutted != real_pkgbuild, "the man line no longer matches")
+        fake = _extras_tree(td, pkgbuild=gutted, workflow=real_workflow)
+        check("extras dropped man page caught",
+              any("/usr/share/man/man1/etrs.1" in p for p in check_aur_ships_extras(fake)))
+
+    # Regressing to running the downloaded binary must be refused, however plausible it looks.
+    with tempfile.TemporaryDirectory() as td:
+        regressed = real_pkgbuild.replace(
+            '    install -Dm644 "${srcdir}/completions/bash/etr"       '
+            '"${pkgdir}/usr/share/bash-completion/completions/etr"',
+            '    "${pkgdir}/usr/bin/etr" --completions bash '
+            '> "${pkgdir}/usr/share/bash-completion/completions/etr"',
+        )
+        check("extras regression mutation applied", regressed != real_pkgbuild)
+        fake = _extras_tree(td, pkgbuild=regressed, workflow=real_workflow)
+        check("extras binary execution caught",
+              any("run a downloaded binary" in p for p in check_aur_ships_extras(fake)),
+              f"got {check_aur_ships_extras(fake)}")
+
+    # Losing the cross-architecture comparison makes one shipped copy unproven.
+    with tempfile.TemporaryDirectory() as td:
+        undiffed = real_workflow.replace("diff -r", "true #", 1)
+        check("extras diff mutation applied", "diff -r" not in undiffed,
+              "release.yml still contains a `diff -r`")
+        fake = _extras_tree(td, pkgbuild=real_pkgbuild, workflow=undiffed)
+        check("extras missing arch comparison caught",
+              any("compares the two architectures" in p for p in check_aur_ships_extras(fake)))
+
+    # And losing the `release-*` filter would publish the raw completions as loose assets.
+    with tempfile.TemporaryDirectory() as td:
+        unfiltered = real_workflow.replace("          pattern: release-*\n", "")
+        check("extras pattern mutation applied", unfiltered != real_workflow)
+        fake = _extras_tree(td, pkgbuild=real_pkgbuild, workflow=unfiltered)
+        check("extras unfiltered download caught",
+              any("release-*" in p for p in check_aur_ships_extras(fake)))
 
     if failures:
         for f in failures:
