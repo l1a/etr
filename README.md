@@ -10,7 +10,7 @@ Unlike SSH, when your network drops, `etr` keeps the remote shell alive and tran
 
 This project is entirely vibe coded — every line was written by AI (Claude and Gemini) with a human directing at a high level. The code compiles, the tests pass, and the tool works.
 
-The networking and systems design is the part that has had experienced human direction: it comes from a network architect whose production background is large-scale multi-national networks (100,000+ nodes). **What the project has not had is review by working programmers or by cryptographers** — and those are exactly the two kinds of scrutiny it would benefit from most:
+The networking and systems design is the part that has had experienced human direction. **What the project has not had is review by working programmers or by cryptographers** — and those are exactly the two kinds of scrutiny it would benefit from most:
 
 - **Modern Rust programmers.** Idiomatic style, API design, async/concurrency correctness, error handling — the things a practising engineer spots immediately and an AI happily reproduces from a plausible pattern.
 - **Encryption and protocol-security experts.** etr deliberately uses standard TLS 1.3 via QUIC rather than bespoke crypto, but the surrounding design still deserves expert eyes: the SSH-bootstrapped certificate pinning, the session passkey handling, replay and reconnect semantics, and the post-quantum story (ML-KEM was retired with the QUIC migration and is not yet reinstated).
