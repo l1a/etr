@@ -66,14 +66,17 @@ VERSION_RE = re.compile(r"^[0-9]+(\.[0-9]+)+$")
 # worse than one attributed to the project.
 MAINTAINER = "Ken Tobias <634380+l1a@users.noreply.github.com>"
 
-# etr ships TWO binaries on TWO architectures, so its AUR package pins four checksums where
-# every sibling pins one. They are named for the asset they belong to; `just publish-aur`
-# downloads each asset and passes its digest under the matching key.
+# etr ships TWO binaries on TWO architectures, so its AUR package pins four binary checksums
+# where every sibling pins one -- plus a fifth for the arch-independent `etr-extras.tar.gz`
+# (both man pages and bash/zsh/fish completions), which a `-bin` package has no other way to
+# obtain. They are named for the asset they belong to; `just publish-aur` downloads each asset
+# and passes its digest under the matching key.
 AUR_SHA_KEYS = (
     "SHA_ETR_X86_64",
     "SHA_ETRS_X86_64",
     "SHA_ETR_AARCH64",
     "SHA_ETRS_AARCH64",
+    "SHA_EXTRAS",
 )
 
 
@@ -89,7 +92,7 @@ class Target:
 
 
 # The AUR is two files rendered from one set of values, which is precisely why they are
-# rendered together: PKGBUILD and .SRCINFO restate the same version and the same four
+# rendered together: PKGBUILD and .SRCINFO restate the same version and the same five
 # checksums, and hand-maintaining that agreement is the classic AUR footgun. `.SRCINFO` is
 # never hand-written.
 TARGETS = {
@@ -229,11 +232,15 @@ def render(
 
 _SHA = "77ccf85843d24ac3216ab31d2584ff4a95869266c59ddb8bc83819425cfc2033"
 _SHA2 = "1e5c3f0a9b8d7c6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e"
+_SHA3 = "3c1f7e9a2b8d4c6e0f5a9b3d7c1e5f9a2b6d8c4e0f7a1b5d9c3e7f1a5b9d3c7e"
 _AUR_SHAS = {
     "SHA_ETR_X86_64": _SHA,
     "SHA_ETRS_X86_64": _SHA2,
     "SHA_ETR_AARCH64": _SHA2,
     "SHA_ETRS_AARCH64": _SHA,
+    # A third distinct value, so the `aur pair agrees` loop below cannot pass by accident on a
+    # template that put the wrong (but equal) checksum against the extras tarball.
+    "SHA_EXTRAS": _SHA3,
 }
 
 

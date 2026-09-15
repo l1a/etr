@@ -9,8 +9,77 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.10.1 — the "Vibe coded" disclaimer drops the CV
-## Current State (v0.10.1)
+## Current state: v0.10.2 — the AUR package ships man pages and completions
+## Current State (v0.10.2)
+
+Packaging only (153 tests, unchanged; no Rust change).
+
+`etr-terminal-bin` was the only one of the five channels installing **nothing but the two
+binaries** — COPR and Homebrew have shipped both man pages and bash/zsh/fish completions
+since v0.9.0. This closes the gap that release recorded as found-but-not-fixed.
+
+### Why it stayed open, and what decided it
+
+A `-bin` package has no source tree to take man pages from, and the obvious way to get
+completions — running the downloaded binary in `package()` — breaks the moment the build
+host's architecture differs from the target's. That is not hypothetical for a package built
+for both x86_64 and aarch64, and it is why this needed a decision rather than a reflex fix.
+
+**The decision: publish one arch-independent release asset.** A new `extras` job in
+`release.yml` packs `etr-extras.tar.gz` — the two committed man pages plus bash/zsh/fish
+completions for both binaries — and the PKGBUILD installs out of it. `package()` now
+executes nothing it downloaded, so it is correct under `makepkg -A`, in a foreign-arch
+chroot and under any cross-build.
+
+Two facts make it work, and both were checked rather than assumed:
+
+- **The man pages are already tracked** (`man/etr.1`, `man/etrs.1`, since v0.9.0), so any CI
+  checkout carries them. They are installed **as committed**, never regenerated with
+  mandown — the same reasoning already written into the COPR spec and the Homebrew formula.
+- **Completions are architecture-independent.** clap derives them from the CLI definition,
+  and no `cfg` attribute appears inside either binary's `Cli` struct. **That is asserted in
+  CI, not trusted:** both Linux runners generate a set natively and the `extras` job
+  hard-fails on a byte of difference. An assumption that would otherwise be invisible until
+  an aarch64 user noticed a wrong completion is now a build failure instead.
+
+### The guard covers a contract that spans two files which cannot see each other
+
+The tarball is packed by `release.yml` and unpacked by `PKGBUILD.in`. A path renamed in one
+and not the other passes every check that looks at either file alone, and fails on a user's
+machine. So `check_aur_ships_extras` in `scripts/packaging_check.py` asserts **both** ends:
+every one of the eight artefacts is read from its tarball path *and* installed to its exact
+Arch destination, the workflow still packs that layout, and the cross-architecture
+comparison is still there. It also refuses a regression to running the downloaded binary,
+however plausible that looks in a `-bin` package.
+
+`AGENTS.md` §4.13 now names **four** places a new artefact must reach, not three.
+
+### Verified before the tag, and what could not be
+
+The release workflow only runs on a `v*` push, so the `extras` job itself is unproven until
+v0.10.2 is released. Its steps were therefore rehearsed locally: the completions generated,
+the tarball packed with the same `tar` invocation, extracted into a stand-in `$srcdir`, and
+the **real `package()` body extracted from the template** and run against a stand-in
+`$pkgdir` — producing all ten files at their correct paths and modes. The cross-arch `diff`
+was exercised in both directions, and each new guard was watched failing on the specific
+defect it exists to catch.
+
+Both remaining failure modes are hard rather than silent: a cross-arch divergence aborts the
+job, and `just publish-aur` lists `etr-extras.tar.gz` among the assets it verifies **before**
+rendering anything, so a failed `extras` job makes the publish refuse instead of pushing a
+PKGBUILD whose `source=` points at an asset that was never published.
+
+### One trap found while doing this
+
+The `release` job downloads every artifact with `merge-multiple: true` and attaches
+`dist/**/*`. The raw per-architecture completions are artifacts too, so without a filter they
+would have been merged into `dist/` and published as **six loose completion files** on the
+release page — the precise outcome uploading them separately was meant to avoid. The job now
+downloads `pattern: release-*`, which makes the artifact naming convention load-bearing; the
+guard asserts the filter is still there.
+
+## Previous: v0.10.1 — the "Vibe coded" disclaimer drops the CV
+## Previous State (v0.10.1)
 
 Documentation only (153 tests, unchanged; no Rust change).
 
@@ -556,7 +625,11 @@ going from two channels to five would otherwise have multiplied a known failure 
 
 ### Found while doing this, NOT fixed here
 
-- **The AUR package installs neither man pages nor completions.** `etr-terminal-bin` is a
+- ~~**The AUR package installs neither man pages nor completions.**~~ **Done in v0.10.2** —
+  the decision this entry asked for was taken, and it was the first of the two options:
+  publish them as one arch-independent release asset, so `package()` installs files and runs
+  nothing. See the v0.10.2 section. *(Original text follows as the record of why it was
+  deferred.)* `etr-terminal-bin` is a
   `-bin` package built from release assets, so it has no source tree to take them from, and
   generating completions by running the downloaded binary would break for the aarch64 package
   built on an x86_64 host. COPR and Homebrew both ship all three. Closing this means either

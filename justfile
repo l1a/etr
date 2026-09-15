@@ -420,7 +420,11 @@ publish-aur:
     AUR_PKG="etr-terminal-bin"
     AUR_REMOTE="ssh://aur@aur.archlinux.org/${AUR_PKG}.git"
     BASE_URL="https://github.com/l1a/etr/releases/download/v${VERSION}"
-    ASSETS=(etr-linux-x86_64 etrs-linux-x86_64 etr-linux-aarch64 etrs-linux-aarch64)
+    # etr-extras.tar.gz carries the man pages and completions -- see packaging/aur/PKGBUILD.in.
+    # Listing it here is load-bearing: the verification loop below refuses to render anything
+    # if the `extras` job did not publish it, rather than pushing a PKGBUILD whose `source=`
+    # points at an asset that does not exist.
+    ASSETS=(etr-linux-x86_64 etrs-linux-x86_64 etr-linux-aarch64 etrs-linux-aarch64 etr-extras.tar.gz)
 
     # The AUR package points at GitHub release assets, so the v$VERSION release
     # must be fully built before this can run (tag → release.yml → here).
@@ -448,7 +452,7 @@ publish-aur:
         echo "    ${a}  ${SHA[$a]}"
     done
 
-    # PKGBUILD and .SRCINFO are rendered from the same four values by the SAME renderer, so
+    # PKGBUILD and .SRCINFO are rendered from the same five values by the SAME renderer, so
     # the two cannot disagree -- the classic AUR footgun, and the reason .SRCINFO is never
     # hand-written. The renderer refuses a placeholder checksum and refuses to emit a file
     # with a surviving sentinel, so neither can reach the AUR.
@@ -457,6 +461,7 @@ publish-aur:
         --sha256 "SHA_ETRS_X86_64=${SHA[etrs-linux-x86_64]}"
         --sha256 "SHA_ETR_AARCH64=${SHA[etr-linux-aarch64]}"
         --sha256 "SHA_ETRS_AARCH64=${SHA[etrs-linux-aarch64]}"
+        --sha256 "SHA_EXTRAS=${SHA[etr-extras.tar.gz]}"
     )
 
     echo "==> Cloning ${AUR_REMOTE}..."

@@ -61,6 +61,8 @@ Prebuilt binaries are packaged as [`etr-terminal-bin`](https://aur.archlinux.org
 paru -S etr-terminal-bin   # or: yay -S etr-terminal-bin
 ```
 
+Installs both binaries, both man pages and bash/zsh/fish completions.
+
 (The AUR packages named `etr`/`etr-bin` are an unrelated traceroute tool.)
 
 ### Fedora / RHEL (COPR)
