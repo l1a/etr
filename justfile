@@ -22,7 +22,7 @@ MAN_PAGES := "man/etr.1 man/etrs.1"
 # Do NOT edit inside the markers. Edit templates/justfile-common.just and the two vendored
 # helpers, bump their versions, and propagate to the siblings in their own PRs.
 # `just standard-check` runs the helpers' self-tests and `just check` depends on it.
-# >>> COMMON (template v3)
+# >>> COMMON (template v4)
 # The interpreter is resolved ONCE per line, and a missing one is a hard error. The
 # `python3 … 2>/dev/null || python …` idiom is deliberately NOT used: it retries on ANY
 # failure, so a real error inside the script gets re-run and reported as if the
@@ -88,13 +88,10 @@ install-completions: build
 # repos quietly shipped the pre-fix nushell path for months. A text diff would also have
 # passed happily on a repo that had never adopted the standard at all.
 standard-check:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    [ "{{PY}}" != "PYTHON-NOT-FOUND" ] || { echo "error: no python3/python on PATH" >&2; exit 1; }
-    "{{PY}}" scripts/install_completions.py --self-test
-    "{{PY}}" scripts/install_man.py --self-test
-    "{{PY}}" scripts/gate_conformance.py --self-test
-    "{{PY}}" scripts/gate_conformance.py "{{justfile()}}"
+    @"{{PY}}" scripts/install_completions.py --self-test
+    @"{{PY}}" scripts/install_man.py --self-test
+    @"{{PY}}" scripts/gate_conformance.py --self-test
+    @"{{PY}}" scripts/gate_conformance.py "{{justfile()}}"
 # <<< COMMON
 LOG_FILE   := `echo "${XDG_STATE_HOME:-$HOME/.local/state}/etr/etrs.log"`
 TMUX_SESS  := "etr_test"

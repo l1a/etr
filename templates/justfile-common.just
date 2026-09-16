@@ -2,16 +2,59 @@
 # Copyright (C) 2026 l1a
 #
 # ============================================================================
-# CANONICAL COMMON JUSTFILE BLOCK — template v3
+# CANONICAL COMMON JUSTFILE BLOCK — template v4
 # ============================================================================
 #
 # The text below `---- BEGIN CANONICAL ----` is the reference for the block
-# delimited by `# >>> COMMON (template v3)` and `# <<< COMMON` in a project's
+# delimited by `# >>> COMMON (template v4)` and `# <<< COMMON` in a project's
 # Justfile. Vendored in: rusticprofile, retch, etr.
 #
 # It is a THIN layer. The real work lives in two vendored Python helpers,
 # `scripts/install_completions.py` and `scripts/install_man.py`, which carry
 # their own rationale and their own `--self-test`.
+#
+#
+# WHY `standard-check` HAS NO SHEBANG  (v4 settled this; v1's mistake nearly recurred)
+# ----------------------------------------------------------------------------
+# Three repos all declared `template v3` while `standard-check`'s BODY differed:
+# retch ran four plain `@"{{PY}}"` lines; etr and rusticprofile ran a
+# `#!/usr/bin/env bash` recipe with `set -euo pipefail` and an explicit
+# `[ "{{PY}}" != "PYTHON-NOT-FOUND" ]` guard. Each repo was internally consistent
+# — template file and Justfile agreed — so nothing looked wrong anywhere.
+#
+# THE MAJORITY WAS WRONG, and reconciling toward it would have been v1 repeating.
+# The decisive measurement is which recipes each repo's `check` actually depends
+# on, counted rather than argued:
+#
+#     retch          7 of 7 check dependencies shell-free
+#     etr            4 of 6 are bash shebangs
+#     rusticprofile  2 of 4 are bash shebangs
+#
+# So retch is the only repo where `just check` still runs on a default Windows
+# PATH — no `cygpath`, no Git `usr\bin` — which is the ENTIRE property v0.6.16
+# bought and the reason these helpers are Python at all. Adopting the shebang
+# body would have spent it, in the one repo that still had it, to match two repos
+# that had already lost it for unrelated reasons.
+#
+# The guard is also worth less than it looks. The sentinel is the literal string
+# `PYTHON-NOT-FOUND`, so the UNGUARDED failure is `PYTHON-NOT-FOUND: command not
+# found` — which already names the problem. The guard buys a tidier message; the
+# shebang costs a platform.
+#
+# CANONICAL: `standard-check` is four plain lines and has no shebang. A repo whose
+# `check` needs bash for OTHER reasons is free to have bash-shebang recipes of its
+# own — OUTSIDE these markers. That is a gap in those repos, stated rather than
+# hidden, and it is not fixed by making this block worse.
+#
+# Stated precisely, because the loose version of this claim is false: the rule is
+# about the GATE, not about the whole block. `install-tag` below IS a bash shebang
+# recipe and stays one — it is an explicit install action nobody runs from `check`,
+# it needs real control flow, and a Windows user running it has already chosen to
+# install a toolchain. What must stay shell-free is every recipe `check` depends on.
+#
+# The transferable half, which is v1's lesson arriving in new clothes: "two of
+# three repos agree" is a fact about how the drift SPREAD, not about which side is
+# right. Count the property at stake instead of counting the repos.
 #
 #
 # WHY PYTHON HELPERS RATHER THAN JUST RECIPES  (v2 reversed v1 here)
@@ -176,10 +219,7 @@ install-completions: build
 # repos quietly shipped the pre-fix nushell path for months. A text diff would also have
 # passed happily on a repo that had never adopted the standard at all.
 standard-check:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    [ "{{PY}}" != "PYTHON-NOT-FOUND" ] || { echo "error: no python3/python on PATH" >&2; exit 1; }
-    "{{PY}}" scripts/install_completions.py --self-test
-    "{{PY}}" scripts/install_man.py --self-test
-    "{{PY}}" scripts/gate_conformance.py --self-test
-    "{{PY}}" scripts/gate_conformance.py "{{justfile()}}"
+    @"{{PY}}" scripts/install_completions.py --self-test
+    @"{{PY}}" scripts/install_man.py --self-test
+    @"{{PY}}" scripts/gate_conformance.py --self-test
+    @"{{PY}}" scripts/gate_conformance.py "{{justfile()}}"
