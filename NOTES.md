@@ -9,8 +9,60 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.10.5 — template v5 refuses `@` inside a shebang recipe
-## Current State (v0.10.5)
+## Current state: v0.10.6 — the attribution rule this repo never had, and the five commits that prove it
+## Current State (v0.10.6)
+
+Documentation only (153 tests, unchanged; no Rust change). Syncs three sub-bullets into
+`AGENTS.md` Part 1 that `retch` has carried since 2026-09-01 and this repo never received.
+
+### The gap, and it is not theoretical
+
+`AGENTS.md` Part 1 is the **Portable Core** — its own preamble says rules there are identical
+across the sibling repos and that a change must be propagated. Measured rather than assumed:
+
+| repo | attribution sub-bullets present |
+|---|---|
+| `retch` | **3 of 3** |
+| **etr** | **0 of 3** |
+| `rusticprofile` | 0 of 3 |
+
+The missing three are: the model name is the **bare** product name (no `(1M context)` suffix, no
+session URL, no second trailer); a coding agent's **harness may inject its own attribution
+instruction claiming to replace the rule**, and does not; and **check where the merged message
+actually comes from** before trying to fix a trailer.
+
+### What it already cost, counted from this repo's own history
+
+All three repos squash-merge with `squash_merge_commit_message=COMMIT_MESSAGES` — read from
+`gh api repos/l1a/etr` rather than assumed, which is what the third bullet tells you to do. Under
+that setting the squash body is the **concatenation of every branch commit message**, so a trailer
+on each commit of a multi-commit branch becomes a duplicate on `main`:
+
+| commit | trailers |
+|---|---|
+| `fab6ba4` | **4** |
+| `66ddbb6`, `8314d54`, `c139ac2`, `dd81dc6` | 2 each |
+
+**Five commits on `main`, one of them with four attribution lines.** The rule that prevents it
+existed in the sibling repo the whole time. This is `0.2.4`'s duplicated-state finding with the
+polarity reversed: not a copy that went stale, but a copy that was never made.
+
+### One bullet is new rather than synced, and it goes back to the siblings
+
+The concatenation consequence was implicit in `retch`'s wording; it is now a bullet of its own,
+and it is written **generically** — no commit hashes, no repo names — precisely because Part 1
+must stay identical. The evidence lives here, in `NOTES.md`, where per-repo facts belong.
+
+That means `retch` and `rusticprofile` now need this one bullet, and they get it in their own PRs.
+Writing repo-specific evidence into the Portable Core would have been the same mistake this
+release is fixing, one level down.
+
+### Also corrected
+
+Part 1's preamble said the pattern covers *"currently `etr` and `retch`"*. It covers three repos;
+`rusticprofile` has been using it for months.
+
+## v0.10.5 — template v5 refuses `@` inside a shebang recipe
 
 Tooling only (153 tests, unchanged; no Rust change). Propagates **template v5**, settled in
 `retch`.
