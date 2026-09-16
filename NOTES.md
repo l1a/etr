@@ -9,8 +9,80 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.10.3 — one confirm variable, and bytes nobody was reading
-## Current State (v0.10.3)
+## Current state: v0.10.4 — the vendored template is v4, and this repo was on the wrong side
+## Current State (v0.10.4)
+
+Tooling only (153 tests, unchanged; no Rust change). Adopts **template v4** of the shared
+Justfile block, settled in `retch` and propagated here.
+
+### What changed, in one line
+
+`standard-check` loses its `#!/usr/bin/env bash` shebang, its `set -euo pipefail` and its
+explicit `PYTHON-NOT-FOUND` guard, and becomes four plain `@"{{PY}}"` lines. The vendored
+`templates/justfile-common.just` is now **byte-identical to retch's**.
+
+### Why this repo was wrong and the majority was not the argument
+
+Three repos all declared `template v3` while `standard-check`'s body differed: retch ran the
+plain form, `etr` and `rusticprofile` ran the shebang form. **Each repo agreed with itself** —
+template file and Justfile byte-identical within each — so nothing looked wrong from inside any
+of them, and the version marker, which is the one thing that makes a vendored copy safe, could
+not tell them apart.
+
+Two of three repos had the shebang form, and reconciling toward it would have been template v1's
+mistake repeating. What decides it is which recipes each repo's `check` actually **depends on**:
+
+| repo | `check` dependencies that are shell-free |
+|---|---|
+| **retch** | **7 of 7** |
+| **etr (this repo)** | **2 of 6** |
+| `rusticprofile` | 2 of 4 |
+
+retch is the only repo where `just check` still runs on a default Windows PATH — no `cygpath`,
+no Git `usr\bin` — which is the entire property retch's `v0.6.16` bought and the whole reason
+these helpers are Python. Adopting the shebang body would have spent it in the one repo that
+still had it.
+
+### Nothing is lost by dropping `set -euo pipefail`, and that was measured here
+
+This is the part that could have gone wrong quietly, so it was tested rather than reasoned about.
+`just` aborts a plain recipe on the first failing line and propagates the exit code; the
+remaining lines do not run:
+
+| control | result |
+|---|---|
+| sabotage the **first** helper to exit 7 | `recipe standard-check failed on line 91 with exit code 7` |
+| sabotage the **second** of four | fails on line 92, and **`gate conformance ok` never prints** |
+| restored | exit 0 |
+
+So `set -e` was redundant with `just`'s own semantics, and `set -o pipefail` was inert because no
+line contains a pipe. **The first attempt at this control proved nothing** — a `str.replace` that
+matched zero times, so the "sabotaged" run passed and looked like evidence. Caught by asserting
+the match count, which is the only reason the table above means anything.
+
+### The guard was worth less than it looked
+
+The sentinel is the literal string `PYTHON-NOT-FOUND`, so the *unguarded* failure reads
+`PYTHON-NOT-FOUND: command not found` — which already names the problem. The guard bought a
+tidier message; the shebang cost a platform.
+
+### This does not make `just check` portable here, and saying so is the point
+
+`etr` still has four bash-shebang recipes in its `check` chain — `man-check`, `packaging-check`,
+`text-check` and the block's own `install-tag` is shebang'd too (deliberately; nothing runs it
+from `check`). **So `just check` still needs bash on this repo**, and v4 does not change that.
+That is a gap in *this* repo, now stated rather than hidden, and it is not fixed by making the
+shared block worse. Closing it is separate work: the three project-specific recipes would each
+have to become Python helpers, which is retch's `v0.6.16` argument applied here.
+
+### Found while doing this, NOT fixed here
+
+The v4 header's *"Known divergences"* list still says **"etr has no `install-hooks` and no
+`open-pr`"**. Both exist in this repo now (`justfile:306` and `justfile:268`). The correction
+belongs in the canonical template, which means all three repos in one coordinated bump, so it is
+recorded for the next template version rather than patched into one copy — patching one copy is
+the drift this release exists to end.
+
 
 Tooling and repo hygiene (153 tests, unchanged; no Rust change).
 
