@@ -19,7 +19,7 @@
 # This is retch's finding, adopted as the standard. retch converted these exact
 # recipes to Python in its v0.6.16 to eliminate bash-shebang escaping bugs and
 # run natively on Windows PowerShell, CMD and Unix shells WITHOUT requiring
-# Git's `usrin` on PATH.
+# Git's `usr\bin` on PATH.
 #
 # v1 of this template got that backwards: it took rusticprofile's plain-`sh`
 # recipes as canonical because rusticprofile had the CORRECTNESS fixes, and

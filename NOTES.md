@@ -9,8 +9,90 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.10.2 — the AUR package ships man pages and completions
-## Current State (v0.10.2)
+## Current state: v0.10.3 — one confirm variable, and bytes nobody was reading
+## Current State (v0.10.3)
+
+Tooling and repo hygiene (153 tests, unchanged; no Rust change).
+
+Two defects, and neither was hypothetical — both had already fired before being fixed.
+
+### `BREW_CONFIRM` took `yes` while its two siblings took `y`
+
+`just pr` reads `PR_CONFIRM`, `clean-procs` reads `CLEAN_CONFIRM`, and both accept `y`.
+`brew-publish` read `BREW_CONFIRM` and required the literal `yes`. **Three variables doing one
+job, with two different accepted answers.**
+
+It fired during the v0.10.1 release: `BREW_CONFIRM=y` aborted the publish **at the Homebrew
+leg, after crates.io and the AUR had already published** — the least convenient possible
+moment, and a partially-released version to recover from. The recovery (re-running the single
+leg) was safe, but the trap only ever springs during a release, which is exactly when nobody
+wants to be debugging a confirmation prompt.
+
+Now accepts `y`/`Y`/`yes`/`YES`. **Not a bypass**, and the distinction is the v0.7.2 one: every
+path still requires an explicit affirmative and there is no default, so an empty answer, a
+stray newline, `Yes`, `yep` and an unset variable all still refuse. This widens *who can
+answer*, not *what counts as an answer*.
+
+### Two collapsed backslashes had been in NOTES.md for eight releases
+
+`~/AGENTS.md` §14 records the mechanism: a double backslash in a command handed to an agent's
+shell arrives as a single one, **before the shell sees it**, so a quoted heredoc does not
+prevent it. What that left in this file:
+
+| intended | what was actually there |
+|---|---|
+| `` `usr\bin` `` | `` `usr `` + **0x08** + `` in` `` |
+| `` `%APPDATA%\nushell\autoload` `` | `` `%APPDATA% `` + **a real newline** + `` ushell `` + **0x07** + `` utoload` `` |
+
+The second **split a paragraph in half**, which is precisely why it survived eight releases of
+review: the file still rendered, just wrongly, and nothing about the rendered text looked like
+a missing character. The same collapse sat in `templates/justfile-common.just`.
+
+**The repair is written with `chr(92)`, never a backslash literal in a shell string** — writing
+one is the bug.
+
+**The shared standard was never affected, and that was checked rather than assumed.** The
+corrupt byte sits in the template's *preamble*; the canonical block starts below
+`---- BEGIN CANONICAL ----`, and all three repos' actual justfiles are clean. So
+`TEMPLATE_VERSION` is deliberately **not** bumped: the standard's content did not change, and
+bumping it would claim a propagation that nothing needs.
+
+### The guard closes both classes, and found a third defect doing it
+
+New `scripts/text_check.py`, wired into `just check`. It refuses every C0 control byte except
+tab and newline, plus DEL, across all tracked text — no per-file exemptions, because there was
+nothing to exempt, and an exemption list is where a guard goes to die.
+
+It also refuses **carriage returns**, which is the half worth explaining: `.gitattributes` pins
+`* text=auto eol=lf` because this tree is Syncthing-shared across three OSes, and with that
+attribute set **`git status` structurally cannot report a CRLF worktree** — git treats the two
+as equivalent, so the file reads as perfectly clean. Turning the guard on found
+`scripts/install_man.py` sitting **entirely CRLF in the worktree** while its committed blob was
+LF and byte-identical to the two sibling repos it is vendored from. That is the same shape
+v0.8.1 recorded and repaired for `install_completions.py`, in a file that repair missed. The
+worktree copy is normalised; the blob never changed, so it contributes nothing to the diff —
+which is exactly why nothing had noticed.
+
+`git ls-files --eol` is the oracle that *can* answer here (`i/lf w/crlf`), and the guard's
+error message names it.
+
+**It is built on byte counting, not `grep`.** `grep -c $'\r'` from an agent shell is
+`~/AGENTS.md` §17: the pattern collapses to empty, `grep` matches every line, and the answer is
+the file's **line count** wearing a carriage-return costume. It is wrong in both directions,
+and the tell is that it equals `wc -l`.
+
+### Watched failing, after a first attempt that proved nothing
+
+The negative controls clone the repo, mutate one file and assert the guard names **that file
+and that byte**. The first version of them was worthless and is worth recording: it cloned
+`HEAD`, which still carried the uncommitted-at-the-time corruption, so three of four controls
+reported the *pre-existing* `NOTES.md` defect and "passed" without ever testing what they
+injected. They now assert a **clean baseline first** — a control that cannot distinguish its
+own mutation from existing damage is not a control. Same family as every other entry in this
+file.
+
+## Previous: v0.10.2 — the AUR package ships man pages and completions
+## Previous State (v0.10.2)
 
 Packaging only (153 tests, unchanged; no Rust change).
 
@@ -1138,7 +1220,7 @@ New in v0.7.1 (tooling only; no Rust code change, test count unchanged at 112):
   Windows `just` tries to translate the interpreter path with `cygpath` and every one of
   them fails before running a line. That gap asked for exactly this fix: *"plain
   (non-shebang) recipes"*. The work now lives in two vendored Python helpers, which need
-  no `sh`, no `cygpath`, no coreutils and nothing from Git's `usrin`.
+  no `sh`, no `cygpath`, no coreutils and nothing from Git's `usr\bin`.
 - **`install` installed the DEBUG binaries, and no completions at all.** It was
   `install: build` plus `cp target/debug/{etr,etrs}`, so `just install` handed you an
   unoptimised build. It is now `install: install-man install-completions` +
@@ -1147,8 +1229,7 @@ New in v0.7.1 (tooling only; no Rust code change, test count unchanged at 112):
   — that is a deliberate, user-visible change to two documented recipes.
 - **nushell completions went where Windows nushell never looks.** `NU_COMP` was
   `$XDG_CONFIG_HOME/nushell/autoload`; on Windows `$nu.user-autoload-dirs` is exactly
-  `%APPDATA%
-ushellutoload` — one entry — and nushell never reads the XDG path. Introduced
+  `%APPDATA%\nushell\autoload` — one entry — and nushell never reads the XDG path. Introduced
   in v0.4.24, which set that path *and* changed the output "to denote auto-loaded state".
   So the recipe wrote a real file somewhere nothing consults and reported success.
 - **The output asserted two things that were false.** It printed

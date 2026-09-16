@@ -136,7 +136,7 @@ audit:
     cargo audit
 
 # Run all static checks: fmt + clippy (suitable as a pre-push gate)
-check: fmt-check clippy standard-check man-check packaging-check
+check: fmt-check clippy standard-check man-check packaging-check text-check
     @echo "All checks passed."
 
 # Every packaging guard, all offline.
@@ -148,6 +148,20 @@ check: fmt-check clippy standard-check man-check packaging-check
 #
 # Both scripts carry their own `--self-test`, run first: a guard whose own tests are not run
 # is a guard nobody has watched fail.
+
+# Refuse control characters and carriage returns in tracked text.
+#
+# Wired into `check` for the same reason `packaging-check` is: nothing else looks at bytes.
+# Both classes it catches had already shipped here -- two collapsed backslashes that sat in
+# NOTES.md for eight releases (one of them splitting a paragraph in half), and a CRLF worktree
+# copy of a file that is supposed to be vendored byte-identically across three repos, which
+# `git status` structurally cannot report because .gitattributes pins eol=lf.
+text-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [ "{{PY}}" != "PYTHON-NOT-FOUND" ] || { echo "error: no python3/python on PATH" >&2; exit 1; }
+    "{{PY}}" scripts/text_check.py --self-test
+    "{{PY}}" scripts/text_check.py
 
 # Offline packaging guards: templates intact, every channel agrees
 packaging-check:
@@ -540,17 +554,31 @@ brew-publish VERSION:
     # blocks on a stdin that will never answer or dies without saying why, and that failure
     # reads as the gate REFUSING the publish rather than as a question nobody could hear. This
     # widens who can answer, not what counts as an answer.
+    #
+    # `y` IS ACCEPTED HERE, and that is the point of this block rather than an afterthought.
+    # Until v0.10.3 this alone of the three required the literal `yes`, so `BREW_CONFIRM=y` --
+    # the spelling the other two take, and the one anybody who has used them will reach for --
+    # aborted the publish. It did exactly that during the v0.10.1 release, at the Homebrew leg,
+    # AFTER crates.io and the AUR had already published: the worst moment to discover it, and a
+    # partially-released version to recover from. Three variables doing one job must not take
+    # two different answers.
+    #
+    # Still not a bypass: every path requires an explicit affirmative and there is no default,
+    # so an empty answer, a stray newline or an unset variable all still refuse.
     if [ -n "${BREW_CONFIRM:-}" ]; then
         CONFIRM="$BREW_CONFIRM"
         echo "Type 'yes' to continue: $CONFIRM   (answered by BREW_CONFIRM)"
     elif [ -t 0 ]; then
-        echo -n "Type 'yes' to continue: "; read -r CONFIRM
+        echo -n "Type 'yes' (or 'y') to continue: "; read -r CONFIRM
     else
         read -r -t 10 CONFIRM || CONFIRM=""
         echo "$CONFIRM"
         [ -n "$CONFIRM" ] || fail "no terminal and nothing on stdin. Re-run with BREW_CONFIRM=yes"
     fi
-    [ "$CONFIRM" = "yes" ] || { echo -e "${RED}Aborted.${NC}"; exit 1; }
+    case "$CONFIRM" in
+        y|Y|yes|YES) ;;
+        *) echo -e "${RED}Aborted.${NC}"; exit 1 ;;
+    esac
 
     info "Cloning the tap..."
     git clone -q "$TAP_REPO" "$WORK/tap" \
