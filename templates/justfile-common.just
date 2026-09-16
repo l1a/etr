@@ -2,16 +2,51 @@
 # Copyright (C) 2026 l1a
 #
 # ============================================================================
-# CANONICAL COMMON JUSTFILE BLOCK — template v4
+# CANONICAL COMMON JUSTFILE BLOCK — template v5
 # ============================================================================
 #
 # The text below `---- BEGIN CANONICAL ----` is the reference for the block
-# delimited by `# >>> COMMON (template v4)` and `# <<< COMMON` in a project's
+# delimited by `# >>> COMMON (template v5)` and `# <<< COMMON` in a project's
 # Justfile. Vendored in: rusticprofile, retch, etr.
 #
 # It is a THIN layer. The real work lives in two vendored Python helpers,
 # `scripts/install_completions.py` and `scripts/install_man.py`, which carry
 # their own rationale and their own `--self-test`.
+#
+#
+# WHY `@` IS REFUSED INSIDE A SHEBANG RECIPE  (v5 added the guard)
+# ----------------------------------------------------------------------------
+# In a PLAIN recipe a leading `@` tells just not to echo the line, and just strips
+# it. In a SHEBANG recipe just strips NOTHING — the body goes to the interpreter
+# verbatim — so the `@` reaches the shell, which looks for a command literally
+# named `@/usr/bin/python3` and exits 127.
+#
+# `scripts/gate_conformance.py` now refuses that shape in ANY recipe, not just the
+# triad, because it is a fact about a recipe's SHAPE rather than about the gate's
+# behaviour and can land anywhere.
+#
+# IT IS HERE BECAUSE IT WAS PAID FOR TWICE. rusticprofile `0.2.2` fixed it after a
+# global regex put `@` in front of lines in `pr`, `merge-pr` and `aur-publish`.
+# retch `v0.17.13` fixed it again in `merge-pr`, in a session where that write-up
+# had already been read — and it broke the very merge that shipped it. **A
+# documented trap is not a guard**, which is this whole file's argument.
+#
+# Run against the two historical defects it exists for, the guard names all four
+# sites: rusticprofile's `pr`, `merge-pr` and `aur-publish`, and retch's `merge-pr`.
+#
+# HEREDOCS ARE SKIPPED, and that is load-bearing rather than polite. A `cat <<'MSG'`
+# block inside a shebang recipe is DATA, so a line of it starting with `@` is a
+# literal `@` and not a command. Without the skip the check fires on correct code —
+# and a guard that fires on correct code is deleted within a week, taking the real
+# rule with it. The self-test pins all four cases: it fires on the defect, stays
+# silent on a plain recipe, stays silent inside a heredoc, and still fires on a
+# defect AFTER a heredoc.
+#
+# TWO VERSION NUMBERS, DELIBERATELY NOT THE SAME ONE. This block's marker is v5; the
+# helpers carry their own `TEMPLATE_VERSION` (`gate_conformance.py` is now 4,
+# `install_completions.py` 3, `install_man.py` 2). They move independently because a
+# helper can change without the block changing, and vice versa — which is what
+# happened here.
 #
 #
 # WHY `standard-check` HAS NO SHEBANG  (v4 settled this; v1's mistake nearly recurred)
@@ -150,8 +185,13 @@
 #   * `Justfile` (rusticprofile, retch) vs `justfile` (etr)
 #   * `lint` (rusticprofile, retch) vs `clippy` (etr)
 #   * `## Current State (vX)` vs `## Current state: vX` in NOTES.md
-#   * etr has no `install-hooks` and no `open-pr`, so its pre-push gate is
-#     installed by nothing and its PR path has no gated call site
+#   * etr's `check` chain still needs bash (man-check, packaging-check, text-check are
+#     shebang recipes); retch's is 7 of 7 shell-free. See the v4 note above.
+#
+# (A bullet claiming etr has no `install-hooks` and no `open-pr` stood here until v5. Both
+# exist there now — justfile:306 and justfile:268 — so it was removed rather than corrected.
+# It had been false for long enough that nobody re-read it, which is `0.2.4`'s finding about
+# duplicated state, inside the file that exists to stop duplication drifting.)
 #
 # ---- BEGIN CANONICAL ----
 # The interpreter is resolved ONCE per line, and a missing one is a hard error. The

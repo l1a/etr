@@ -22,7 +22,7 @@ MAN_PAGES := "man/etr.1 man/etrs.1"
 # Do NOT edit inside the markers. Edit templates/justfile-common.just and the two vendored
 # helpers, bump their versions, and propagate to the siblings in their own PRs.
 # `just standard-check` runs the helpers' self-tests and `just check` depends on it.
-# >>> COMMON (template v4)
+# >>> COMMON (template v5)
 # The interpreter is resolved ONCE per line, and a missing one is a hard error. The
 # `python3 … 2>/dev/null || python …` idiom is deliberately NOT used: it retries on ANY
 # failure, so a real error inside the script gets re-run and reported as if the

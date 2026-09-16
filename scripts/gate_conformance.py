@@ -3,7 +3,7 @@
 # Copyright (C) 2026 l1a
 """Assert the pr / open-pr / merge-pr triad still carries its required guards.
 
-TEMPLATE v3 — vendored verbatim in rusticprofile, retch and etr. Change it here, bump
+TEMPLATE v4 — vendored verbatim in rusticprofile, retch and etr. Change it here, bump
 TEMPLATE_VERSION, and propagate in each repo's own PR. Run by `just standard-check`.
 
 WHAT THIS IS, AND HONESTLY WHAT IT IS NOT
@@ -39,7 +39,7 @@ import re
 import sys
 from pathlib import Path
 
-TEMPLATE_VERSION = 3
+TEMPLATE_VERSION = 4
 
 
 def recipe_body(text, name):
@@ -114,6 +114,66 @@ RULES = [
 ]
 
 
+HEADER_RE = re.compile(r"^([a-zA-Z_][a-zA-Z0-9_-]*)(\s+[^:]*)?:(?!=)")
+
+# `<<WORD`, `<<'WORD'`, `<<"WORD"` and the `<<-` indent-stripping form.
+HEREDOC_RE = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+
+
+def at_prefixed_lines_in_shebang_recipes(text):
+    """Find `@`-prefixed lines inside `#!`-shebang recipe bodies. Returns [(name, lineno, line)].
+
+    WHY THIS EXISTS -- it is the one rule here that was added after being paid for twice.
+
+    In a PLAIN recipe a leading `@` tells just not to echo the line, and just strips it. In a
+    SHEBANG recipe just strips nothing: the body is handed to the interpreter verbatim, so the
+    `@` reaches the shell, which looks for a command literally named `@/usr/bin/python3` and
+    exits 127.
+
+    rusticprofile 0.2.2 fixed exactly this after a global regex put `@` in front of lines in
+    `merge-pr`, `pr` and `aur-publish`. retch v0.17.13 fixed it again in `merge-pr`, in a
+    session where that write-up had already been read. **A documented trap is not a guard**,
+    which is this file's whole argument, so it is now a check.
+
+    It is also the one rule that cannot be per-recipe: the mistake is about a recipe's SHAPE,
+    not about the triad's behaviour, and it can land in any recipe at all.
+
+    HEREDOCS ARE SKIPPED, and that is not a nicety. A `cat <<'MSG'` block inside a shebang
+    recipe is DATA; a line of it beginning with `@` is a literal `@`, not a command. Without
+    this the check fires on correct code, and a guard that fires on correct code is deleted
+    within a week -- which would cost the real rule. Verified both ways in the self-test.
+    """
+    lines = text.splitlines()
+    hits = []
+    i = 0
+    while i < len(lines):
+        m = HEADER_RE.match(lines[i])
+        if not m or ":=" in lines[i].split("#")[0]:
+            i += 1
+            continue
+        name = m.group(1)
+        body, j = [], i + 1
+        while j < len(lines) and (not lines[j].strip() or lines[j].startswith((" ", "\t"))):
+            body.append((j + 1, lines[j]))
+            j += 1
+        first = next((l for _, l in body if l.strip()), "")
+        if first.strip().startswith("#!"):
+            pending = None  # heredoc terminator currently open
+            for lineno, l in body:
+                if pending is not None:
+                    if l.strip() == pending:
+                        pending = None
+                    continue
+                hd = HEREDOC_RE.search(l)
+                if hd:
+                    pending = hd.group(2)
+                    continue
+                if l.strip().startswith("@"):
+                    hits.append((name, lineno, l.strip()))
+        i = j
+    return hits
+
+
 def check(justfile: Path):
     text = justfile.read_text(encoding="utf-8")
     failures = []
@@ -124,6 +184,14 @@ def check(justfile: Path):
             continue
         if not pred(code_of(body)):
             failures.append((f"{recipe}:{key}", desc))
+
+    # Whole-file, not per-recipe: an `@` inside a shebang body can land in ANY recipe.
+    for name, lineno, line in at_prefixed_lines_in_shebang_recipes(text):
+        failures.append((
+            f"{name}:{lineno}:at-in-shebang",
+            f"`@` prefix inside a shebang recipe -- just does not strip it there, so the "
+            f"shell gets a command literally named `@...` and exits 127. Drop the `@`. "
+            f"Line: {line[:60]}"))
     return failures
 
 
@@ -200,6 +268,58 @@ def self_test():
         missing.write_text(CONFORMANT.replace("open-pr *ARGS:", "unrelated:"), encoding="utf-8")
         if not any(k.startswith("open-pr") for k, _ in check(missing)):
             problems.append("  a MISSING open-pr recipe did not fail the check")
+
+        # --- template v4: `@` inside a shebang recipe -------------------------------------
+        # Four cases, because three of them are the ways this check could be WRONG rather
+        # than the way it is right.
+
+        # 1. It fires on the real defect. This is retch v0.17.12's actual line.
+        at_bad = Path(d) / "AtBad"
+        at_bad.write_text(CONFORMANT + '''
+broken-recipe:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    @"{{PY}}" scripts/update_wip.py
+''', encoding="utf-8")
+        if not any(k.endswith("at-in-shebang") for k, _ in check(at_bad)):
+            problems.append("  an `@` inside a shebang recipe was NOT caught")
+
+        # 2. It does NOT fire on a PLAIN recipe, where `@` is correct and required.
+        at_plain = Path(d) / "AtPlain"
+        at_plain.write_text(CONFORMANT + '''
+plain-recipe:
+    @"{{PY}}" scripts/thing.py --self-test
+''', encoding="utf-8")
+        if any(k.endswith("at-in-shebang") for k, _ in check(at_plain)):
+            problems.append("  `@` in a PLAIN recipe was wrongly flagged -- that form is correct")
+
+        # 3. It does NOT fire on heredoc DATA. Without this the check fires on correct code,
+        #    and a guard that fires on correct code gets deleted, taking the real rule with it.
+        at_heredoc = Path(d) / "AtHeredoc"
+        at_heredoc.write_text(CONFORMANT + '''
+heredoc-recipe:
+    #!/usr/bin/env bash
+    cat > out.txt <<\'MSG\'
+    @this is data, not a command
+    MSG
+    echo done
+''', encoding="utf-8")
+        if any(k.endswith("at-in-shebang") for k, _ in check(at_heredoc)):
+            problems.append("  an `@` inside a HEREDOC was wrongly flagged as a command")
+
+        # 4. ...but a real defect AFTER a heredoc is still caught. Skipping the heredoc must
+        #    not swallow the rest of the recipe.
+        at_after = Path(d) / "AtAfter"
+        at_after.write_text(CONFORMANT + '''
+after-heredoc:
+    #!/usr/bin/env bash
+    cat <<\'MSG\'
+    @data
+    MSG
+    @"{{PY}}" thing.py
+''', encoding="utf-8")
+        if not any(k.endswith("at-in-shebang") for k, _ in check(at_after)):
+            problems.append("  an `@` defect AFTER a heredoc was missed -- the skip over-ran")
 
     if problems:
         print(f"gate_conformance self-test FAILED (template v{TEMPLATE_VERSION}):", file=sys.stderr)
