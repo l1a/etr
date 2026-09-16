@@ -9,8 +9,53 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.10.4 — the vendored template is v4, and this repo was on the wrong side
-## Current State (v0.10.4)
+## Current state: v0.10.5 — template v5 refuses `@` inside a shebang recipe
+## Current State (v0.10.5)
+
+Tooling only (153 tests, unchanged; no Rust change). Propagates **template v5**, settled in
+`retch`.
+
+`scripts/gate_conformance.py` (`TEMPLATE_VERSION` 3 → 4) refuses an `@`-prefixed line inside a
+`#!` recipe body, in **any** recipe rather than only the `pr`/`open-pr`/`merge-pr` triad — the
+mistake is about a recipe's *shape*, not the gate's behaviour, so it can land anywhere. The block
+marker goes v4 → v5.
+
+In a **plain** recipe `@` means "do not echo" and just strips it. In a **shebang** recipe just
+strips nothing, so the shell gets a command literally named `@/usr/bin/python3` and exits 127.
+
+### It exists because the trap was paid for twice
+
+rusticprofile `0.2.2` fixed it after a global regex put `@` in front of lines in `pr`, `merge-pr`
+and `aur-publish`; retch `v0.17.13` fixed it again in `merge-pr`, in a session where that write-up
+had already been read — and it broke the very merge that shipped it. **A documented trap is not a
+guard.**
+
+Validated against those real commits rather than a fixture: the guard names all four sites
+unprompted, and is clean on both repos' fixed commits.
+
+### Heredocs are skipped, and that is load-bearing
+
+A `cat <<'MSG'` block inside a shebang recipe is **data**, so a line of it beginning with `@` is a
+literal `@` and not a command. The first detector flagged exactly that — caught by testing the
+false-positive case before vendoring it. *A guard that fires on correct code is deleted within a
+week, taking the real rule with it.*
+
+The self-test pins all four outcomes, three of which are ways the check could be **wrong**: fires
+on the defect; silent on a plain recipe; silent inside a heredoc; and still fires on a defect
+*after* a heredoc, so the skip cannot over-run.
+
+### Also in v5, and it concerns this repo
+
+The header's *"Known divergences"* list said **"etr has no `install-hooks` and no `open-pr`"*.
+Both exist here (`justfile:306`, `justfile:268`), and had for long enough that nobody re-read the
+claim. Removed rather than reworded, and replaced with the divergence that is actually live:
+**this repo's `check` chain still needs bash** (`man-check`, `packaging-check`, `text-check`)
+where retch's does not.
+
+**Two version numbers, deliberately not one.** The block marker (v5) and each helper's
+`TEMPLATE_VERSION` move independently, because a helper can change without the block changing —
+which is exactly what happened here.
+
 
 Tooling only (153 tests, unchanged; no Rust change). Adopts **template v4** of the shared
 Justfile block, settled in `retch` and propagated here.
