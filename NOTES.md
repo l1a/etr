@@ -9,8 +9,45 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.10.6 — the attribution rule this repo never had, and the five commits that prove it
-## Current State (v0.10.6)
+## Current state: v0.10.7 — template v6: `just install` no longer needs mandown
+## Current State (v0.10.7)
+
+Tooling only (153 tests, unchanged; no Rust change). Adopts **template v6** of the shared
+Justfile block, settled in `retch` (its v0.17.18) and propagated here in its own PR.
+
+### What changed, in one line
+
+`install-man` no longer depends on `man`, so `just install` installs the **committed**
+`man/etr.1` and `man/etrs.1` instead of rebuilding them first. `scripts/install_man.py` goes
+to template v3 for a docstring correction; the block marker goes v5 → v6.
+
+### Why the dependency existed, and why it could go
+
+It existed for **this repo**: until v0.9.0 (#72) etr built its pages into a gitignored
+`man/build/`, so there was nothing to install until `just man` had run. Since v0.9.0 the pages
+are tracked and `man-check` (in `just check`) refuses a stale one, so the committed page *is*
+the current page. What was left was the cost: `just install` required **mandown** — a tool for
+writing the page — to install the program, and where mandown was present it rewrote two
+tracked files in the user's checkout. retch v0.17.17 measured the failure in a fresh clone
+(`'mandown' executable not found`, before `cargo install` ran) and documented mandown as a
+prerequisite; this removes the need instead.
+
+The shared template's own text had gone stale the same way, and is corrected in v6: its
+`MAN_PAGES` example still read `man/build/etr.1`, and its scope note said "one repo gitignores
+its page". `install_man.py`'s docstring said etr "builds its pages into an ignored
+directory". **Its skip for a page not tracked at a tag is kept** — `just install-tag` can
+still install an etr release from before v0.9.0, where the pages genuinely are absent.
+
+### Verified here, not only in retch
+
+With mandown removed from `PATH` and throwaway `CARGO_INSTALL_ROOT` / XDG directories,
+`just install` in this repo exits 0, installs both binaries, and the installed `etr.1` and
+`etrs.1` are byte-identical to the committed ones; no tracked file changes. The vendored
+template, `install_man.py` and the COMMON block are byte-identical to retch's (hash-compared).
+Applied by the same script in all three repos, so they cannot diverge.
+
+## Previous: v0.10.6 — the attribution rule this repo never had, and the five commits that prove it
+## Previous State (v0.10.6)
 
 Documentation only (153 tests, unchanged; no Rust change). Syncs three sub-bullets into
 `AGENTS.md` Part 1 that `retch` has carried since 2026-09-01 and this repo never received.
