@@ -2,16 +2,35 @@
 # Copyright (C) 2026 l1a
 #
 # ============================================================================
-# CANONICAL COMMON JUSTFILE BLOCK — template v5
+# CANONICAL COMMON JUSTFILE BLOCK — template v6
 # ============================================================================
 #
 # The text below `---- BEGIN CANONICAL ----` is the reference for the block
-# delimited by `# >>> COMMON (template v5)` and `# <<< COMMON` in a project's
+# delimited by `# >>> COMMON (template v6)` and `# <<< COMMON` in a project's
 # Justfile. Vendored in: rusticprofile, retch, etr.
 #
 # It is a THIN layer. The real work lives in two vendored Python helpers,
 # `scripts/install_completions.py` and `scripts/install_man.py`, which carry
 # their own rationale and their own `--self-test`.
+#
+#
+# WHY `install-man` DOES NOT BUILD THE PAGE  (v6)
+# ----------------------------------------------------------------------------
+# Through v5 `install-man` depended on `man`, so `just install` rebuilt every page
+# before installing it. That made mandown -- a tool for WRITING the page -- a
+# prerequisite for INSTALLING the program: in a fresh retch clone without it,
+# `just install` failed with `'mandown' executable not found` before `cargo install`
+# ever ran. And where mandown was present it rewrote a tracked file in the user's
+# checkout (the page's date footer moves every month).
+#
+# The dependency was only ever needed while a page was not committed. etr built its
+# pages into a gitignored `man/build/` until its #72 (2026-09-13); since then all
+# three repos commit their pages, and each one's gate refuses a stale page, so the
+# committed page IS the current page. Found by retch v0.17.17, which had to document
+# mandown as a prerequisite of `just install` before this removed it.
+#
+# `install_man.py` still skips a page that is not tracked at a TAG, because
+# `install-tag` can install an etr release from before #72.
 #
 #
 # WHY `@` IS REFUSED INSIDE A SHEBANG RECIPE  (v5 added the guard)
@@ -42,9 +61,9 @@
 # silent on a plain recipe, stays silent inside a heredoc, and still fires on a
 # defect AFTER a heredoc.
 #
-# TWO VERSION NUMBERS, DELIBERATELY NOT THE SAME ONE. This block's marker is v5; the
+# TWO VERSION NUMBERS, DELIBERATELY NOT THE SAME ONE. This block's marker is v6; the
 # helpers carry their own `TEMPLATE_VERSION` (`gate_conformance.py` is now 4,
-# `install_completions.py` 3, `install_man.py` 2). They move independently because a
+# `install_completions.py` 3, `install_man.py` 3). They move independently because a
 # helper can change without the block changing, and vice versa — which is what
 # happened here.
 #
@@ -154,7 +173,7 @@
 # owns:
 #
 #     BINS      := "etr etrs"                          # space separated
-#     MAN_PAGES := "man/build/etr.1 man/build/etrs.1"  # space separated
+#     MAN_PAGES := "man/etr.1 man/etrs.1"              # space separated
 #
 # Project-specific recipes are normal — put them OUTSIDE the markers, under
 # `# ===== PROJECT-SPECIFIC =====`. Editing INSIDE the markers means changing the
@@ -178,8 +197,9 @@
 # because they are pure functions; the gate recipes run test suites, push branches and
 # merge PRs, so executing them from `check` would be slow and destructive.
 #
-# Still not covered: `check`/`lint`/`test` bodies, and `man` — one repo commits its
-# page, one gitignores it, one builds two.
+# Still not covered: `check`/`lint`/`test` bodies, and `man` — each repo builds its
+# page(s) its own way (one builds two). All three COMMIT the result, which is what
+# lets `install-man` install without building (v6).
 #
 # Known divergences left alone, for whoever extends this:
 #   * `Justfile` (rusticprofile, retch) vs `justfile` (etr)
@@ -239,7 +259,13 @@ install-tag VERSION:
     "{{PY}}" scripts/install_completions.py {{BINS}} --from-path
 
 # Install the man page(s) to the XDG man directory.
-install-man: man
+#
+# Installs the COMMITTED page(s) and deliberately does NOT depend on `man` (v6). Every repo
+# using this block commits its pages and its gate refuses a stale one, so rebuilding here
+# only made `just install` require mandown -- a documentation build tool -- to install a
+# finished page, and rewrote a tracked file in the user's checkout. Edited the page source?
+# Run `just man` first; the gate would refuse the stale page at PR time anyway.
+install-man:
     @"{{PY}}" scripts/install_man.py {{MAN_PAGES}}
 
 # Generate and install shell completions for every binary.

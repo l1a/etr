@@ -3,7 +3,7 @@
 # Copyright (C) 2026 l1a
 """Install man page(s) to the XDG man directory. Canonical across repos.
 
-TEMPLATE v2 — vendored verbatim in rusticprofile, retch and etr. Change it here, bump
+TEMPLATE v3 — vendored verbatim in rusticprofile, retch and etr. Change it here, bump
 TEMPLATE_VERSION, and propagate in each repo's own PR. `just standard-check` runs
 `--self-test`.
 
@@ -14,9 +14,9 @@ no POSIX `install(1)`, and nothing from Git's `usr\\bin` on Windows.
 is what `install-tag` needs. Installing a tag's binary beside the worktree's man page —
 a v0.2.22 binary with a v0.2.23 page because the checkout had moved on — is exactly the
 kind of individually-plausible mismatch these projects exist to refuse. A page that is
-gitignored (etr builds its pages into an ignored directory) is reported as skipped rather
-than failing the run, because the binary and completions are still correctly installed and
-saying so is more useful than aborting.
+not tracked at that tag (etr's pages lived in a gitignored `man/build/` before its #72) is
+reported as skipped rather than failing the run, because the binary and completions are
+still correctly installed and saying so is more useful than aborting.
 """
 
 import os
@@ -25,7 +25,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-TEMPLATE_VERSION = 2
+TEMPLATE_VERSION = 3
 
 
 def man_dir(env, home):
