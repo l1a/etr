@@ -568,15 +568,21 @@ brew-publish VERSION:
     #
     # Still not a bypass: every path requires an explicit affirmative and there is no default,
     # so an empty answer, a stray newline or an unset variable all still refuse.
+    #
+    # The PROMPT says `[y/N]` on every path, like `pr` and `clean-procs`. Until v0.10.9 it still
+    # printed "Type 'yes'" (and the no-terminal hint said BREW_CONFIRM=yes) after v0.10.3 had
+    # widened the accepted answers -- the text contradicted the behaviour it sat next to, and
+    # the piped-stdin path printed no question at all.
     if [ -n "${BREW_CONFIRM:-}" ]; then
         CONFIRM="$BREW_CONFIRM"
-        echo "Type 'yes' to continue: $CONFIRM   (answered by BREW_CONFIRM)"
+        echo "Publish to the tap? [y/N] $CONFIRM   (answered by BREW_CONFIRM)"
     elif [ -t 0 ]; then
-        echo -n "Type 'yes' (or 'y') to continue: "; read -r CONFIRM
+        echo -n "Publish to the tap? [y/N] "; read -r CONFIRM
     else
+        echo -n "Publish to the tap? [y/N] "
         read -r -t 10 CONFIRM || CONFIRM=""
         echo "$CONFIRM"
-        [ -n "$CONFIRM" ] || fail "no terminal and nothing on stdin. Re-run with BREW_CONFIRM=yes"
+        [ -n "$CONFIRM" ] || fail "no terminal and nothing on stdin. Re-run with BREW_CONFIRM=y"
     fi
     case "$CONFIRM" in
         y|Y|yes|YES) ;;

@@ -9,8 +9,32 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.10.8 — `man-check` checks the commit, not only the worktree
-## Current State (v0.10.8)
+## Current state: v0.10.9 — the Homebrew prompt stops asking for `yes`
+## Current State (v0.10.9)
+
+Tooling only (153 tests, unchanged; no Rust change).
+
+v0.10.3 widened `brew-publish`'s accepted answers to `y`/`Y`/`yes`/`YES`, but left the text
+around them saying otherwise. The prompt still printed `Type 'yes' to continue:`, the
+no-terminal failure told you to re-run with `BREW_CONFIRM=yes`, and the piped-stdin path
+printed no question at all. Noticed during the v0.10.6 release, where the log read
+`Type 'yes' to continue: y` and then published.
+
+Every path now prints `Publish to the tap? [y/N]`, the same shape as `pr` and `clean-procs`,
+and the hint names `BREW_CONFIRM=y`. **Only the text changed.** The confirmation block was
+extracted from the justfile and run on every input path: `y`, `Y`, `yes`, `YES` and piped `y`
+are accepted; `n`, `Yes`, piped `n`, an empty variable and empty stdin all refuse, exactly as
+before.
+
+The first harness for that was wrong in a way worth recording. It stripped the indentation
+before testing for the block's closing `esac`, so the end marker never matched and the
+accepting cases ran on into the publish code. They stopped at the first real command, a
+`git clone` of an empty tap URL, so nothing was cloned or pushed. A harness that extracts part
+of a publish recipe has to prove its extraction boundary before it runs anything: the fixed one
+asserts the extracted script contains no `clone` or `info` line.
+
+## Previous: v0.10.8 — `man-check` checks the commit, not only the worktree
+## Previous State (v0.10.8)
 
 Tooling only (153 tests, unchanged; no Rust change). Closes the gate gap recorded while
 merging #81.
