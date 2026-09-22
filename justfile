@@ -139,7 +139,7 @@ audit:
     cargo audit
 
 # Run all static checks: fmt + clippy (suitable as a pre-push gate)
-check: fmt-check clippy standard-check man-check packaging-check text-check
+check: fmt-check clippy standard-check man-check packaging-check text-check wip-check
     @echo "All checks passed."
 
 # Every packaging guard, all offline.
@@ -157,14 +157,49 @@ check: fmt-check clippy standard-check man-check packaging-check text-check
 # Wired into `check` for the same reason `packaging-check` is: nothing else looks at bytes.
 # Both classes it catches had already shipped here -- two collapsed backslashes that sat in
 # NOTES.md for eight releases (one of them splitting a paragraph in half), and a CRLF worktree
-# copy of a file that is supposed to be vendored byte-identically across three repos, which
-# `git status` structurally cannot report because .gitattributes pins eol=lf.
+# copy of a file that is supposed to be vendored byte-identically across three repos.
+#
+# git does NOT hide that second class outright, though it comes close enough that it went
+# unnoticed here. With .gitattributes pinning eol=lf, planting CRLF in a tracked file shows as
+# a bare ` M` in `git status` with NO diff behind it, and the first `git add` clears the status
+# while leaving every carriage return on disk -- so the signal appears exactly once and reads
+# as noise. `git ls-files --eol` (`i/lf w/crlf`) is the oracle that answers properly.
+# (`scripts/text_check.py`'s own docstring still overstates this as "git status CANNOT report
+# it"; it is vendored to two sibling repos and needs a coordinated bump -- see NOTES.md.)
+#
+# WIP.md is gitignored, so `git ls-files` never offers it and this guard cannot reach it.
+# That is a gap rather than a decision -- `wip-check` is what supplies the same guarantee.
 text-check:
     #!/usr/bin/env bash
     set -euo pipefail
     [ "{{PY}}" != "PYTHON-NOT-FOUND" ] || { echo "error: no python3/python on PATH" >&2; exit 1; }
     "{{PY}}" scripts/text_check.py --self-test
     "{{PY}}" scripts/text_check.py
+
+# LF is the base model for every non-binary file in this tree, and `WIP.md` is the one file
+# with nothing enforcing it.
+#
+# `.gitattributes` pins `* text=auto eol=lf` and `text-check` refuses a carriage return in
+# tracked text -- but both work through git, and `git ls-files` never offers a gitignored
+# path. `WIP.md` is gitignored (it is the Syncthing-synced cross-machine handoff file that
+# AGENTS.md Part 1 section 3 mandates), and `scripts/reset_wip.py` rewrites it on every
+# `just merge-pr`, so it is exactly the file most likely to pick up the wrong bytes and least
+# likely to be noticed doing it.
+#
+# The rewrite deliberately PRESERVES whatever terminator it finds rather than hardcoding LF:
+# a hardcoded terminator converts a file as a side effect of a merge, which the sibling repo
+# `retch` shipped as an accident in its v0.17.12. So the decision gets a guard of its own
+# instead of falling out of an I/O default.
+#
+# Two halves, and both are needed. `--self-test` is about the CODE (it rewrites exactly one
+# state block, refuses on any other match count, and round-trips CRLF *and* LF unchanged);
+# `--check-endings` is about the FILE as it stands on this machine, and passes when `WIP.md`
+# is absent, since it is per-machine and untracked.
+
+# Prove reset_wip.py touches only the state block, and that WIP.md is still LF (offline)
+wip-check:
+    @"{{PY}}" scripts/reset_wip.py --self-test
+    @"{{PY}}" scripts/reset_wip.py --check-endings
 
 # Offline packaging guards: templates intact, every channel agrees
 packaging-check:
@@ -233,7 +268,8 @@ pr:
     echo "  [ ] Config file docs updated (config.toml comments + NOTES.md example) if a config key changed"
     echo "  [ ] PROTOCOL.md updated if the wire protocol changed"
     echo "  [ ] README.md reviewed and updated (new features, install steps, platform notes)"
-    echo "  [ ] NOTES.md known-gaps section and test-coverage count updated"
+    echo "  [ ] NOTES.md: Current state, known gaps, hard-won lessons, test-coverage count"
+    echo "  [ ] WIP.md reflects what is in flight (not a session log -- see its own header)"
     echo "  [ ] GitHub wiki cloned and updated (etr.wiki.git — see AGENTS.md §4.11 for page list)"
     echo ""
     # A bare `read` makes this gate unanswerable by anything that is not a human at a
