@@ -9,8 +9,48 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.10.7 — template v6: `just install` no longer needs mandown
-## Current State (v0.10.7)
+## Current state: v0.10.8 — `man-check` checks the commit, not only the worktree
+## Current State (v0.10.8)
+
+Tooling only (153 tests, unchanged; no Rust change). Closes the gate gap recorded while
+merging #81.
+
+### The gap, and it had already fired
+
+`man-check` rebuilt the pages from the worktree and compared them with the worktree. Rebasing
+#81, a `git commit --amend` without `git add` committed `Cargo.toml` at **0.10.6** while the
+committed `.TH` still said **0.10.5** — and `just check` passed, because the worktree was
+correct. It was caught by hand, diffing `git show HEAD:man/etr.1` against the file. The tag
+tarball, which COPR and Homebrew install the pages from, carries the **commit**, so the check
+was looking at the wrong tree for exactly the artefact it exists to protect.
+
+### The fix: HEAD is checked against itself
+
+`man-check` now runs a second pass: it renders from **HEAD's own** `man/*.md` and **HEAD's own**
+`Cargo.toml` version, and compares the result with HEAD's committed `man/*.1`. The error names
+the fix (`git add man/etr.1 man/etrs.1 && git commit --amend --no-edit`).
+
+HEAD is compared with *itself*, never with the worktree. Comparing the worktree to HEAD would
+fail every uncommitted version bump mid-work, and a guard that fires on correct work gets
+switched off. Only a commit that disagrees with itself can fail the new pass. With no HEAD
+at all, the pass is skipped and says so.
+
+### Negative controls, in a scratch clone
+
+| case | old recipe | new recipe |
+|---|---|---|
+| clean tree | pass | pass |
+| uncommitted bump, `just man` not run | fail | fail (worktree pass) |
+| uncommitted bump after `just man` (work in progress) | pass | **pass** |
+| **#81 shape: `Cargo.toml` committed, `man/` not** | **pass** | **fail** (HEAD pass) |
+| after `git add man/` + `--amend` | pass | pass |
+| repository with no commits | — | pass, HEAD pass skipped |
+
+The old recipe was run against the #81 case too, to confirm the control reproduces the
+defect rather than something else.
+
+## Previous: v0.10.7 — template v6: `just install` no longer needs mandown
+## Previous State (v0.10.7)
 
 Tooling only (153 tests, unchanged; no Rust change). Adopts **template v6** of the shared
 Justfile block, settled in `retch` (its v0.17.18) and propagated here in its own PR.
