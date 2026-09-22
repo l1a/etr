@@ -150,7 +150,7 @@ and hard-fails on the first problem:
 1. Confirms you are on a feature branch, not `main`.
 2. Confirms `Cargo.toml`'s version has been bumped past the last git tag.
 3. Confirms `NOTES.md` has a `## Current state: v<version>` header matching the bumped version.
-4. Regenerates man pages (`just man`) and fails if `mandown` errors out, then fails again (via `just check`'s `man-check`) if the rendered pages differ from the committed `man/etr.1` / `man/etrs.1`. **Since v0.9.0 these are tracked**, because a GitHub tag tarball carries only tracked files and both the COPR spec and the Homebrew formula install a man page out of it. Commit them with the version bump.
+4. Regenerates man pages (`just man`) and fails if `mandown` errors out, then fails again (via `just check`'s `man-check`) if the rendered pages differ from `man/etr.1` / `man/etrs.1` — checked against **both** the worktree and HEAD's own committed sources and version (since v0.10.8), so a commit or `--amend` made without staging `man/` fails even while the worktree is correct. **Since v0.9.0 these are tracked**, because a GitHub tag tarball carries only tracked files and both the COPR spec and the Homebrew formula install a man page out of it. Commit them with the version bump.
 5. Runs `cargo check` and fails if `Cargo.lock` changed but wasn't committed.
 6. Runs `just check` (`cargo fmt --check` + `cargo clippy --all-targets -D warnings`).
 7. Runs `cargo test`.
@@ -189,7 +189,8 @@ and hard-fails on the first problem:
       `man/etr.1.md` or `man/etrs.1.md` before running `just man`.
 - [ ] **Commit the rendered `man/etr.1` and `man/etrs.1`.** They are tracked as of v0.9.0.
       The `.TH` line embeds the version, so *every* version bump changes them — `just check`
-      runs `man-check` and fails on a stale page, so this cannot be forgotten silently.
+      runs `man-check` and fails on a stale page — in the worktree **or in HEAD** (since v0.10.8) —
+      so this cannot be forgotten silently, including by an amend that forgot `git add man/`.
 - [ ] Rationale, so nobody "tidies" it back: a tag tarball contains only tracked files, and
       the COPR spec and Homebrew formula both `install` a man page from that tarball. While
       the pages lived in a gitignored `man/build/`, neither channel could ship one and

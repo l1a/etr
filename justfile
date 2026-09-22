@@ -680,19 +680,25 @@ man:
     mandown man/etrs.1.md ETRS 1 | sed "1s|.*|.TH \"ETRS\" \"1\" \"\" \"etr $VERSION\" \"User Commands\"|" > man/etrs.1
     echo "Built man/etr.1 and man/etrs.1 (version $VERSION)"
 
-# Fail if the committed man pages are not what `just man` produces right now.
+# Fail if the man pages are not what `just man` produces -- checked TWICE, against two trees.
 #
 # Run by `just check`, so a version bump that forgets `just man` cannot reach a PR. Skips
 # (rather than fails) where mandown is absent: refusing `just check` on a contributor's
 # machine for a tool that only maintainers need would make the repo harder to work on, not
-# safer — the same reasoning scripts/hooks/pre-push already applies to a missing `just`.
+# safer -- the same reasoning scripts/hooks/pre-push already applies to a missing `just`.
 #
-# Compares BYTES via cmp, not `git diff --quiet`: the latter answers about the index, and on
-# a Syncthing-shared tree checked out on three OSes the worktree is the thing that gets
-# packaged. The rebuild goes to a temp file so a failing check never leaves a half-written
-# page behind.
-
-# Fail if the committed man pages are not what `just man` produces now
+# 1. WORKTREE: the pages on disk against a rebuild from the sources on disk. Compares BYTES
+#    via cmp, not `git diff --quiet`: on a Syncthing-shared tree checked out on three OSes the
+#    worktree is the thing that gets packaged.
+# 2. HEAD: the COMMITTED pages against a rebuild from the COMMITTED sources and the COMMITTED
+#    Cargo.toml version. Check 1 alone cannot see a commit that disagrees with itself: on #81
+#    an amend without `git add` committed Cargo.toml at 0.10.6 while the committed `.TH` still
+#    said 0.10.5, and `just check` passed because the worktree was correct. The tag tarball --
+#    what COPR and Homebrew install from -- carries the commit, not the worktree.
+#    HEAD is compared with ITSELF, never with the worktree, so uncommitted work in progress
+#    cannot fail it; only a commit that is internally inconsistent can.
+#
+# Rebuilds go to a temp dir so a failing check never leaves a half-written page behind.
 man-check:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -700,24 +706,54 @@ man-check:
         echo "man-check: mandown not installed — skipping (cargo install mandown)"
         exit 0
     fi
-    VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
     # Temp files inside the destination directory, never /tmp: on this Syncthing-synced tree
     # a cross-filesystem `mv` from tmpfs carries the user_tmp_t SELinux label into ~/Sync and
     # wedges the whole folder (~/AGENTS.md §12). Nothing is moved here, but the same rule
     # keeps the pattern correct if anyone adds a `mv` later.
     TMP=$(mktemp -d "man/.man-check.XXXXXX")
     trap 'rm -rf "$TMP"' EXIT
-    mandown man/etr.1.md ETR 1  | sed "1s|.*|.TH \"ETR\" \"1\" \"\" \"etr $VERSION\" \"User Commands\"|"  > "$TMP/etr.1"
-    mandown man/etrs.1.md ETRS 1 | sed "1s|.*|.TH \"ETRS\" \"1\" \"\" \"etr $VERSION\" \"User Commands\"|" > "$TMP/etrs.1"
+    cargo_version() { grep '^version' | head -1 | sed 's/.*"\(.*\)"/\1/'; }
+    # render SRC_MD NAME VERSION OUT -- must stay identical to what `just man` does.
+    render() {
+        mandown "$1" "$2" 1 | sed "1s|.*|.TH \"$2\" \"1\" \"\" \"etr $3\" \"User Commands\"|" > "$4"
+    }
+
+    # 1. Worktree.
+    VERSION=$(cargo_version < Cargo.toml)
+    mkdir "$TMP/wt"
+    render man/etr.1.md  ETR  "$VERSION" "$TMP/wt/etr.1"
+    render man/etrs.1.md ETRS "$VERSION" "$TMP/wt/etrs.1"
     for p in etr.1 etrs.1; do
-        if ! cmp -s "$TMP/$p" "man/$p"; then
+        if ! cmp -s "$TMP/wt/$p" "man/$p"; then
             echo "error: man/$p is stale — run 'just man' and commit the result." >&2
             echo "       (the .TH line embeds the version, so a version bump always changes it)" >&2
-            diff -u "man/$p" "$TMP/$p" | head -20 >&2 || true
+            diff -u "man/$p" "$TMP/wt/$p" | head -20 >&2 || true
             exit 1
         fi
     done
-    echo "man pages are current (version $VERSION)"
+
+    # 2. HEAD, against itself.
+    if ! git rev-parse -q --verify HEAD >/dev/null 2>&1; then
+        echo "man pages are current (version $VERSION); no HEAD commit, committed-tree check skipped"
+        exit 0
+    fi
+    HEAD_VERSION=$(git show HEAD:Cargo.toml | cargo_version)
+    mkdir "$TMP/head"
+    for pair in etr.1:ETR etrs.1:ETRS; do
+        p=${pair%%:*}; name=${pair##*:}
+        git show "HEAD:man/$p.md" > "$TMP/head/$p.md"
+        git show "HEAD:man/$p"    > "$TMP/head/$p.committed"
+        render "$TMP/head/$p.md" "$name" "$HEAD_VERSION" "$TMP/head/$p"
+        if ! cmp -s "$TMP/head/$p" "$TMP/head/$p.committed"; then
+            echo "error: the COMMITTED man/$p (HEAD $(git rev-parse --short HEAD)) is stale for the" >&2
+            echo "       committed Cargo.toml version $HEAD_VERSION, although the worktree copy is current." >&2
+            echo "       Usually a commit or --amend made without staging man/. Fix:" >&2
+            echo "         git add man/etr.1 man/etrs.1 && git commit --amend --no-edit" >&2
+            diff -u "$TMP/head/$p.committed" "$TMP/head/$p" | head -20 >&2 || true
+            exit 1
+        fi
+    done
+    echo "man pages are current (worktree $VERSION, HEAD $HEAD_VERSION)"
 
 # ── Local end-to-end testing ─────────────────────────────────────────────────
 
