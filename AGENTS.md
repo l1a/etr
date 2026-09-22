@@ -210,10 +210,22 @@ and hard-fails on the first problem:
       update `README.md` accordingly.
 
 ### 4.9 NOTES.md
-- [ ] Known gaps section updated: mark completed items as done (strikethrough), add
-      new gaps discovered during the work.
-- [ ] "Current state" header version and description updated to match the new version.
+- [ ] "Current state" header version updated to match the new version (`just pr` enforces this).
+- [ ] "Current state" body updated **only if the change leaves something a future reader needs**
+      — a changed default, a new user-visible behaviour, an open follow-up. Routine changes need
+      nothing here: `git log` is the changelog.
+- [ ] Known gaps / next steps updated: **delete** finished items rather than striking them
+      through, and add gaps discovered during the work.
+- [ ] "Hard-won lessons" updated **if the work leaves behind a rule** — a trap, a gotcha, a check
+      that turned out to answer the wrong question. This is the part of NOTES.md that earns its
+      keep; a PR that found nothing surprising adds nothing here.
 - [ ] Test count in the test-coverage table updated if tests were added or removed.
+
+> **NOTES.md is not a changelog.** It held a full per-release log until v0.10.10 — ~2,060 lines
+> reaching back to v0.4.6, which buried everything load-bearing. Do not reintroduce one. If an
+> entry would only say what changed, write a good commit message instead. The same applies to
+> `WIP.md`: it carries work **in flight**, not a session history — its own header states its
+> scope.
 
 ### 4.10 Version bump & release hygiene
 - [ ] Bump the version in `Cargo.toml` following semver:
