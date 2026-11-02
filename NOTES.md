@@ -27,10 +27,10 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.10.11
+## Current state: v0.10.12
 
-`main` carries **0.10.11**. The newest released tag is **`v0.10.6`**, live on GitHub,
-crates.io, the AUR, COPR and the Homebrew tap; **0.10.7 through 0.10.11 are
+`main` carries **0.10.12**. The newest released tag is **`v0.10.6`**, live on GitHub,
+crates.io, the AUR, COPR and the Homebrew tap; **0.10.7 through 0.10.12 are
 merged and untagged**, all of them tooling or documentation.
 
 The full round trip works on Linux and macOS: SSH bootstrap, QUIC session with pinned
@@ -436,10 +436,6 @@ how this section stopped being readable.
 
 ### Tooling and hygiene
 
-- **`just check` still needs bash on this repo.** `man-check`, `packaging-check` and
-  `text-check` are `#!/usr/bin/env bash` shebang recipes, so `just check` does not run on a
-  default Windows PATH. retch's is shell-free end to end. Closing this means converting the
-  three to Python helpers — retch's `v0.6.16` argument applied here.
 - **`scripts/text_check.py` carries a claim its siblings have corrected.** Its docstring says
   a CRLF worktree is invisible because "`git status` CANNOT report it". retch corrected this
   in its v0.17.12: git reports the drift exactly once, as an ` M` with **no diff behind it**,
@@ -452,7 +448,7 @@ how this section stopped being readable.
   two patterns matches exactly once, which closes the class; retch went further in its #259,
   regenerating only the text between its own `BEGIN`/`END` markers and refusing on duplicated
   or unpaired ones. Worth adopting if `WIP.md`'s layout ever needs to move.
-- **Release**: 0.10.7 through 0.10.11 are merged and untagged. All tooling or documentation;
+- **Release**: 0.10.7 through 0.10.12 are merged and untagged. All tooling or documentation;
   reasonable to batch.
 
 ### Deliberately out of scope
