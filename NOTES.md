@@ -27,11 +27,11 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.10.15
+## Current state: v0.10.16
 
-`main` carries **0.10.15**. The newest released tag is **`v0.10.6`**, live on GitHub,
-crates.io, the AUR, COPR and the Homebrew tap; **0.10.7 through 0.10.15 are
-merged and untagged**, all of them tooling or documentation.
+`main` carries **0.10.16**. The newest released tag is **`v0.10.15`**, live on GitHub,
+crates.io, the AUR, COPR and the Homebrew tap; **0.10.16 is merged and untagged**
+(documentation).
 
 The full round trip works on Linux and macOS: SSH bootstrap, QUIC session with pinned
 certificate, PTY, keepalives, reconnect after a drop, `-L`/`-R` TCP and UDP forwarding,
@@ -445,15 +445,6 @@ how this section stopped being readable.
   win on jumbo-frame LANs. The safe shape is conditional (a detected local/jumbo path, or an
   explicit flag), never global, and re-measured with the one-way tooling on both a standard
   and a jumbo path.
-
-### Tooling and hygiene
-
-- **Propagate `scripts/text_check.py` (template v2) to `retch` and `rusticprofile`.** `etr`'s copy
-  is now `TEMPLATE_VERSION = 2` (with the corrected `git status`/`git diff` CRLF docstring and
-  runtime failure message, plus all three repos' control-byte fixtures in `_self_test()`); the two
-  sibling repos still carry their v1 copies.
-- **Release**: 0.10.7 through 0.10.15 are merged and untagged. All tooling or documentation;
-  reasonable to batch.
 
 ### Deliberately out of scope
 
