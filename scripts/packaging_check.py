@@ -32,12 +32,21 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
+import textwrap
 from pathlib import Path
 
 TEMPLATE_VERSION = 1
+
+# The copr.yml step whose missing-credentials branch the self-test executes, and the repo on
+# which a missing credential must FAIL rather than skip. See `creds_step_outcome`.
+CREDS_STEP = "Configure copr-cli"
+CANONICAL_REPO = "l1a/etr"
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -470,6 +479,136 @@ def check_copr_project_text(meta: dict, root: Path = REPO_ROOT) -> list[str]:
     return problems
 
 
+def step_run_script(workflow_text: str, step_name: str) -> str:
+    """The dedented `run: |` body of the workflow step called `step_name`.
+
+    Read as text rather than through a YAML library, which `just check` cannot assume is
+    installed. Raises CheckError when the step or its `run: |` block is missing, so a renamed
+    step fails the check instead of being skipped.
+    """
+    lines = workflow_text.splitlines()
+    name_re = re.compile(rf"^\s*-\s+name:\s*{re.escape(step_name)}\s*$")
+    start = next((i for i, line in enumerate(lines) if name_re.match(line)), None)
+    if start is None:
+        raise CheckError(f"workflow has no step named {step_name!r}")
+    for j in range(start + 1, len(lines)):
+        if re.match(r"^\s*-\s+name:", lines[j]):
+            break
+        m = re.match(r"^(\s*)run:\s*\|\s*$", lines[j])
+        if m:
+            indent = len(m.group(1))
+            body = []
+            for line in lines[j + 1:]:
+                if line.strip() and len(line) - len(line.lstrip()) <= indent:
+                    break
+                body.append(line)
+            return textwrap.dedent("\n".join(body)) + "\n"
+    raise CheckError(f"step {step_name!r} has no `run: |` block")
+
+
+def creds_step_outcome(
+    script: str, repo: str, *, creds: dict[str, str] | None = None
+) -> tuple[int, str, str, bool]:
+    """Run the credentials step's script the way Actions would, in a throwaway HOME.
+
+    Returns (exit code, combined output, what it appended to $GITHUB_ENV, whether it wrote
+    ~/.config/copr). The step is local only: it writes a config file and makes no network
+    call, so running it for real is both safe and the only way to test what it DOES rather
+    than what it says.
+    """
+    with tempfile.TemporaryDirectory() as home:
+        github_env = os.path.join(home, "github_env")
+        env = {
+            "PATH": os.environ.get("PATH", ""),
+            "HOME": home,
+            "GITHUB_ENV": github_env,
+            "GITHUB_REPOSITORY": repo,
+        }
+        if creds:
+            env.update(creds)
+        proc = subprocess.run(
+            ["bash", "-c", script],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        written = ""
+        if os.path.isfile(github_env):
+            with open(github_env, encoding="utf-8") as fh:
+                written = fh.read()
+        wrote_config = os.path.isfile(os.path.join(home, ".config", "copr"))
+        return proc.returncode, proc.stdout + proc.stderr, written, wrote_config
+
+
+def check_copr_creds_step(workflow_text: str) -> list[str]:
+    """Problems with the COPR credentials guard; empty means both halves hold.
+
+    A missing credential must be a RED check on the canonical repo and a quiet skip only on a
+    fork. The guard used to skip everywhere, and rusticprofile, which carries the identical
+    guard, ran green for weeks with its secrets never added, submitting nothing.
+    """
+    problems: list[str] = []
+    script = step_run_script(workflow_text, CREDS_STEP)
+    for forbidden in ("buildscm", "copr-cli modify"):
+        if forbidden in script:
+            problems.append(
+                f"{CREDS_STEP!r} extraction leaked into a later step ({forbidden!r} present)"
+            )
+            return problems
+
+    code, out, genv, _ = creds_step_outcome(script, CANONICAL_REPO, creds=None)
+    if code == 0:
+        problems.append(
+            f"{CANONICAL_REPO} without credentials exits 0: a green run that rebuilds nothing"
+        )
+    if "::error::" not in out:
+        problems.append(f"{CANONICAL_REPO} without credentials prints no ::error:: annotation")
+    if "skip=true" in genv:
+        problems.append(f"{CANONICAL_REPO} without credentials still marks the rebuild skipped")
+
+    # Partial credentials (one secret empty) must also fail on the canonical repo.
+    code, _, genv, _ = creds_step_outcome(
+        script,
+        CANONICAL_REPO,
+        creds={"COPR_LOGIN": "login", "COPR_USERNAME": "user", "COPR_TOKEN": ""},
+    )
+    if code == 0 or "skip=true" in genv:
+        problems.append(f"{CANONICAL_REPO} with an empty COPR_TOKEN did not fail")
+
+    code, out, genv, _ = creds_step_outcome(script, "someone/etr", creds=None)
+    if code != 0:
+        problems.append(
+            f"a fork without credentials fails (exit {code}); it must skip: {out.strip()}"
+        )
+    if "skip=true" not in genv:
+        problems.append("a fork without credentials does not set skip=true")
+
+    code, out, genv, wrote = creds_step_outcome(
+        script,
+        CANONICAL_REPO,
+        creds={"COPR_LOGIN": "login", "COPR_USERNAME": "user", "COPR_TOKEN": "token"},
+    )
+    if code != 0 or not wrote or "skip=false" not in genv:
+        problems.append(
+            f"{CANONICAL_REPO} WITH credentials does not configure copr-cli "
+            f"(exit {code}, config written: {wrote}, GITHUB_ENV {genv!r})"
+        )
+    return problems
+
+
+def check_copr_workflow(root: Path = REPO_ROOT) -> list[str]:
+    """Run `check_copr_creds_step` against `.github/workflows/copr.yml` when POSIX bash exists."""
+    if os.name == "nt" or not shutil.which("bash"):
+        return []
+    rel = ".github/workflows/copr.yml"
+    try:
+        workflow_text = _read(root, rel)
+    except FileNotFoundError:
+        return [f"{rel}: missing"]
+    return check_copr_creds_step(workflow_text)
+
+
 def check_github_metadata(meta: dict) -> list[str]:
     """The About-box text obeys GitHub's limits, checked offline before any push."""
     problems = []
@@ -498,6 +637,7 @@ def run_all(root: Path = REPO_ROOT) -> list[str]:
         *check_aur_ships_extras(root),
         *check_changelog_dates(root),
         *check_copr_project_text(meta, root),
+        *check_copr_workflow(root),
         *check_github_metadata(meta),
     ]
 
@@ -758,6 +898,61 @@ def _self_test() -> int:
         fake = _extras_tree(td, pkgbuild=real_pkgbuild, workflow=unfiltered)
         check("extras unfiltered download caught",
               any("release-*" in p for p in check_aur_ships_extras(fake)))
+
+    # --- the copr.yml credentials guard, EXECUTED rather than read ------------------------
+    # Needs a POSIX bash. On Windows `bash` may resolve to WSL's launcher, which would run
+    # the step somewhere else entirely, so say so rather than pass silently.
+    if os.name == "nt" or not shutil.which("bash"):
+        print("packaging_check.py: credentials-guard checks skipped (no POSIX bash here)")
+    else:
+        live_copr_wf = _read(REPO_ROOT, ".github/workflows/copr.yml")
+        live_copr_problems = check_copr_creds_step(live_copr_wf)
+        check("live copr.yml credentials guard", not live_copr_problems, f"got {live_copr_problems}")
+
+        # The old guard, which skipped on every repo. It must be caught, and caught for the
+        # canonical-repo reason: a fork skipping is correct and must not be what fires.
+        old_guard = textwrap.dedent("""\
+            jobs:
+              copr:
+                steps:
+                  - name: Configure copr-cli
+                    run: |
+                      set -euo pipefail
+                      if [ -z "${COPR_LOGIN:-}" ] || [ -z "${COPR_TOKEN:-}" ] || [ -z "${COPR_USERNAME:-}" ]; then
+                        echo "::notice::COPR credentials not configured; skipping the rebuild"
+                        echo "skip=true" >> "$GITHUB_ENV"
+                        exit 0
+                      fi
+                      mkdir -p ~/.config
+                      echo "[copr-cli]" > ~/.config/copr
+                      echo "skip=false" >> "$GITHUB_ENV"
+
+                  - name: Next step
+                    run: |
+                      echo "must not be read as part of the step above (copr-cli modify / buildscm)"
+            """)
+        probs = check_copr_creds_step(old_guard)
+        check(
+            "skip-everywhere guard detected",
+            any("exits 0" in p for p in probs),
+            f"got {probs}",
+        )
+        check(
+            "a fork skipping is not what fires",
+            not any("fork" in p for p in probs),
+            f"got {probs}",
+        )
+        extracted = step_run_script(old_guard, CREDS_STEP)
+        check(
+            "the step body stops at the next step",
+            "must not be read" not in extracted and "buildscm" not in extracted,
+            extracted,
+        )
+        try:
+            step_run_script(old_guard, "No such step")
+            check("missing step raises", False, "step_run_script accepted a missing step")
+        except CheckError:
+            pass
 
     if failures:
         for f in failures:
