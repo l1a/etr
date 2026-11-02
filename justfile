@@ -111,18 +111,22 @@ default:
 # Format source files
 fmt:
     cargo fmt
+    cargo fmt --manifest-path tools/stress/Cargo.toml
 
 # Check formatting without modifying files
 fmt-check:
     cargo fmt --check
+    cargo fmt --manifest-path tools/stress/Cargo.toml --check
 
 # Run Clippy (deny warnings, check all targets)
 clippy:
     cargo clippy --all-targets -- -D warnings
+    cargo clippy --manifest-path tools/stress/Cargo.toml --all-targets -- -D warnings
 
 # Run unit and integration tests
 test:
     cargo test
+    cargo test --manifest-path tools/stress/Cargo.toml
 
 # Run performance benchmarks
 bench:
@@ -252,6 +256,7 @@ pr:
     # 7. Tests
     info "Running cargo test..."
     cargo test -q 2>&1
+    cargo test --manifest-path tools/stress/Cargo.toml -q 2>&1
     pass "All tests passed"
 
     # Manual checklist
@@ -2106,9 +2111,10 @@ stress-udp-rate: check-tools install build-stress
 
     echo ""
     printf "  %-12s %-14s %-14s %-8s\n" "pace(us)" "offered(Mb/s)" "delivered(Mb/s)" "loss"
-    # 1400-byte datagrams. The pace is the delay between sends, so the offered rate is
-    # roughly 1400*8/pace bits/s -- 2000us ~= 5.6 Mb/s, 50us ~= 224 Mb/s.
-    for PACE in 2000 1000 500 200 100 50 0; do
+    # 1400-byte datagrams. The pace is the target interval between sends (deadline-paced with
+    # a spin-loop below 250 us so kernel timer slack does not clamp sub-100 us steps):
+    # 1400*8/pace bits/s -- 2000us ~= 5.6 Mb/s, 75us ~= 149 Mb/s, 50us ~= 224 Mb/s.
+    for PACE in 2000 1000 500 200 100 75 50 25 15 10 0; do
         OUT="$(mktemp -p . .udprate.XXXXXX)"
         "{{STRESS_BIN}}" udp-pump "${UDP_FWD_PORT}" "$PACE" > "$OUT" &
         PUMP_PID=$!
@@ -2134,12 +2140,6 @@ stress-udp-rate: check-tools install build-stress
     echo "Read the knee, not any single row: the highest offered rate whose loss is still"
     echo "near zero is what this path sustains. A high offered rate with high loss is the"
     echo "pump outrunning the tunnel, not a throughput measurement."
-    echo ""
-    echo "CAVEAT -- the top of this sweep is the PACER's ceiling, not etr's. thread::sleep"
-    echo "cannot pace finer than roughly 100 us, so a requested 50 us step actually lands near"
-    echo "111 us: about 100 Mb/s at 1400 bytes. If every paced row shows ~0% loss, all you have"
-    echo "learned is that etr sustains at least the fastest row -- the real knee is above it and"
-    echo "needs a busy-wait pacer to find."
 
 # Stress-test all five stream types simultaneously while watching etrs memory.
 #
@@ -2314,8 +2314,9 @@ stress-local: check-tools install build-stress
     # tests "does a flood kill us" (it does -- see NOTES.md) rather than "does sustained mixed
     # traffic stay healthy", which is what this recipe is for.
     #
-    # 50 us ~= 100 Mb/s at 1400 bytes: the fastest rate measured to deliver at 0% loss.
-    UDP_PACE_US="${UDP_PACE_US:-50}"
+    # 100 us ~= 112 Mb/s at 1400 bytes (matching the ~100 Mb/s rate that the old
+    # `thread::sleep(50us)` actually produced when kernel timer slack stretched it to ~111 us).
+    UDP_PACE_US="${UDP_PACE_US:-100}"
     echo "==> UDP -L pump on :${UDP_FWD_PORT} (paced ${UDP_PACE_US}us)..."
     "$STRESS_BIN" udp-pump "$UDP_FWD_PORT" "$UDP_PACE_US" > "$UDP_PUMP_OUT" &
     UDP_PUMP_PID=$!

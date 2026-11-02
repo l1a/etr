@@ -45,8 +45,19 @@ use std::{
 /// Set to true by the SIGTERM handler; pump loops check this to stop cleanly.
 static STOP: AtomicBool = AtomicBool::new(false);
 
+#[cfg(unix)]
 unsafe extern "C" fn on_sigterm(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
+}
+
+/// Install the SIGTERM handler so pumps and sinks print their stats line before exiting.
+fn install_sigterm_handler() {
+    #[cfg(unix)]
+    // SAFETY: `on_sigterm` is an `extern "C"` function that only performs an
+    // async-signal-safe atomic store (`STOP.store(true, Ordering::Relaxed)`).
+    unsafe {
+        libc::signal(libc::SIGTERM, on_sigterm as *const () as libc::sighandler_t);
+    }
 }
 
 fn main() {
@@ -65,7 +76,10 @@ fn main() {
     // someone is already fighting a network problem.
     let is_source = matches!(args[1].as_str(), "tcp-source" | "udp-source");
     if is_source && args.len() < 5 {
-        eprintln!("Usage: stress_tool {} <host> <port> <secs> [pace_us]", args[1]);
+        eprintln!(
+            "Usage: stress_tool {} <host> <port> <secs> [pace_us]",
+            args[1]
+        );
         std::process::exit(1);
     }
     let port: u16 = if is_source {
@@ -80,24 +94,18 @@ fn main() {
         "tcp-pump" => {
             // Install SIGTERM handler so the pump can print stats before exiting.
             // Echo servers use the default SIGTERM handler (immediate termination).
-            unsafe {
-                libc::signal(libc::SIGTERM, on_sigterm as *const () as libc::sighandler_t);
-            }
+            install_sigterm_handler();
             tcp_pump(port)
         }
         "udp-pump" => {
-            unsafe {
-                libc::signal(libc::SIGTERM, on_sigterm as *const () as libc::sighandler_t);
-            }
+            install_sigterm_handler();
             // Optional pacing, in microseconds between sends. Absent or 0 = flat out.
             // See the comment in udp_pump for why the default is unthrottled.
             let pace_us: u64 = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
             udp_pump(port, pace_us)
         }
         "tcp-sink" => {
-            unsafe {
-                libc::signal(libc::SIGTERM, on_sigterm as *const () as libc::sighandler_t);
-            }
+            install_sigterm_handler();
             tcp_sink(port)
         }
         "tcp-source" => {
@@ -105,9 +113,7 @@ fn main() {
             tcp_source(&args[2], port, secs)
         }
         "udp-sink" => {
-            unsafe {
-                libc::signal(libc::SIGTERM, on_sigterm as *const () as libc::sighandler_t);
-            }
+            install_sigterm_handler();
             udp_sink(port)
         }
         "udp-source" => {
@@ -166,22 +172,16 @@ fn udp_echo(port: u16) {
     thread::spawn(move || {
         let mut buf = vec![0u8; 65535];
         loop {
-            match sock6.recv_from(&mut buf) {
-                Ok((n, addr)) => {
-                    let _ = sock6.send_to(&buf[..n], addr);
-                }
-                Err(_) => {}
+            if let Ok((n, addr)) = sock6.recv_from(&mut buf) {
+                let _ = sock6.send_to(&buf[..n], addr);
             }
         }
     });
 
     let mut buf = vec![0u8; 65535];
     loop {
-        match sock4.recv_from(&mut buf) {
-            Ok((n, addr)) => {
-                let _ = sock4.send_to(&buf[..n], addr);
-            }
-            Err(_) => {}
+        if let Ok((n, addr)) = sock4.recv_from(&mut buf) {
+            let _ = sock4.send_to(&buf[..n], addr);
         }
     }
 }
@@ -312,10 +312,16 @@ fn udp_pump(port: u16, pace_us: u64) {
     // and it is why the stats line reports sent AND recv. Pass a microsecond delay as the
     // third argument when you deliberately want a paced, low-rate soak instead:
     //     stress_tool udp-pump <port> 1000    # ~1000 dgram/s, the old behaviour
+    //
+    // Pacing uses a deadline-advancing hybrid busy-wait pacer (`Pacer`) rather than a bare
+    // `thread::sleep` after each send: Linux/macOS timer slack (~50-100 us) plus syscall
+    // time otherwise clamps a requested 50 us step to ~111 us (~100 Mb/s ceiling).
+    let mut pacer = Pacer::new(pace_us);
     while !STOP.load(Ordering::Relaxed) {
         match socket.send(&chunk) {
             Ok(n) => {
                 bytes_sent.fetch_add(n as u64, Ordering::Relaxed);
+                pacer.wait();
             }
             // A FULL SOCKET BUFFER IS BACK-PRESSURE, NOT A FAILURE.
             //
@@ -331,25 +337,10 @@ fn udp_pump(port: u16, pace_us: u64) {
             // equivalent probe for the UDP one. Treating it as fatal is why three of the four
             // pumps reported "in 0.0s": they exited within milliseconds and the justfile then
             // divided by a near-zero interval. It is transient, so keep going.
-            Err(ref e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock
-                        | std::io::ErrorKind::OutOfMemory
-                        | std::io::ErrorKind::ConnectionRefused
-                ) =>
-            {
-                thread::yield_now();
-            }
-            // ENOBUFS has no stable ErrorKind across platforms, so match the raw errno too
-            // rather than relying on the classification above catching it.
-            Err(ref e) if e.raw_os_error() == Some(libc::ENOBUFS) => {
+            Err(ref e) if is_transient_udp_send_error(e) => {
                 thread::yield_now();
             }
             Err(_) => break,
-        }
-        if pace_us > 0 {
-            thread::sleep(Duration::from_micros(pace_us));
         }
     }
 
@@ -363,6 +354,105 @@ fn udp_pump(port: u16, pace_us: u64) {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Return `true` when a UDP `send()` error represents transient back-pressure or a
+/// not-yet-listening peer rather than a fatal socket failure.
+fn is_transient_udp_send_error(e: &std::io::Error) -> bool {
+    if matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::OutOfMemory
+            | std::io::ErrorKind::ConnectionRefused
+    ) {
+        return true;
+    }
+    // ENOBUFS has no stable ErrorKind across platforms, so match the raw errno on Unix too.
+    #[cfg(unix)]
+    if e.raw_os_error() == Some(libc::ENOBUFS) {
+        return true;
+    }
+    false
+}
+
+/// Threshold below which [`Pacer`] busy-waits with [`std::hint::spin_loop`] instead of
+/// calling [`thread::sleep`].
+///
+/// Kernel timer slack on Linux (`nanosleep`) and macOS is roughly 50–100 µs, so a
+/// `thread::sleep(Duration::from_micros(50))` actually wakes after ~110 µs — capping
+/// 1400-byte datagrams at ~100 Mb/s regardless of how small `pace_us` is. Sleeping only
+/// the coarse prefix beyond `SPIN_HORIZON` and spinning for the final window keeps coarse
+/// paces (≥ 500 µs) CPU-friendly while making sub-100 µs steps (`50`, `25`, `15`, `10` µs)
+/// hit their target deadlines accurately.
+const SPIN_HORIZON: Duration = Duration::from_micros(250);
+
+/// Maximum number of steps the pacer is allowed to fall behind before clamping its
+/// deadline to `now`.
+///
+/// Without this clamp, a transient socket stall (`WouldBlock` / `ENOBUFS`) or scheduler
+/// preemption of a few milliseconds accumulates dozens of past-due steps, and the loop
+/// then fires an unpaced catch-up burst at line rate the instant the socket clears.
+const MAX_LAG_STEPS: u32 = 8;
+
+/// Compute `(new_deadline, coarse_sleep)` for one paced step from `current_deadline`.
+///
+/// Pure helper so unit tests can verify normal advancement, coarse sleep prefix splitting,
+/// spin-only windows, and lag clamping without depending on OS scheduler timing.
+fn advance_deadline(
+    current_deadline: Instant,
+    step: Duration,
+    now: Instant,
+) -> (Instant, Option<Duration>) {
+    let target = current_deadline + step;
+    if now >= target {
+        let max_lag = step.saturating_mul(MAX_LAG_STEPS);
+        let clamped = if now.duration_since(target) > max_lag {
+            now
+        } else {
+            target
+        };
+        return (clamped, None);
+    }
+    let remaining = target.duration_since(now);
+    let coarse_sleep = if remaining > SPIN_HORIZON {
+        Some(remaining - SPIN_HORIZON)
+    } else {
+        None
+    };
+    (target, coarse_sleep)
+}
+
+/// Deadline-advancing UDP pacer that combines coarse `thread::sleep` with fine
+/// `std::hint::spin_loop` busy-waiting inside [`SPIN_HORIZON`].
+struct Pacer {
+    step: Option<Duration>,
+    next_deadline: Instant,
+}
+
+impl Pacer {
+    /// Create a pacer for `pace_us` microseconds between sends (`0` = unpaced flat-out).
+    fn new(pace_us: u64) -> Self {
+        Self {
+            step: (pace_us > 0).then(|| Duration::from_micros(pace_us)),
+            next_deadline: Instant::now(),
+        }
+    }
+
+    /// Wait until the next send deadline. No-op when `pace_us == 0`.
+    fn wait(&mut self) {
+        let Some(step) = self.step else {
+            return;
+        };
+        let now = Instant::now();
+        let (target, coarse_sleep) = advance_deadline(self.next_deadline, step, now);
+        self.next_deadline = target;
+        if let Some(sleep_dur) = coarse_sleep {
+            thread::sleep(sleep_dur);
+        }
+        while Instant::now() < self.next_deadline {
+            std::hint::spin_loop();
+        }
+    }
+}
 
 fn tcp_connect_with_retry(port: u16) -> Option<TcpStream> {
     for _ in 0..50 {
@@ -545,28 +635,95 @@ fn udp_source(host: &str, port: u16, secs: u64, pace_us: u64) {
     let start = Instant::now();
     let deadline = Duration::from_secs(secs);
     let mut sent: u64 = 0;
+    let mut pacer = Pacer::new(pace_us);
     while start.elapsed() < deadline && !STOP.load(Ordering::Relaxed) {
         match sock.send(&chunk) {
-            Ok(n) => sent += n as u64,
+            Ok(n) => {
+                sent += n as u64;
+                pacer.wait();
+            }
             // Back-pressure and a not-yet-listening peer are both transient for UDP; see the
             // same handling in udp_pump for why treating them as fatal ruins the measurement.
-            Err(ref e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock
-                        | std::io::ErrorKind::OutOfMemory
-                        | std::io::ErrorKind::ConnectionRefused
-                ) =>
-            {
+            Err(ref e) if is_transient_udp_send_error(e) => {
                 thread::yield_now();
             }
-            Err(ref e) if e.raw_os_error() == Some(libc::ENOBUFS) => thread::yield_now(),
             Err(_) => break,
-        }
-        if pace_us > 0 {
-            thread::sleep(Duration::from_micros(pace_us));
         }
     }
     let elapsed = start.elapsed().as_secs_f64();
     println!("SOURCE sent={sent} elapsed={elapsed:.3}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pacer_zero_is_unpaced() {
+        let mut pacer = Pacer::new(0);
+        assert!(pacer.step.is_none());
+        let start = Instant::now();
+        for _ in 0..1000 {
+            pacer.wait();
+        }
+        assert!(
+            start.elapsed() < Duration::from_millis(5),
+            "unpaced wait() should be a no-op, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn advance_deadline_splits_coarse_sleep_and_spin_window() {
+        let t0 = Instant::now();
+        // Step = 1000 us, now = t0 -> remaining = 1000 us > SPIN_HORIZON (250 us),
+        // so coarse_sleep should be 750 us.
+        let (target, sleep) = advance_deadline(t0, Duration::from_micros(1000), t0);
+        assert_eq!(target, t0 + Duration::from_micros(1000));
+        assert_eq!(sleep, Some(Duration::from_micros(750)));
+
+        // Step = 50 us <= SPIN_HORIZON (250 us) -> spin-only, no thread::sleep.
+        let (target_fine, sleep_fine) = advance_deadline(t0, Duration::from_micros(50), t0);
+        assert_eq!(target_fine, t0 + Duration::from_micros(50));
+        assert_eq!(sleep_fine, None);
+    }
+
+    #[test]
+    fn advance_deadline_clamps_excessive_lag_without_bursting() {
+        let t0 = Instant::now();
+        let step = Duration::from_micros(50);
+        // Within MAX_LAG_STEPS (e.g. 3 steps behind = 150 us): preserves cadence.
+        let slightly_late = t0 + Duration::from_micros(150);
+        let (target, sleep) = advance_deadline(t0, step, slightly_late);
+        assert_eq!(target, t0 + step);
+        assert_eq!(sleep, None);
+
+        // Beyond MAX_LAG_STEPS (e.g. 10 ms stall on a 50 us step): clamps to `now`
+        // so the sender does not fire 200 unpaced datagrams in a catch-up burst.
+        let stalled = t0 + Duration::from_millis(10);
+        let (clamped, sleep_stalled) = advance_deadline(t0, step, stalled);
+        assert_eq!(clamped, stalled);
+        assert_eq!(sleep_stalled, None);
+    }
+
+    #[test]
+    fn pacer_busy_waits_sub_100us_accurately() {
+        // 100 steps at 50 us = 5.0 ms target. With the old `thread::sleep(50us)`,
+        // timer slack made each step ~111 us (~11.1 ms total). Assert we land near
+        // 5 ms (at least 4.8 ms, and well below the old 10+ ms sleep floor).
+        let mut pacer = Pacer::new(50);
+        let start = Instant::now();
+        for _ in 0..100 {
+            pacer.wait();
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_micros(4800),
+            "50 us * 100 steps finished too early: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_micros(9000),
+            "50 us * 100 steps took {elapsed:?} (hit sleep timer slack ceiling)"
+        );
+    }
 }
