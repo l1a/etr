@@ -27,10 +27,10 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.10.12
+## Current state: v0.10.13
 
-`main` carries **0.10.12**. The newest released tag is **`v0.10.6`**, live on GitHub,
-crates.io, the AUR, COPR and the Homebrew tap; **0.10.7 through 0.10.12 are
+`main` carries **0.10.13**. The newest released tag is **`v0.10.6`**, live on GitHub,
+crates.io, the AUR, COPR and the Homebrew tap; **0.10.7 through 0.10.13 are
 merged and untagged**, all of them tooling or documentation.
 
 The full round trip works on Linux and macOS: SSH bootstrap, QUIC session with pinned
@@ -436,19 +436,15 @@ how this section stopped being readable.
 
 ### Tooling and hygiene
 
-- **`scripts/text_check.py` carries a claim its siblings have corrected.** Its docstring says
-  a CRLF worktree is invisible because "`git status` CANNOT report it". retch corrected this
-  in its v0.17.12: git reports the drift exactly once, as an ` M` with **no diff behind it**,
-  and the first `git add` erases that signal while leaving every CR on disk. Narrower and
-  worse than the claim here. The file is vendored to all three repos, all three bodies
-  differ, and all three still declare `TEMPLATE_VERSION = 1` — so the version marker, the one
-  thing that makes a vendored copy safe, cannot tell them apart. Needs its own PR, coordinated
-  across the three.
+- **Propagate `scripts/text_check.py` (template v2) to `retch` and `rusticprofile`.** `etr`'s copy
+  is now `TEMPLATE_VERSION = 2` (with the corrected `git status`/`git diff` CRLF docstring and
+  runtime failure message, plus all three repos' control-byte fixtures in `_self_test()`); the two
+  sibling repos still carry their v1 copies.
 - **`scripts/reset_wip.py` does not own a marked block.** It now refuses unless each of its
   two patterns matches exactly once, which closes the class; retch went further in its #259,
   regenerating only the text between its own `BEGIN`/`END` markers and refusing on duplicated
   or unpaired ones. Worth adopting if `WIP.md`'s layout ever needs to move.
-- **Release**: 0.10.7 through 0.10.12 are merged and untagged. All tooling or documentation;
+- **Release**: 0.10.7 through 0.10.13 are merged and untagged. All tooling or documentation;
   reasonable to batch.
 
 ### Deliberately out of scope
