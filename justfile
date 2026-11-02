@@ -186,10 +186,11 @@ text-check:
 # `retch` shipped as an accident in its v0.17.12. So the decision gets a guard of its own
 # instead of falling out of an I/O default.
 #
-# Two halves, and both are needed. `--self-test` is about the CODE (it rewrites exactly one
-# state block, refuses on any other match count, and round-trips CRLF *and* LF unchanged);
-# `--check-endings` is about the FILE as it stands on this machine, and passes when `WIP.md`
-# is absent, since it is per-machine and untracked.
+# Two halves, and both are needed. `--self-test` is about the CODE (it regenerates only the
+# `BEGIN`/`END` merge-pr state block, refuses when markers are duplicated, unpaired or out
+# of order, and round-trips CRLF *and* LF unchanged); `--check-endings` is about the FILE as
+# it stands on this machine, and passes when `WIP.md` is absent, since it is per-machine and
+# untracked.
 
 # Prove reset_wip.py touches only the state block, and that WIP.md is still LF (offline)
 wip-check:
@@ -390,7 +391,7 @@ merge-pr:
     git pull
     echo "Deleting local branch $BRANCH..."
     git branch -D "$BRANCH" 2>/dev/null || true
-    python3 scripts/reset_wip.py
+    "{{PY}}" scripts/reset_wip.py
 
 # Publish the CURRENT version to crates.io, the AUR and the Homebrew tap.
 #

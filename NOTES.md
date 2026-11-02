@@ -27,10 +27,10 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.10.13
+## Current state: v0.10.14
 
-`main` carries **0.10.13**. The newest released tag is **`v0.10.6`**, live on GitHub,
-crates.io, the AUR, COPR and the Homebrew tap; **0.10.7 through 0.10.13 are
+`main` carries **0.10.14**. The newest released tag is **`v0.10.6`**, live on GitHub,
+crates.io, the AUR, COPR and the Homebrew tap; **0.10.7 through 0.10.14 are
 merged and untagged**, all of them tooling or documentation.
 
 The full round trip works on Linux and macOS: SSH bootstrap, QUIC session with pinned
@@ -440,11 +440,7 @@ how this section stopped being readable.
   is now `TEMPLATE_VERSION = 2` (with the corrected `git status`/`git diff` CRLF docstring and
   runtime failure message, plus all three repos' control-byte fixtures in `_self_test()`); the two
   sibling repos still carry their v1 copies.
-- **`scripts/reset_wip.py` does not own a marked block.** It now refuses unless each of its
-  two patterns matches exactly once, which closes the class; retch went further in its #259,
-  regenerating only the text between its own `BEGIN`/`END` markers and refusing on duplicated
-  or unpaired ones. Worth adopting if `WIP.md`'s layout ever needs to move.
-- **Release**: 0.10.7 through 0.10.13 are merged and untagged. All tooling or documentation;
+- **Release**: 0.10.7 through 0.10.14 are merged and untagged. All tooling or documentation;
   reasonable to batch.
 
 ### Deliberately out of scope
@@ -771,17 +767,21 @@ the GitHub release has been built.
     pointing the other way. Reading and writing bytes keeps the conversion out of the merge
     path; `--check-endings` is where the decision is stated, somewhere a reader can see it.
   - **A rewrite that reports success without finding its target is the same family as every
-    other entry in §1.** Both substitutions used to be unbounded, so while `WIP.md` was a
-    rolling log the `### Active Branch:` pattern rewrote every historical heading — and the
-    `**Latest commit on main**` pattern matched **nothing at all**, while the script still
-    printed "Latest commit updated to …". Exactly one match of each is now required, and the
-    script writes nothing on any other count.
-  - **Anchor a marker pattern to line start.** The exactly-one rule fired on its first real
-    run — because `WIP.md`'s own header *names* both markers in prose, and an unanchored
-    pattern matched those mentions too. A guard whose first firing is a false positive is one
-    commit away from being loosened instead of fixed; anchoring is what the pattern actually
-    meant, and the self-test now pins that a prose mention survives while the heading is
-    rewritten.
+    other entry in §1.** An earlier version used two unbounded regex substitutions, so while
+    `WIP.md` was a rolling log the `### Active Branch:` pattern rewrote every historical
+    heading, the `**Latest commit on main**` pattern matched **nothing at all**, and any
+    branch-specific lines (`**Latest commit on branch**:`, `**Version**:`) were left stale
+    after a merge. `scripts/reset_wip.py` (template v2) now owns a single
+    `<!-- BEGIN merge-pr state -->` / `<!-- END merge-pr state -->` block (inserting it at the
+    top on first run, replacing it in place when present once, and refusing without writing
+    when markers are duplicated, unpaired, or out of order), leaving everything outside the
+    markers byte-for-byte untouched.
+  - **Anchor a marker pattern to full lines.** When `reset_wip.py` v1 first enforced an
+    exact-once match, it fired on its own header — because `WIP.md` named both markers in
+    prose, and an unanchored pattern matched those mentions too. A guard whose first firing is
+    a false positive is one commit away from being loosened instead of fixed; full-line
+    anchoring is what the marker pattern actually means, and the self-test pins that mid-line
+    prose mentions survive untouched.
 - **A double backslash in an agent shell command arrives as a single one** (`~/AGENTS.md` §14),
   before the shell sees it, so a quoted heredoc does not prevent it. Two collapsed backslashes
   sat in this file for eight releases — one of them turning into a real newline and **splitting
