@@ -170,11 +170,8 @@ check: fmt-check clippy standard-check man-check packaging-check text-check wip-
 # WIP.md is gitignored, so `git ls-files` never offers it and this guard cannot reach it.
 # That is a gap rather than a decision -- `wip-check` is what supplies the same guarantee.
 text-check:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    [ "{{PY}}" != "PYTHON-NOT-FOUND" ] || { echo "error: no python3/python on PATH" >&2; exit 1; }
-    "{{PY}}" scripts/text_check.py --self-test
-    "{{PY}}" scripts/text_check.py
+    @"{{PY}}" scripts/text_check.py --self-test
+    @"{{PY}}" scripts/text_check.py
 
 # LF is the base model for every non-binary file in this tree, and `WIP.md` is the one file
 # with nothing enforcing it.
@@ -203,12 +200,9 @@ wip-check:
 
 # Offline packaging guards: templates intact, every channel agrees
 packaging-check:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    [ "{{PY}}" != "PYTHON-NOT-FOUND" ] || { echo "error: no python3/python on PATH" >&2; exit 1; }
-    "{{PY}}" scripts/render_packaging.py --self-test
-    "{{PY}}" scripts/packaging_check.py --self-test
-    "{{PY}}" scripts/packaging_check.py
+    @"{{PY}}" scripts/render_packaging.py --self-test
+    @"{{PY}}" scripts/packaging_check.py --self-test
+    @"{{PY}}" scripts/packaging_check.py
 
 # Pre-PR gate: run all automated checks and print manual checklist before opening a PR.
 # All items must pass before calling `gh pr create`. See AGENTS.md Part 2 §4.
@@ -711,16 +705,7 @@ build-stress:
 
 # Build man pages from man/*.md with mandown (output is TRACKED)
 man:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if ! command -v mandown >/dev/null 2>&1; then
-        echo "ERROR: mandown is required to build man pages (cargo install mandown)" >&2
-        exit 1
-    fi
-    VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-    mandown man/etr.1.md ETR 1  | sed "1s|.*|.TH \"ETR\" \"1\" \"\" \"etr $VERSION\" \"User Commands\"|"  > man/etr.1
-    mandown man/etrs.1.md ETRS 1 | sed "1s|.*|.TH \"ETRS\" \"1\" \"\" \"etr $VERSION\" \"User Commands\"|" > man/etrs.1
-    echo "Built man/etr.1 and man/etrs.1 (version $VERSION)"
+    @"{{PY}}" scripts/man_pages.py --build
 
 # Fail if the man pages are not what `just man` produces -- checked TWICE, against two trees.
 #
@@ -730,8 +715,8 @@ man:
 # safer -- the same reasoning scripts/hooks/pre-push already applies to a missing `just`.
 #
 # 1. WORKTREE: the pages on disk against a rebuild from the sources on disk. Compares BYTES
-#    via cmp, not `git diff --quiet`: on a Syncthing-shared tree checked out on three OSes the
-#    worktree is the thing that gets packaged.
+#    directly in Python (`scripts/man_pages.py`), not `git diff --quiet`: on a Syncthing-shared
+#    tree checked out on three OSes the worktree is the thing that gets packaged.
 # 2. HEAD: the COMMITTED pages against a rebuild from the COMMITTED sources and the COMMITTED
 #    Cargo.toml version. Check 1 alone cannot see a commit that disagrees with itself: on #81
 #    an amend without `git add` committed Cargo.toml at 0.10.6 while the committed `.TH` still
@@ -740,62 +725,12 @@ man:
 #    HEAD is compared with ITSELF, never with the worktree, so uncommitted work in progress
 #    cannot fail it; only a commit that is internally inconsistent can.
 #
-# Rebuilds go to a temp dir so a failing check never leaves a half-written page behind.
+# Rebuilds go to a temp dir inside `man/` so a failing check never leaves a half-written page
+# behind, and `man-check` is a plain recipe (like the other six `just check` targets) so
+# `just check` runs without `bash` or `cygpath`.
 man-check:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    if ! command -v mandown >/dev/null 2>&1; then
-        echo "man-check: mandown not installed — skipping (cargo install mandown)"
-        exit 0
-    fi
-    # Temp files inside the destination directory, never /tmp: on this Syncthing-synced tree
-    # a cross-filesystem `mv` from tmpfs carries the user_tmp_t SELinux label into ~/Sync and
-    # wedges the whole folder (~/AGENTS.md §12). Nothing is moved here, but the same rule
-    # keeps the pattern correct if anyone adds a `mv` later.
-    TMP=$(mktemp -d "man/.man-check.XXXXXX")
-    trap 'rm -rf "$TMP"' EXIT
-    cargo_version() { grep '^version' | head -1 | sed 's/.*"\(.*\)"/\1/'; }
-    # render SRC_MD NAME VERSION OUT -- must stay identical to what `just man` does.
-    render() {
-        mandown "$1" "$2" 1 | sed "1s|.*|.TH \"$2\" \"1\" \"\" \"etr $3\" \"User Commands\"|" > "$4"
-    }
-
-    # 1. Worktree.
-    VERSION=$(cargo_version < Cargo.toml)
-    mkdir "$TMP/wt"
-    render man/etr.1.md  ETR  "$VERSION" "$TMP/wt/etr.1"
-    render man/etrs.1.md ETRS "$VERSION" "$TMP/wt/etrs.1"
-    for p in etr.1 etrs.1; do
-        if ! cmp -s "$TMP/wt/$p" "man/$p"; then
-            echo "error: man/$p is stale — run 'just man' and commit the result." >&2
-            echo "       (the .TH line embeds the version, so a version bump always changes it)" >&2
-            diff -u "man/$p" "$TMP/wt/$p" | head -20 >&2 || true
-            exit 1
-        fi
-    done
-
-    # 2. HEAD, against itself.
-    if ! git rev-parse -q --verify HEAD >/dev/null 2>&1; then
-        echo "man pages are current (version $VERSION); no HEAD commit, committed-tree check skipped"
-        exit 0
-    fi
-    HEAD_VERSION=$(git show HEAD:Cargo.toml | cargo_version)
-    mkdir "$TMP/head"
-    for pair in etr.1:ETR etrs.1:ETRS; do
-        p=${pair%%:*}; name=${pair##*:}
-        git show "HEAD:man/$p.md" > "$TMP/head/$p.md"
-        git show "HEAD:man/$p"    > "$TMP/head/$p.committed"
-        render "$TMP/head/$p.md" "$name" "$HEAD_VERSION" "$TMP/head/$p"
-        if ! cmp -s "$TMP/head/$p" "$TMP/head/$p.committed"; then
-            echo "error: the COMMITTED man/$p (HEAD $(git rev-parse --short HEAD)) is stale for the" >&2
-            echo "       committed Cargo.toml version $HEAD_VERSION, although the worktree copy is current." >&2
-            echo "       Usually a commit or --amend made without staging man/. Fix:" >&2
-            echo "         git add man/etr.1 man/etrs.1 && git commit --amend --no-edit" >&2
-            diff -u "$TMP/head/$p.committed" "$TMP/head/$p" | head -20 >&2 || true
-            exit 1
-        fi
-    done
-    echo "man pages are current (worktree $VERSION, HEAD $HEAD_VERSION)"
+    @"{{PY}}" scripts/man_pages.py --self-test
+    @"{{PY}}" scripts/man_pages.py --check
 
 # ── Local end-to-end testing ─────────────────────────────────────────────────
 
