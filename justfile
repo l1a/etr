@@ -164,8 +164,6 @@ check: fmt-check clippy standard-check man-check packaging-check text-check wip-
 # a bare ` M` in `git status` with NO diff behind it, and the first `git add` clears the status
 # while leaving every carriage return on disk -- so the signal appears exactly once and reads
 # as noise. `git ls-files --eol` (`i/lf w/crlf`) is the oracle that answers properly.
-# (`scripts/text_check.py`'s own docstring still overstates this as "git status CANNOT report
-# it"; it is vendored to two sibling repos and needs a coordinated bump -- see NOTES.md.)
 #
 # WIP.md is gitignored, so `git ls-files` never offers it and this guard cannot reach it.
 # That is a gap rather than a decision -- `wip-check` is what supplies the same guarantee.
