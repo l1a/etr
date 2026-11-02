@@ -27,20 +27,36 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.10.14
+## Current state: v0.10.15
 
-`main` carries **0.10.14**. The newest released tag is **`v0.10.6`**, live on GitHub,
-crates.io, the AUR, COPR and the Homebrew tap; **0.10.7 through 0.10.14 are
+`main` carries **0.10.15**. The newest released tag is **`v0.10.6`**, live on GitHub,
+crates.io, the AUR, COPR and the Homebrew tap; **0.10.7 through 0.10.15 are
 merged and untagged**, all of them tooling or documentation.
 
 The full round trip works on Linux and macOS: SSH bootstrap, QUIC session with pinned
 certificate, PTY, keepalives, reconnect after a drop, `-L`/`-R` TCP and UDP forwarding,
 X11 forwarding, `-4`/`-6` family preference. The Windows **client** works; `etrs` is
-Unix-only by design. 153 tests.
+Unix-only by design. 157 tests.
 
 What is open is listed under **Known gaps / next steps** below.
 
 Recent work worth knowing about, beyond what `git log` says:
+
+- **v0.10.15 — Deadline-advancing busy-wait UDP pacer measures the true UDP forwarding knee.**
+  `tools/stress` (`udp-pump` and `udp-source`) previously paced with a post-send
+  `thread::sleep(Duration::from_micros(pace_us))`, whose ~50–100 µs kernel timer slack plus
+  `send()` time stretched a requested `50 µs` step to ~111 µs (~100 Mb/s ceiling). `Pacer`
+  (`advance_deadline`) now advances an absolute deadline (`next_deadline += step`), sleeps only
+  the coarse prefix beyond `250 µs` (`SPIN_HORIZON`), spins with `std::hint::spin_loop()` for
+  the final window, and clamps lag beyond 8 steps so socket back-pressure never triggers an
+  unpaced catch-up burst. Measured on Fedora 44 loopback (`arrakis`) with `just stress-udp-rate`
+  (1400-byte echo workload, where every datagram crosses the tunnel twice): **112.0 Mb/s offered
+  delivers 111.9 Mb/s (0.0–0.1% loss)** at `100 µs`; loss begins at **`75 µs` (149.0 Mb/s
+  offered, 132.9 Mb/s delivered, 10.8% loss)** and **`50 µs` (223.5 Mb/s offered, 152.0 Mb/s
+  delivered, 32.0% loss)**, asymptoting at **~205–217 Mb/s echo goodput** (~410–434 Mb/s of
+  bidirectional tunnel payload). So the real zero-loss echo knee is **~112 Mb/s** — right where
+  the old `thread::sleep(50us)` happened to land by accident. `tools/stress/Cargo.toml` is now
+  also wired into `just fmt`, `just fmt-check`, `just clippy`, `just test`, and `just pr`.
 
 - **v0.10.11 — Missing COPR credentials fail the release run on `l1a/etr`.** They used to be a
   `::notice::` plus exit 0 on every repo so forks stay green, which also meant a missing secret
@@ -306,7 +322,7 @@ just install-tag 0.9.0
 # Code quality gate — run before every commit
 just check            # fmt + clippy, and: standard-check, man-check, packaging-check,
                       #   text-check, wip-check
-just test             # cargo test (153 tests)
+just test             # cargo test (157 tests, incl. tools/stress)
 
 # Man pages are TRACKED (man/etr.1, man/etrs.1) because tag tarballs carry only tracked
 # files and COPR/Homebrew install them from there. Re-run after every version bump.
@@ -419,10 +435,6 @@ how this section stopped being readable.
 
 ### Measurement
 
-- **The real UDP knee is unmeasured.** Forwarding sustains ≥100 Mb/s at 0% loss, but that is
-  the *pacer's* ceiling, not etr's: `thread::sleep` cannot pace finer than ~100 µs, so a
-  requested 50 µs step lands at ~111 µs ≈ 100 Mb/s. Finding the true knee needs a busy-wait
-  pacer.
 - **Under concurrent multi-gigabit TCP load the UDP forwards deliver ~41 of 100 Mb/s
   offered.** UDP has no flow control and is competing with saturating TCP; whether this is
   contention or a forwarder limit is unmeasured.
@@ -440,7 +452,7 @@ how this section stopped being readable.
   is now `TEMPLATE_VERSION = 2` (with the corrected `git status`/`git diff` CRLF docstring and
   runtime failure message, plus all three repos' control-byte fixtures in `_self_test()`); the two
   sibling repos still carry their v1 copies.
-- **Release**: 0.10.7 through 0.10.14 are merged and untagged. All tooling or documentation;
+- **Release**: 0.10.7 through 0.10.15 are merged and untagged. All tooling or documentation;
   reasonable to batch.
 
 ### Deliberately out of scope
@@ -797,7 +809,7 @@ the GitHub release has been built.
   nothing.
 ---
 
-## Test coverage (153 tests)
+## Test coverage (157 tests)
 
 | Module | What's tested |
 |--------|--------------|
@@ -811,3 +823,4 @@ the GitHub release has been built.
 | `config` | TOML parse (full section, partial, empty), default values, `gateway_ports` / `forward` / `reverse_forward` / `x11` / `x11_trusted` / `address_family` config keys, `merge_defaults` idempotence |
 | `forward` | UDP fast path: `UdpFrameEncoder` byte-identical to the pre-0.9.2 inline encoder (IPv4/IPv6, empty and 65507-byte payloads), alternating peers, port-only change, round trip through the decoder; `datagram_peer_addr` accepts both families and rejects port 0, ports above 65535 and non-literals. `-L`/`-R` spec parsing: TCP/UDP/IPv6, explicit proto, bad port, empty host, Display; bind address parsing (explicit IP, `[::1]`, wildcard `*`); `get_bind_addresses` with and without gateway flag; `resolve_udp_target`: localhost prefers IPv6, explicit IPv4, unresolvable host, `-4` overriding the IPv6-first default, fallback to the other family; `connect_tcp_preferred`: reaches an IPv4 listener, falls back across families, errors on an unresolvable host; `X11Display` parsing |
 | `addrfam` | `AddrPref` from flags / config aliases / `ETRPREFER:` wire values (unknown → `Auto` in every direction), `or` fallback, ssh flag mapping, `order_by_family` (preferred family first, stable within a family, identity for `Auto`, single-family and empty input), `first_routable`, `resolve_preferred`, `family_available` |
+| `tools/stress` | `Pacer::new(0)` unpaced no-op, `advance_deadline` coarse-sleep vs `SPIN_HORIZON` spin-window splitting, `MAX_LAG_STEPS` lag clamping without catch-up bursts, and sub-100 µs (`50 µs`) busy-wait accuracy |
