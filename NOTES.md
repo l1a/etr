@@ -27,10 +27,10 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.10.10
+## Current state: v0.10.11
 
-`main` carries **0.10.10**. The newest released tag is **`v0.10.6`**, live on GitHub,
-crates.io, the AUR, COPR and the Homebrew tap; **0.10.7, 0.10.8, 0.10.9 and 0.10.10 are
+`main` carries **0.10.11**. The newest released tag is **`v0.10.6`**, live on GitHub,
+crates.io, the AUR, COPR and the Homebrew tap; **0.10.7 through 0.10.11 are
 merged and untagged**, all of them tooling or documentation.
 
 The full round trip works on Linux and macOS: SSH bootstrap, QUIC session with pinned
@@ -41,6 +41,16 @@ Unix-only by design. 153 tests.
 What is open is listed under **Known gaps / next steps** below.
 
 Recent work worth knowing about, beyond what `git log` says:
+
+- **v0.10.11 — Missing COPR credentials fail the release run on `l1a/etr`.** They used to be a
+  `::notice::` plus exit 0 on every repo so forks stay green, which also meant a missing secret
+  on the canonical repository reported a green rebuild that submitted nothing (as happened in
+  `rusticprofile`). `.github/workflows/copr.yml` now fails on `l1a/etr` and skips only on forks,
+  and `scripts/packaging_check.py` (in `just check`) executes the real workflow step under bash
+  across all four cases (canonical repo without credentials, canonical repo with partial
+  credentials, fork without credentials, canonical repo with credentials). The COPR API token on
+  `corrino` (`~/.config/copr`) expires **2027-02-27** — renew the CLI token and the repo secrets
+  together; an expired non-empty token gets past the empty check and fails at `copr-cli`.
 
 - **v0.10.10 — `NOTES.md` and `WIP.md` pruned to their jobs.** This file stops being a
   changelog (see the header); `WIP.md` now carries only work in flight, with its scope
@@ -442,7 +452,7 @@ how this section stopped being readable.
   two patterns matches exactly once, which closes the class; retch went further in its #259,
   regenerating only the text between its own `BEGIN`/`END` markers and refusing on duplicated
   or unpaired ones. Worth adopting if `WIP.md`'s layout ever needs to move.
-- **Release**: 0.10.7 through 0.10.10 are merged and untagged. All tooling or documentation;
+- **Release**: 0.10.7 through 0.10.11 are merged and untagged. All tooling or documentation;
   reasonable to batch.
 
 ### Deliberately out of scope

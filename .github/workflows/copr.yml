@@ -64,10 +64,17 @@ jobs:
           COPR_TOKEN: ${{ secrets.COPR_TOKEN }}
         run: |
           set -euo pipefail
-          # Guard rather than fail: a fork has no secrets, and a red check there would be
-          # noise about a credential the fork is not supposed to have.
+          # A fork has no secrets, and a red check there would be noise about a credential the
+          # fork is not supposed to have, so a fork skips. THIS repo must fail instead: a skip
+          # that exits 0 here reports a green rebuild that submitted nothing, which is how
+          # rusticprofile's identical guard hid its never-added secrets for weeks (2026-09).
+          # scripts/packaging_check.py --self-test runs this step to hold both halves.
           if [ -z "${COPR_LOGIN:-}" ] || [ -z "${COPR_TOKEN:-}" ] || [ -z "${COPR_USERNAME:-}" ]; then
-            echo "::notice::COPR credentials not configured; skipping the rebuild"
+            if [ "${GITHUB_REPOSITORY:-}" = "l1a/etr" ]; then
+              echo "::error::COPR credentials missing on l1a/etr; nothing would be rebuilt. Set COPR_LOGIN, COPR_USERNAME and COPR_TOKEN."
+              exit 1
+            fi
+            echo "::notice::COPR credentials not configured on this fork; skipping the rebuild"
             echo "skip=true" >> "$GITHUB_ENV"
             exit 0
           fi

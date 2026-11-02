@@ -391,8 +391,9 @@ the recipes assume:
   to it; `just brew-publish` handles an empty tap, including pinning its default branch.
 - **COPR**: the `kentobias/etr` project, with **"Enable internet access during builds" ON**
   (the spec resolves crates.io at build time and there is no vendor tarball), plus the
-  `COPR_LOGIN` / `COPR_USERNAME` / `COPR_TOKEN` repository secrets for `copr.yml`. Without
-  the secrets that workflow *skips* rather than fails, so a fork does not go red — which also
-  means a missing secret looks like success. Check the run's log for the skip notice.
+  `COPR_LOGIN` / `COPR_USERNAME` / `COPR_TOKEN` repository secrets for `copr.yml`. On a fork
+  without those secrets that workflow *skips* rather than fails, so a fork does not go red; on
+  `l1a/etr` an empty secret fails the workflow outright. (An expired non-empty token still passes
+  the empty check and fails at the `copr-cli` call; always verify from COPR itself per §6.)
 
 ---
