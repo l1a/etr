@@ -3,7 +3,7 @@
 # Copyright (C) 2026 l1a
 """Build and check the tracked man pages (man/etr.1, man/etrs.1) without a POSIX shell.
 
-TEMPLATE v1 — run by `just man` (`--build`) and `just man-check` (`--self-test` + `--check`).
+TEMPLATE v2 — run by `just man` (`--build`) and `just man-check` (`--self-test` + `--check`).
 
 WHY THIS IS PYTHON RATHER THAN A BASH SHEBANG RECIPE
 ----------------------------------------------------
@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import os
 import re
 import shutil
 import subprocess
@@ -37,7 +38,29 @@ import tempfile
 from pathlib import Path
 from typing import Callable
 
-TEMPLATE_VERSION = 1
+TEMPLATE_VERSION = 2
+
+# Every repository-scoped variable listed by `git rev-parse --local-env-vars`. Inherited from a
+# git hook (`pre-push`, `pre-commit`), a linked worktree, or `git -c ...` in a parent process,
+# any of these will redirect a `cwd=repo_root` git call away from `repo_root` and onto the
+# caller's repository or config.
+_GIT_LOCAL_ENV_VARS: tuple[str, ...] = (
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_CONFIG",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_DIR",
+    "GIT_GRAFT_FILE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_PREFIX",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_SHALLOW_FILE",
+    "GIT_WORK_TREE",
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -112,10 +135,39 @@ def build_pages(
     return 0, f"Built man/etr.1 and man/etrs.1 (version {version})"
 
 
+def _git_env(repo_root: Path, *, isolate_config: bool = False) -> dict[str, str]:
+    """Return a clean environment where `repo_root` is the only git repository in scope.
+
+    Stripping `_GIT_LOCAL_ENV_VARS` prevents an inherited `GIT_DIR` or `GIT_INDEX_FILE` (e.g.
+    when `just check` is invoked from `scripts/hooks/pre-push` or a linked worktree) from
+    redirecting `git` calls away from `repo_root`. When `isolate_config=True` (used for
+    `--self-test` fixtures), system and user git configs (`commit.gpgsign`, `core.hooksPath`,
+    etc.) are also disconnected so throwaway fixture commits never sign, prompt, or run user
+    hooks.
+    """
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in _GIT_LOCAL_ENV_VARS
+        and not k.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
+    }
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    if isolate_config:
+        for k in list(env):
+            if k.startswith(("GIT_AUTHOR_", "GIT_COMMITTER_")):
+                del env[k]
+        env["GIT_CONFIG_NOSYSTEM"] = "1"
+        env["GIT_CONFIG_GLOBAL"] = os.devnull
+        env["HOME"] = str(repo_root)
+        env["XDG_CONFIG_HOME"] = str(repo_root)
+    return env
+
+
 def _git_has_head(repo_root: Path) -> bool:
     proc = subprocess.run(
-        ["git", "rev-parse", "-q", "--verify", "HEAD"],
+        ["git", "-C", str(repo_root), "rev-parse", "-q", "--verify", "HEAD"],
         cwd=repo_root,
+        env=_git_env(repo_root),
         capture_output=True,
         check=False,
     )
@@ -124,8 +176,9 @@ def _git_has_head(repo_root: Path) -> bool:
 
 def _git_short_head(repo_root: Path) -> str:
     proc = subprocess.run(
-        ["git", "rev-parse", "--short", "HEAD"],
+        ["git", "-C", str(repo_root), "rev-parse", "--short", "HEAD"],
         cwd=repo_root,
+        env=_git_env(repo_root),
         capture_output=True,
         text=True,
         check=True,
@@ -135,8 +188,9 @@ def _git_short_head(repo_root: Path) -> str:
 
 def _git_show_bytes(repo_root: Path, rev_path: str) -> bytes:
     proc = subprocess.run(
-        ["git", "show", rev_path],
+        ["git", "-C", str(repo_root), "show", rev_path],
         cwd=repo_root,
+        env=_git_env(repo_root),
         capture_output=True,
         check=False,
     )
@@ -230,6 +284,17 @@ def _stub_renderer(md_path: Path, name: str, version: str) -> bytes:
     return rewrite_th_header(raw, name, version)
 
 
+def _git_fixture(root: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
+    """Run a `git` command against the throwaway `root` fixture in a fully isolated env."""
+    return subprocess.run(
+        ["git", "-C", str(root), *args],
+        cwd=root,
+        env=_git_env(root, isolate_config=True),
+        check=True,
+        capture_output=True,
+    )
+
+
 def _init_fixture_repo(root: Path, version: str = "0.1.0") -> None:
     (root / "man").mkdir(parents=True, exist_ok=True)
     (root / "Cargo.toml").write_bytes(
@@ -239,15 +304,17 @@ def _init_fixture_repo(root: Path, version: str = "0.1.0") -> None:
     (root / "man" / "etrs.1.md").write_bytes(b"# etrs(1)\nServer manual.\n")
     code, _ = build_pages(root, renderer=_stub_renderer)
     assert code == 0
-    for cmd in (
-        ["git", "init", "-q"],
-        ["git", "config", "user.email", "test@example.com"],
-        ["git", "config", "user.name", "Test"],
-        ["git", "config", "core.autocrlf", "false"],
-        ["git", "add", "Cargo.toml", "man/etr.1.md", "man/etrs.1.md", "man/etr.1", "man/etrs.1"],
-        ["git", "commit", "-q", "-m", "initial"],
+    for args in (
+        ("init", "-q"),
+        ("config", "user.email", "test@example.com"),
+        ("config", "user.name", "Test"),
+        ("config", "core.autocrlf", "false"),
+        ("config", "commit.gpgsign", "false"),
+        ("config", "tag.gpgsign", "false"),
+        ("add", "Cargo.toml", "man/etr.1.md", "man/etrs.1.md", "man/etr.1", "man/etrs.1"),
+        ("commit", "-q", "--no-gpg-sign", "--no-verify", "-m", "initial"),
     ):
-        subprocess.run(cmd, cwd=root, check=True, capture_output=True)
+        _git_fixture(root, *args)
 
 
 def self_test() -> int:
@@ -308,15 +375,8 @@ def self_test() -> int:
 
         # 3c. Committing Cargo.toml at 0.1.1 WITHOUT staging man/ (#81 regression) must fail
         #     the HEAD check even though the worktree copies on disk are already at 0.1.1.
-        subprocess.run(
-            ["git", "add", "Cargo.toml"], cwd=root, check=True, capture_output=True
-        )
-        subprocess.run(
-            ["git", "commit", "-q", "-m", "bump without man"],
-            cwd=root,
-            check=True,
-            capture_output=True,
-        )
+        _git_fixture(root, "add", "Cargo.toml")
+        _git_fixture(root, "commit", "-q", "--no-gpg-sign", "--no-verify", "-m", "bump without man")
         code, msg = check_pages(root, renderer=_stub_renderer)
         assert_true(
             "HEAD internal inconsistency (#81) caught while worktree is current",
@@ -325,17 +385,9 @@ def self_test() -> int:
         )
 
         # 3d. Amending the man pages into HEAD restores consistency.
-        subprocess.run(
-            ["git", "add", "man/etr.1", "man/etrs.1"],
-            cwd=root,
-            check=True,
-            capture_output=True,
-        )
-        subprocess.run(
-            ["git", "commit", "-q", "--amend", "--no-edit"],
-            cwd=root,
-            check=True,
-            capture_output=True,
+        _git_fixture(root, "add", "man/etr.1", "man/etrs.1")
+        _git_fixture(
+            root, "commit", "-q", "--amend", "--no-edit", "--no-gpg-sign", "--no-verify"
         )
         code, msg = check_pages(root, renderer=_stub_renderer)
         assert_true(
@@ -352,6 +404,65 @@ def self_test() -> int:
             "CRLF byte drift in man/etrs.1 caught",
             code == 1 and "man/etrs.1 is stale" in msg,
             f"code={code} msg={msg!r}",
+        )
+
+    # 4. Git environment & config isolation (#89 review): inherited GIT_DIR / GIT_WORK_TREE /
+    #    GIT_INDEX_FILE (as set by git hooks or worktrees) and global commit.gpgsign / hooksPath
+    #    must neither corrupt an outer repository nor fail the fixture.
+    with tempfile.TemporaryDirectory() as d:
+        base = Path(d)
+        victim = base / "victim"
+        victim.mkdir()
+        _init_fixture_repo(victim, "9.9.9")
+        _git_fixture(victim, "config", "user.name", "RealUser")
+        _git_fixture(victim, "config", "user.email", "real@example.com")
+        victim_head_before = _git_short_head(victim)
+
+        poison_gitconfig = base / "poison.gitconfig"
+        poison_gitconfig.write_text(
+            "[commit]\n\tgpgsign = true\n"
+            "[gpg]\n\tprogram = /nonexistent/gpg-must-not-run\n"
+            "[core]\n\thooksPath = /nonexistent/hooks-must-not-run\n",
+            encoding="utf-8",
+        )
+
+        fixture = base / "fixture"
+        fixture.mkdir()
+        saved_env = os.environ.copy()
+        try:
+            os.environ["GIT_DIR"] = str(victim / ".git")
+            os.environ["GIT_WORK_TREE"] = str(victim)
+            os.environ["GIT_INDEX_FILE"] = str(victim / ".git" / "index")
+            os.environ["GIT_CONFIG_GLOBAL"] = str(poison_gitconfig)
+            os.environ["GIT_CONFIG_COUNT"] = "2"
+            os.environ["GIT_CONFIG_KEY_0"] = "commit.gpgsign"
+            os.environ["GIT_CONFIG_VALUE_0"] = "true"
+            os.environ["GIT_CONFIG_KEY_1"] = "gpg.program"
+            os.environ["GIT_CONFIG_VALUE_1"] = "/nonexistent/gpg-must-not-run"
+            os.environ["GIT_CONFIG_PARAMETERS"] = (
+                "'commit.gpgsign=true' 'gpg.program=/nonexistent/gpg-must-not-run'"
+            )
+
+            _init_fixture_repo(fixture, "0.2.0")
+            code, msg = check_pages(fixture, renderer=_stub_renderer)
+        finally:
+            os.environ.clear()
+            os.environ.update(saved_env)
+
+        assert_true(
+            "fixture succeeds under poisoned GIT_DIR and commit.gpgsign",
+            code == 0 and "worktree 0.2.0, HEAD 0.2.0" in msg,
+            f"code={code} msg={msg!r}",
+        )
+        victim_name = _git_fixture(victim, "config", "user.name").stdout.decode("utf-8").strip()
+        victim_email = _git_fixture(victim, "config", "user.email").stdout.decode("utf-8").strip()
+        victim_head_after = _git_short_head(victim)
+        assert_true(
+            "outer repository config and HEAD untouched by fixture under GIT_DIR",
+            victim_name == "RealUser"
+            and victim_email == "real@example.com"
+            and victim_head_after == victim_head_before,
+            f"name={victim_name!r} email={victim_email!r} head={victim_head_before}->{victim_head_after}",
         )
 
     if failures:
