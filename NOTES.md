@@ -27,11 +27,11 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.10.16
+## Current state: v0.10.17
 
-`main` carries **0.10.16**. The newest released tag is **`v0.10.15`**, live on GitHub,
-crates.io, the AUR, COPR and the Homebrew tap; **0.10.16 is merged and untagged**
-(documentation).
+`main` carries **0.10.17**. The newest released tag is **`v0.10.15`**, live on GitHub,
+crates.io, the AUR, COPR and the Homebrew tap; **0.10.16–0.10.17 are merged and untagged**
+(documentation and tooling hygiene).
 
 The full round trip works on Linux and macOS: SSH bootstrap, QUIC session with pinned
 certificate, PTY, keepalives, reconnect after a drop, `-L`/`-R` TCP and UDP forwarding,
@@ -554,6 +554,15 @@ not a check.** Watch every guard fail on the defect it exists to catch, before b
 - **A structural check proves a guard is present, not that it works.** `gate_conformance.py`
   asserts the `pr`/`open-pr`/`merge-pr` guards exist because executing those recipes from
   `check` would be slow and occasionally destructive. It says so rather than implying more.
+- **A `--self-test` that runs `git` in a throwaway directory must strip `git rev-parse
+  --local-env-vars` and isolate git config.** `just check` runs inside `scripts/hooks/pre-push`
+  (and may run in a linked worktree or under `git -c ...`). Passing only `cwd=fixture` leaves
+  inherited `GIT_DIR`, `GIT_WORK_TREE` and `GIT_INDEX_FILE` in `os.environ`, which override
+  `cwd` discovery and point the fixture's `git config`, `git add` and `git commit` at the live
+  repository, while global `commit.gpgsign = true` or `core.hooksPath` breaks or hangs the
+  throwaway commits. `scripts/man_pages.py` (`TEMPLATE_VERSION = 2`) strips all local `GIT_*`
+  variables and sets `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=os.devnull`, `HOME` and
+  `XDG_CONFIG_HOME` to the fixture root, and `--no-gpg-sign --no-verify`.
 
 ### 3. Transport and runtime
 
