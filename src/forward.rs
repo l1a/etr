@@ -549,27 +549,21 @@ impl X11Display {
     }
 }
 
-/// Retrieve the X11 auth protocol and key (cookie) for the specified display string.
+/// Maximum number of concurrent per-peer UDP sender sockets kept open on a single UDP
+/// forward specification (`-L .../udp` or `-R .../udp`).
 ///
-/// Runs `xauth list` and matches the parsed display number or falls back to
-/// the first available `MIT-MAGIC-COOKIE-1` entry.
-pub fn get_xauth_cookie(display_str: &str) -> Result<(String, Vec<u8>), String> {
-    let display = X11Display::parse(display_str)?;
-    let target_num = display.display_num();
+/// Each active UDP peer holds an ephemeral `UdpSocket` file descriptor and a spawned
+/// reply-reader task with a 64 KiB receive buffer. Bounding the map prevents a flood of
+/// packets with varying source ports from exhausting `RLIMIT_NOFILE` (`EMFILE`) or memory;
+/// when the cap is reached, the least-recently-active peer is evicted and its reply task is
+/// aborted.
+pub const MAX_UDP_SENDERS: usize = 256;
 
-    let output = std::process::Command::new("xauth")
-        .arg("list")
-        .output()
-        .map_err(|e| format!("failed to execute xauth: {e}"))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "xauth failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
+/// Parse `xauth list` output and return the `(protocol, cookie_bytes)` for `target_num`.
+///
+/// Only entries whose display number matches `target_num` are accepted; entries for other
+/// displays are never returned as a fallback.
+pub fn parse_xauth_list_for_display(stdout: &str, target_num: u16) -> Option<(String, Vec<u8>)> {
     for line in stdout.lines() {
         let fields: Vec<&str> = line.split_whitespace().collect();
         if fields.len() < 3 {
@@ -592,23 +586,135 @@ pub fn get_xauth_cookie(display_str: &str) -> Result<(String, Vec<u8>), String> 
                 && num == target_num
                 && let Some(cookie) = hex_decode(cookie_hex)
             {
-                return Ok((proto.to_string(), cookie));
+                return Some((proto.to_string(), cookie));
+            }
+        }
+    }
+    None
+}
+
+/// Retrieve the X11 auth protocol and key (cookie) for the specified display string.
+///
+/// Runs `xauth list` and matches the parsed display number strictly (never falling back to an
+/// unrelated display's cookie).
+pub fn get_xauth_cookie(display_str: &str) -> Result<(String, Vec<u8>), String> {
+    let display = X11Display::parse(display_str)?;
+    let target_num = display.display_num();
+
+    let output = std::process::Command::new("xauth")
+        .arg("list")
+        .output()
+        .map_err(|e| format!("failed to execute xauth: {e}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "xauth failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_xauth_list_for_display(&stdout, target_num)
+        .ok_or_else(|| format!("no xauth cookie found for display {}", display_str))
+}
+
+/// Retrieve an X11 authentication cookie for `display_str`, honouring untrusted (`-X`) vs
+/// trusted (`-Y`) forwarding mode.
+///
+/// When `trusted` is `false` (`-X`), attempts to generate an untrusted XSECURITY cookie via
+/// `xauth -f <temp> generate <display> MIT-MAGIC-COOKIE-1 untrusted`. If the local X server
+/// does not support the SECURITY extension (e.g. Xwayland), logs a warning and falls back to
+/// [`get_xauth_cookie`].
+pub fn get_xauth_cookie_for_mode(
+    display_str: &str,
+    trusted: bool,
+) -> Result<(String, Vec<u8>), String> {
+    if trusted {
+        return get_xauth_cookie(display_str);
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let display = X11Display::parse(display_str)?;
+        let target_num = display.display_num();
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "etr-xauth-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        match std::fs::DirBuilder::new().mode(0o700).create(&tmp_dir) {
+            Ok(()) => {
+                let tmp_file = tmp_dir.join("Xauthority");
+                let gen_out = std::process::Command::new("xauth")
+                    .arg("-f")
+                    .arg(&tmp_file)
+                    .args([
+                        "generate",
+                        display_str,
+                        "MIT-MAGIC-COOKIE-1",
+                        "untrusted",
+                        "timeout",
+                        "1800",
+                    ])
+                    .output();
+
+                let untrusted_result: Result<(String, Vec<u8>), String> = match gen_out {
+                    Ok(out) if out.status.success() => {
+                        match std::process::Command::new("xauth")
+                            .arg("-f")
+                            .arg(&tmp_file)
+                            .arg("list")
+                            .output()
+                        {
+                            Ok(list_out) if list_out.status.success() => {
+                                let s = String::from_utf8_lossy(&list_out.stdout);
+                                parse_xauth_list_for_display(&s, target_num).ok_or_else(|| {
+                                    format!(
+                                        "generated Xauthority had no matching cookie for display :{target_num}"
+                                    )
+                                })
+                            }
+                            Ok(list_out) => Err(format!(
+                                "xauth list on generated cookie failed: {}",
+                                String::from_utf8_lossy(&list_out.stderr).trim()
+                            )),
+                            Err(e) => Err(format!("failed to run xauth list: {e}")),
+                        }
+                    }
+                    Ok(out) => Err(format!(
+                        "xauth generate untrusted failed: {}",
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    )),
+                    Err(e) => Err(format!("failed to run xauth generate untrusted: {e}")),
+                };
+
+                let _ = std::fs::remove_dir_all(&tmp_dir);
+                match untrusted_result {
+                    Ok(cookie) => return Ok(cookie),
+                    Err(reason) => {
+                        eprintln!("[etr] warning: {reason}; falling back to standard xauth cookie");
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "[etr] warning: failed to create temporary xauth directory {}: {e}; falling back to standard xauth cookie",
+                    tmp_dir.display()
+                );
             }
         }
     }
 
-    // Fallback: first MIT-MAGIC-COOKIE-1 entry
-    for line in stdout.lines() {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() >= 3
-            && fields[1] == "MIT-MAGIC-COOKIE-1"
-            && let Some(cookie) = hex_decode(fields[2])
-        {
-            return Ok((fields[1].to_string(), cookie));
-        }
-    }
+    #[cfg(not(unix))]
+    eprintln!(
+        "[etr] warning: untrusted X11 cookie generation is not supported on this platform; falling back to standard xauth cookie"
+    );
 
-    Err(format!("no xauth cookie found for display {}", display_str))
+    get_xauth_cookie(display_str)
 }
 
 /// Reusable encoder for the UDP forwarding hot path.
@@ -880,5 +986,25 @@ mod udp_fastpath_tests {
         // Already-bracketed text is not what the wire carries, and must not be accepted as a
         // bare IP literal.
         assert_eq!(datagram_peer_addr("[::1]", 53), None);
+    }
+
+    #[test]
+    fn parse_xauth_list_matches_exact_display_and_refuses_unrelated_fallback() {
+        let sample = "\
+host/unix:0  MIT-MAGIC-COOKIE-1  00112233445566778899aabbccddeeff
+host/unix:10  MIT-MAGIC-COOKIE-1  fedcba9876543210fedcba9876543210
+";
+        let (proto0, cookie0) = parse_xauth_list_for_display(sample, 0).expect("display 0 present");
+        assert_eq!(proto0, "MIT-MAGIC-COOKIE-1");
+        assert_eq!(cookie0.len(), 16);
+        assert_eq!(cookie0[0], 0x00);
+
+        let (proto10, cookie10) =
+            parse_xauth_list_for_display(sample, 10).expect("display 10 present");
+        assert_eq!(proto10, "MIT-MAGIC-COOKIE-1");
+        assert_eq!(cookie10[0], 0xfe);
+
+        // Display :2 is absent — must NOT fall back to display :0's cookie.
+        assert_eq!(parse_xauth_list_for_display(sample, 2), None);
     }
 }

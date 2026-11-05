@@ -13,7 +13,7 @@ use etr::addrfam::AddrPref;
 use etr::config::Config;
 use etr::forward::ForwardSpec;
 #[cfg(unix)]
-use etr::forward::{X11Display, get_xauth_cookie};
+use etr::forward::{X11Display, get_xauth_cookie_for_mode};
 use etr::protocol::{
     Envelope, ForwardProto, Heartbeat, Payload, SessionOpen, StreamOpen, TerminalResize,
     UdpDatagram,
@@ -300,13 +300,17 @@ macro_rules! vlog {
 
 fn client_log_path() -> std::path::PathBuf {
     dirs::state_dir()
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-                .join(".local/state")
-        })
-        .join("etr")
+        .or_else(|| dirs::home_dir().map(|h| h.join(".local/state")))
+        .map(|d| d.join("etr"))
+        .unwrap_or_else(etr::config::fallback_tmp_state_dir)
         .join("etr.log")
+}
+
+/// Open (or create) the client log file with restrictive `0600` permissions (and `0700` parent
+/// directory permissions on Unix), refusing symlinks, `..` traversal, and untrusted intermediate
+/// directories.
+fn open_private_log_file(log_path: &std::path::Path) -> io::Result<std::fs::File> {
+    etr::config::open_private_log_file(log_path)
 }
 
 #[derive(Parser, Debug)]
@@ -374,11 +378,11 @@ struct Cli {
     #[arg(long = "env", value_name = "KEY[=VALUE]")]
     env: Vec<String>,
 
-    /// Enable X11 forwarding
+    /// Enable untrusted X11 forwarding
     #[arg(short = 'X')]
     x11: bool,
 
-    /// Enable trusted X11 forwarding (treated same as -X)
+    /// Enable trusted X11 forwarding
     #[arg(short = 'Y')]
     x11_trusted: bool,
 
@@ -499,14 +503,7 @@ async fn main() -> io::Result<()> {
             .clone()
             .or_else(|| cfg.client.log_path.as_ref().map(std::path::PathBuf::from))
             .unwrap_or_else(client_log_path);
-        if let Some(parent) = log_path.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
-        {
+        match open_private_log_file(&log_path) {
             Ok(f) => {
                 eprintln!("[etr] Verbose log → {}", log_path.display());
                 let _ = LOG_FILE.set(std::sync::Mutex::new(f));
@@ -623,14 +620,22 @@ async fn main() -> io::Result<()> {
     let mut locale_prefix: Vec<String> = locale_keys
         .iter()
         .filter(|k| !env_vars.iter().any(|e| e.starts_with(&format!("{k}="))))
-        .filter_map(|k| std::env::var(k).ok().map(|v| format!("{k}={v}")))
+        .filter_map(|k| {
+            std::env::var(k)
+                .ok()
+                .filter(|v| !v.contains(['\n', '\r', '\0']))
+                .map(|v| format!("{k}={v}"))
+        })
         .collect();
     locale_prefix.append(&mut env_vars);
     let env_vars = locale_prefix;
 
     let session_id = generate_session_id();
     let passkey = generate_passkey();
-    let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
+    let term = std::env::var("TERM")
+        .ok()
+        .filter(|t| !t.contains(['\n', '\r', '\0']))
+        .unwrap_or_else(|| "xterm-256color".to_string());
 
     vlog!(
         cli.verbose,
@@ -668,10 +673,8 @@ async fn main() -> io::Result<()> {
         None
     };
 
-    let x11_enabled = cli.x11
-        || cli.x11_trusted
-        || cfg.client.x11.unwrap_or(false)
-        || cfg.client.x11_trusted.unwrap_or(false);
+    let x11_trusted = cli.x11_trusted || cfg.client.x11_trusted.unwrap_or(false);
+    let x11_enabled = cli.x11 || cfg.client.x11.unwrap_or(false) || x11_trusted;
 
     let (server_port, server_cert) = match bootstrap_ssh(
         &target,
@@ -718,7 +721,7 @@ async fn main() -> io::Result<()> {
     #[cfg(unix)]
     if x11_enabled {
         match std::env::var("DISPLAY") {
-            Ok(disp) => match get_xauth_cookie(&disp) {
+            Ok(disp) => match get_xauth_cookie_for_mode(&disp, x11_trusted) {
                 Ok((proto, cookie)) => {
                     x11_auth_proto = proto;
                     x11_auth_cookie = cookie;
@@ -788,6 +791,74 @@ fn generate_passkey() -> String {
         .collect()
 }
 
+/// Quote a single argument for safe evaluation by a remote POSIX shell (`sh -c`).
+///
+/// OpenSSH concatenates remote command arguments with spaces and hands the resulting
+/// string to the remote user's login shell. Wrapping unsafe strings in single quotes and
+/// escaping any embedded `'` as `'\''` prevents spaces and shell metacharacters (`;`, `$()`,
+/// backticks, `&`, `|`) in `--server-path` or `--server-log-path` from being split or
+/// evaluated on the remote host, while preserving leading `~/` tilde expansion.
+fn posix_shell_quote(s: &str) -> String {
+    if s == "~" {
+        return "~".to_string();
+    }
+    if let Some(rest) = s.strip_prefix("~/") {
+        if rest.is_empty() {
+            return "~/".to_string();
+        }
+        return format!("~/{}", posix_shell_quote(rest));
+    }
+    if !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/' | b':'))
+    {
+        return s.to_string();
+    }
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Validate SSH target and line-delimited bootstrap inputs before spawning `ssh`.
+///
+/// Rejects targets starting with `-` (preventing `ssh` option injection such as
+/// `-oProxyCommand=...`) and rejects embedded newlines, carriage returns, or NUL bytes in
+/// `term`, `env_vars`, or `remote_command` (preventing line-framing injection into `etrs`).
+fn validate_bootstrap_inputs(
+    target: &str,
+    term: &str,
+    env_vars: &[String],
+    remote_command: Option<&str>,
+) -> io::Result<()> {
+    if target.is_empty() || target.starts_with('-') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid SSH target {target:?}: target must not be empty or start with '-'"),
+        ));
+    }
+    if term.contains(['\n', '\r', '\0']) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "TERM contains invalid control character (newline or NUL)",
+        ));
+    }
+    for kv in env_vars {
+        if kv.contains(['\n', '\r', '\0']) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "environment variable contains invalid control character (newline or NUL)",
+            ));
+        }
+    }
+    if let Some(cmd) = remote_command
+        && cmd.contains(['\n', '\r', '\0'])
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "remote command must not contain raw newlines or NUL bytes",
+        ));
+    }
+    Ok(())
+}
+
 /// SSH to the target, start `etrs`, send session credentials, and read back
 /// the QUIC port and server cert DER from etrs stdout.
 #[allow(clippy::too_many_arguments)]
@@ -806,6 +877,7 @@ fn bootstrap_ssh(
     addr_pref: AddrPref,
     verbose: u8,
 ) -> io::Result<(u16, Vec<u8>)> {
+    validate_bootstrap_inputs(target, term, env_vars, remote_command)?;
     let session_id_hex = hex_encode(session_id);
     let v_flag = match verbose {
         0 => String::new(),
@@ -818,10 +890,11 @@ fn bootstrap_ssh(
     if let Some(flag) = ssh_family_flag {
         cmd.arg(flag);
     }
+    cmd.arg("--");
     cmd.arg(target);
-    cmd.arg(server_path);
+    cmd.arg(posix_shell_quote(server_path));
     if let Some(log_path) = server_log_path {
-        cmd.arg("--log-path").arg(log_path);
+        cmd.arg("--log-path").arg(posix_shell_quote(log_path));
     }
     if !v_flag.is_empty() {
         cmd.arg(&v_flag);
@@ -977,12 +1050,10 @@ async fn run_connection_loop(
             if verbose >= 3
                 && let Some(f) = LOG_FILE.get()
             {
-                let hex: String = buf[..n]
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let _ = writeln!(f.lock().unwrap(), "[etr] stdin raw bytes: {hex}");
+                let _ = writeln!(
+                    f.lock().unwrap(),
+                    "[etr] stdin raw bytes: {n} bytes (redacted)"
+                );
             }
             let mut out = Vec::with_capacity(n);
             for &b in &buf[..n] {
@@ -1559,11 +1630,18 @@ async fn run_session(
     }
 
     // ── Reverse forward stream acceptor task ──────────────────────────────
+    let parsed_reverse_specs: Arc<Vec<ForwardSpec>> = Arc::new(
+        reverse_forward_specs
+            .iter()
+            .filter_map(|s| ForwardSpec::parse(s).ok())
+            .collect(),
+    );
     let conn_clone = conn.clone();
     let verbose_clone = verbose;
     let reverse_acceptor_handle = tokio::spawn(async move {
         while let Ok((mut quic_send, mut quic_recv)) = conn_clone.accept_bi().await {
             let verbose = verbose_clone;
+            let allowed_reverse_specs = Arc::clone(&parsed_reverse_specs);
             tokio::spawn(async move {
                 let tag = match quic::read_tag(&mut quic_recv).await {
                     Ok(t) => t,
@@ -1584,6 +1662,18 @@ async fn run_session(
                     },
                     _ => return,
                 };
+                if !is_authorized_reverse_stream(&so, x11_enabled, &allowed_reverse_specs) {
+                    vlog!(
+                        verbose,
+                        1,
+                        "[etr] rejected unauthorized server StreamOpen (type={}, target={}:{})",
+                        so.stream_type,
+                        so.remote_host,
+                        so.remote_port
+                    );
+                    let _ = quic_send.finish();
+                    return;
+                }
                 if so.stream_type == etr::protocol::StreamType::X11 as i32 {
                     #[cfg(unix)]
                     {
@@ -1670,6 +1760,13 @@ async fn run_session(
                         // routed back to the correct sender.
                         const SENDER_IDLE: Duration = Duration::from_secs(30);
 
+                        struct AbortOnDrop(tokio::task::JoinHandle<()>);
+                        impl Drop for AbortOnDrop {
+                            fn drop(&mut self) {
+                                self.0.abort();
+                            }
+                        }
+
                         let (reply_tx, mut reply_rx) = udp_mpsc::channel::<Envelope>(256);
 
                         let mut quic_send = quic_send;
@@ -1689,8 +1786,10 @@ async fn run_session(
 
                         let verbose_send = verbose;
                         let mut send_task = tokio::spawn(async move {
-                            let mut sender_map: HashMap<(String, u32), (Arc<UdpSocket>, Instant)> =
-                                HashMap::new();
+                            let mut sender_map: HashMap<
+                                (String, u32),
+                                (Arc<UdpSocket>, Instant, AbortOnDrop),
+                            > = HashMap::new();
 
                             while let Ok(Some(env)) = quic::read_msg(&mut quic_recv).await {
                                 if let Some(Payload::UdpDatagram(dg)) = env.payload {
@@ -1700,11 +1799,11 @@ async fn run_session(
                                     let key = (dg.peer_addr.clone(), dg.peer_port);
                                     let now = Instant::now();
 
-                                    sender_map.retain(|_, (_, last)| {
+                                    sender_map.retain(|_, (_, last, _)| {
                                         now.duration_since(*last) < SENDER_IDLE
                                     });
 
-                                    let socket = if let Some((sock, last)) =
+                                    let socket = if let Some((sock, last, _)) =
                                         sender_map.get_mut(&key)
                                     {
                                         *last = now;
@@ -1722,7 +1821,14 @@ async fn run_session(
                                                 continue;
                                             }
                                         };
-                                        sender_map.insert(key.clone(), (Arc::clone(&sock), now));
+                                        if sender_map.len() >= etr::forward::MAX_UDP_SENDERS
+                                            && let Some(oldest_key) = sender_map
+                                                .iter()
+                                                .min_by_key(|(_, (_, last, _))| *last)
+                                                .map(|(k, _)| k.clone())
+                                        {
+                                            sender_map.remove(&oldest_key);
+                                        }
 
                                         // Per-sender reply task: reads local-target replies
                                         // and forwards them back with the original sender's
@@ -1732,7 +1838,7 @@ async fn run_session(
                                         let sock_r = Arc::clone(&sock);
                                         let tx = reply_tx.clone();
                                         let vr = verbose_send;
-                                        tokio::spawn(async move {
+                                        let reader_handle = tokio::spawn(async move {
                                             let mut buf = vec![0u8; 65535];
                                             while let Ok(Ok((n, src))) = tokio::time::timeout(
                                                 SENDER_IDLE,
@@ -1759,6 +1865,10 @@ async fn run_session(
                                                 }
                                             }
                                         });
+                                        sender_map.insert(
+                                            key.clone(),
+                                            (Arc::clone(&sock), now, AbortOnDrop(reader_handle)),
+                                        );
 
                                         sock
                                     };
@@ -1831,6 +1941,33 @@ async fn run_session(
 }
 
 // ── Forward helpers (client side) ────────────────────────────────────────────
+
+/// Verify that a server-initiated [`StreamOpen`] request is authorized by the client's
+/// active session configuration (`x11_enabled` and `reverse_specs`).
+///
+/// Rejects `StreamType::X11` when `-X`/`-Y` is not enabled, and rejects `StreamType::PortForward`
+/// unless `(so.remote_host, so.remote_port, so.forward_proto)` matches a configured `-R` spec.
+fn is_authorized_reverse_stream(
+    so: &StreamOpen,
+    x11_enabled: bool,
+    reverse_specs: &[ForwardSpec],
+) -> bool {
+    if so.stream_type == etr::protocol::StreamType::X11 as i32 {
+        return x11_enabled;
+    }
+    if so.stream_type != etr::protocol::StreamType::PortForward as i32 {
+        return false;
+    }
+    let Ok(proto) = ForwardProto::try_from(so.forward_proto) else {
+        return false;
+    };
+    let Ok(port) = u16::try_from(so.remote_port) else {
+        return false;
+    };
+    reverse_specs.iter().any(|spec| {
+        spec.proto == proto && spec.remote_port == port && spec.remote_host == so.remote_host
+    })
+}
 
 /// Accept local TCP connections on the addresses resolved by `spec.get_bind_addresses(gateway)`
 /// and open one QUIC forward stream per connection toward the spec's remote host/port.
@@ -2458,5 +2595,115 @@ mod tests {
 
         assert_eq!(log_path, std::path::PathBuf::from("/config/client.log"));
         assert_eq!(server_log_path, Some("/config/server.log"));
+    }
+
+    #[test]
+    fn test_is_authorized_reverse_stream_enforces_x11_and_reverse_specs() {
+        let tcp_spec = ForwardSpec::parse("8080:localhost:80").unwrap();
+        let udp_spec = ForwardSpec::parse("5353:127.0.0.1:53/udp").unwrap();
+        let specs = vec![tcp_spec, udp_spec];
+
+        let x11_so = StreamOpen {
+            stream_id: 0,
+            stream_type: etr::protocol::StreamType::X11 as i32,
+            remote_host: String::new(),
+            remote_port: 0,
+            forward_proto: ForwardProto::Tcp as i32,
+        };
+        assert!(
+            !is_authorized_reverse_stream(&x11_so, false, &specs),
+            "X11 stream must be rejected when x11_enabled is false"
+        );
+        assert!(
+            is_authorized_reverse_stream(&x11_so, true, &specs),
+            "X11 stream must be allowed when x11_enabled is true"
+        );
+
+        let allowed_tcp = StreamOpen {
+            stream_id: 0,
+            stream_type: etr::protocol::StreamType::PortForward as i32,
+            remote_host: "localhost".to_string(),
+            remote_port: 80,
+            forward_proto: ForwardProto::Tcp as i32,
+        };
+        assert!(is_authorized_reverse_stream(&allowed_tcp, false, &specs));
+        assert!(
+            !is_authorized_reverse_stream(&allowed_tcp, false, &[]),
+            "TCP stream must be rejected when no -R specs were configured"
+        );
+
+        // Wrong host, wrong port, or wrong protocol must be rejected.
+        let wrong_host = StreamOpen {
+            remote_host: "10.0.0.1".to_string(),
+            ..allowed_tcp.clone()
+        };
+        assert!(!is_authorized_reverse_stream(&wrong_host, false, &specs));
+
+        let wrong_port = StreamOpen {
+            remote_port: 22,
+            ..allowed_tcp.clone()
+        };
+        assert!(!is_authorized_reverse_stream(&wrong_port, false, &specs));
+
+        let wrong_proto = StreamOpen {
+            forward_proto: ForwardProto::Udp as i32,
+            ..allowed_tcp
+        };
+        assert!(!is_authorized_reverse_stream(&wrong_proto, false, &specs));
+    }
+
+    #[test]
+    fn test_posix_shell_quote() {
+        assert_eq!(posix_shell_quote("etrs"), "etrs");
+        assert_eq!(
+            posix_shell_quote("/usr/local/bin/etrs"),
+            "/usr/local/bin/etrs"
+        );
+        assert_eq!(
+            posix_shell_quote("/path/with spaces/etrs"),
+            "'/path/with spaces/etrs'"
+        );
+        assert_eq!(posix_shell_quote("/tmp/log;id"), "'/tmp/log;id'");
+        assert_eq!(posix_shell_quote("/tmp/it's.log"), "'/tmp/it'\\''s.log'");
+        assert_eq!(posix_shell_quote("~"), "~");
+        assert_eq!(posix_shell_quote("~/"), "~/");
+        assert_eq!(
+            posix_shell_quote("~/.local/state/etr/etrs.log"),
+            "~/.local/state/etr/etrs.log"
+        );
+        assert_eq!(posix_shell_quote("~/my bin/etrs"), "~/'my bin/etrs'");
+        assert_eq!(posix_shell_quote("~/log;id"), "~/'log;id'");
+    }
+
+    #[test]
+    fn test_validate_bootstrap_inputs_rejects_option_targets_and_newlines() {
+        assert!(validate_bootstrap_inputs("user@host", "xterm-256color", &[], None).is_ok());
+        assert!(
+            validate_bootstrap_inputs("-oProxyCommand=sh", "xterm-256color", &[], None).is_err(),
+            "leading hyphen in target must be rejected"
+        );
+        assert!(
+            validate_bootstrap_inputs("", "xterm-256color", &[], None).is_err(),
+            "empty target must be rejected"
+        );
+        assert!(
+            validate_bootstrap_inputs("host", "xterm\nETRCMD:id", &[], None).is_err(),
+            "newline in TERM must be rejected"
+        );
+        assert!(
+            validate_bootstrap_inputs(
+                "host",
+                "xterm-256color",
+                &["FOO=bar\nETRCMD:id".to_string()],
+                None
+            )
+            .is_err(),
+            "newline in env var must be rejected"
+        );
+        assert!(
+            validate_bootstrap_inputs("host", "xterm-256color", &[], Some("echo a\necho b"))
+                .is_err(),
+            "raw newline in remote_command must be rejected"
+        );
     }
 }

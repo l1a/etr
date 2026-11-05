@@ -380,6 +380,212 @@ fn contains_key_line(content: &str, key: &str) -> bool {
     })
 }
 
+/// Return a per-user fallback state directory under the system temporary directory.
+pub fn fallback_tmp_state_dir() -> std::path::PathBuf {
+    let base = std::env::temp_dir();
+    #[cfg(unix)]
+    {
+        // Canonicalize on Unix so macOS `/var/folders/...` (where `/var` is a symlink to
+        // `private/var`) resolves to its real path before `O_NOFOLLOW` traversal.
+        // Do NOT canonicalize on Windows: `Path::canonicalize` there returns a `\\?\`
+        // verbatim prefix on which `PathBuf::join("..")` silently pops the previous
+        // component in-place instead of appending `Component::ParentDir`.
+        let base = base.canonicalize().unwrap_or(base);
+        let uid = nix::unistd::geteuid().as_raw();
+        base.join(format!("etr-{uid}"))
+    }
+    #[cfg(not(unix))]
+    {
+        base.join("etr")
+    }
+}
+
+#[cfg(unix)]
+fn is_root_or_userns_overflow_uid(uid: u32) -> bool {
+    if uid == 0 {
+        return true;
+    }
+    std::fs::read_to_string("/proc/sys/kernel/overflowuid")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .is_some_and(|overflow| uid == overflow)
+}
+
+/// Verify that an opened directory file descriptor is safe to traverse when opening a private log
+/// file:
+/// - Before any sticky directory is entered (`!*under_sticky_dir`), a directory must be owned by
+///   `euid` or `root` (`0`) with `(mode & 0o022) == 0`, or be a root-owned sticky directory
+///   (`(mode & 0o1000) != 0`), which transitions `*under_sticky_dir = true`.
+/// - Once inside a sticky directory (`*under_sticky_dir == true`), every subdirectory must be
+///   owned by `euid` and private (`(mode & 0o077) == 0`).
+#[cfg(unix)]
+fn verify_trusted_log_dir(
+    dir_file: &std::fs::File,
+    euid: u32,
+    under_sticky_dir: &mut bool,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = dir_file.metadata()?;
+    if !meta.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "log path component is not a directory",
+        ));
+    }
+    let uid = meta.uid();
+    let mode = meta.mode() & 0o7777;
+    if *under_sticky_dir {
+        if uid != euid || (mode & 0o077) != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "refusing to traverse non-private directory under sticky temp directory",
+            ));
+        }
+        return Ok(());
+    }
+
+    if (mode & 0o022) == 0 && (uid == euid || is_root_or_userns_overflow_uid(uid)) {
+        return Ok(());
+    }
+    if (mode & 0o1000) != 0 && is_root_or_userns_overflow_uid(uid) {
+        *under_sticky_dir = true;
+        return Ok(());
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "refusing to traverse untrusted or writable directory in log path",
+    ))
+}
+
+/// Open (or create) a private log file with `0600` permissions (and `0700` newly created parent
+/// directories).
+///
+/// On Unix, this rejects `..` traversal components, walks every parent component from `/` (or `.`)
+/// using `openat` with `O_NOFOLLOW | O_DIRECTORY`, verifies ownership and write permissions of
+/// every intermediate directory descriptor via `fstat`, and opens the final file via `openat`
+/// (`O_NOFOLLOW | O_NONBLOCK`) from the verified parent directory descriptor.
+pub fn open_private_log_file(log_path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::path::Component;
+
+    if log_path.file_name().is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "log path has no file name",
+        ));
+    }
+    for comp in log_path.components() {
+        if matches!(comp, Component::ParentDir) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "refusing log path containing '..' traversal",
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        use nix::fcntl::{FcntlArg, OFlag, fcntl, open, openat};
+        use nix::sys::stat::{Mode, mkdirat};
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let file_name = log_path.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "log path has no file name",
+            )
+        })?;
+
+        let euid = nix::unistd::geteuid().as_raw();
+        let parent = log_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let start = if parent.is_absolute() { "/" } else { "." };
+        let start_fd = open(
+            start,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?;
+        let mut dir_file = std::fs::File::from(start_fd);
+        let mut under_sticky_dir = false;
+        verify_trusted_log_dir(&dir_file, euid, &mut under_sticky_dir)?;
+
+        for comp in parent.components() {
+            let Component::Normal(part) = comp else {
+                continue;
+            };
+            let dir_flags =
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+            let (next_fd, created) = match openat(&dir_file, part, dir_flags, Mode::empty()) {
+                Ok(fd) => (fd, false),
+                Err(nix::errno::Errno::ENOENT) => {
+                    let created = match mkdirat(&dir_file, part, Mode::from_bits_truncate(0o700)) {
+                        Ok(()) => true,
+                        Err(nix::errno::Errno::EEXIST) => false,
+                        Err(e) => return Err(std::io::Error::from(e)),
+                    };
+                    let fd = openat(&dir_file, part, dir_flags, Mode::empty())
+                        .map_err(std::io::Error::from)?;
+                    (fd, created)
+                }
+                Err(e) => return Err(std::io::Error::from(e)),
+            };
+            let next_dir = std::fs::File::from(next_fd);
+            if created {
+                let _ = next_dir.set_permissions(std::fs::Permissions::from_mode(0o700));
+            }
+            verify_trusted_log_dir(&next_dir, euid, &mut under_sticky_dir)?;
+            dir_file = next_dir;
+        }
+
+        let file_fd = openat(
+            &dir_file,
+            file_name,
+            OFlag::O_CREAT
+                | OFlag::O_WRONLY
+                | OFlag::O_APPEND
+                | OFlag::O_NOFOLLOW
+                | OFlag::O_NONBLOCK
+                | OFlag::O_CLOEXEC,
+            Mode::from_bits_truncate(0o600),
+        )
+        .map_err(std::io::Error::from)?;
+        let file = std::fs::File::from(file_fd);
+        let file_meta = file.metadata()?;
+        if !file_meta.is_file() || file_meta.uid() != euid || file_meta.nlink() != 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "refusing to write to untrusted log file {}",
+                    log_path.display()
+                ),
+            ));
+        }
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        if let Ok(flags) = fcntl(&file, FcntlArg::F_GETFL) {
+            let clean = OFlag::from_bits_truncate(flags) & !OFlag::O_NONBLOCK;
+            let _ = fcntl(&file, FcntlArg::F_SETFL(clean));
+        }
+        Ok(file)
+    }
+
+    #[cfg(not(unix))]
+    {
+        if let Some(parent) = log_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -607,5 +813,54 @@ address_family = \"auto\"\n";
         let cfg: Config = toml::from_str(&content).unwrap_or_default();
         assert!(cfg.client.ssh_port.is_none());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_open_private_log_file_rejects_traversal_and_symlinks() {
+        let base = fallback_tmp_state_dir().join(format!("log-test-{}", std::process::id()));
+        std::fs::remove_dir_all(&base).ok();
+
+        // 1. '..' component must be rejected on all platforms.
+        let dotdot = base.join("..").join("etr.log");
+        assert!(open_private_log_file(&dotdot).is_err());
+
+        // 2. Valid nested private log path must succeed.
+        let ok_path = base.join("nested").join("etr.log");
+        let file = open_private_log_file(&ok_path).expect("valid log path should open");
+        drop(file);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+            let file_meta = std::fs::symlink_metadata(&ok_path).unwrap();
+            assert_eq!(file_meta.mode() & 0o777, 0o600);
+            let dir_meta = std::fs::symlink_metadata(ok_path.parent().unwrap()).unwrap();
+            assert_eq!(dir_meta.mode() & 0o777, 0o700);
+
+            // 3. Final file symlink must be rejected.
+            let target = base.join("target.txt");
+            std::fs::write(&target, b"secret").unwrap();
+            let symlink_file = base.join("symlink.log");
+            std::os::unix::fs::symlink(&target, &symlink_file).unwrap();
+            assert!(open_private_log_file(&symlink_file).is_err());
+
+            // 4. Intermediate directory symlink must be rejected.
+            let real_sub = base.join("real_sub");
+            std::fs::create_dir_all(&real_sub).unwrap();
+            std::fs::set_permissions(&real_sub, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let symlink_dir = base.join("sym_sub");
+            std::os::unix::fs::symlink(&real_sub, &symlink_dir).unwrap();
+            assert!(open_private_log_file(&symlink_dir.join("etr.log")).is_err());
+
+            // 5. Group/world-writable intermediate directory must be rejected.
+            let writable_sub = base.join("writable_sub");
+            std::fs::create_dir_all(&writable_sub).unwrap();
+            std::fs::set_permissions(&writable_sub, std::fs::Permissions::from_mode(0o777))
+                .unwrap();
+            assert!(open_private_log_file(&writable_sub.join("session").join("etr.log")).is_err());
+        }
+
+        std::fs::remove_dir_all(&base).ok();
     }
 }

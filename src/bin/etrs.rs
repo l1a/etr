@@ -13,8 +13,6 @@ use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::{self};
 #[cfg(unix)]
 use std::io::{Read, Write};
-#[cfg(unix)]
-use std::os::unix::io::{FromRawFd, IntoRawFd};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
@@ -159,21 +157,64 @@ fn effective_bind_ip(explicit: Option<&str>, pref: AddrPref) -> String {
     }
 }
 
+/// Resolve the session reconnect timeout (seconds) using the documented precedence:
+/// CLI flag > `ETR_SERVER_NETWORK_TMOUT` env var > `config.toml` `[server] reconnect_timeout` > 1800s.
+fn resolve_reconnect_timeout(
+    cli_val: Option<u64>,
+    env_val: Option<&str>,
+    cfg_val: Option<u64>,
+) -> Duration {
+    Duration::from_secs(
+        cli_val
+            .or_else(|| env_val.and_then(|v| v.parse().ok()))
+            .or(cfg_val)
+            .unwrap_or(1800),
+    )
+}
+
+/// Check whether a `KEY=VALUE` environment variable supplied during SSH bootstrap is safe to
+/// apply to the spawned shell.
+///
+/// Rejects strings containing control characters (`\n`, `\r`, `\0`) and blocks dynamic-linker /
+/// non-interactive shell startup hijacking variables (`LD_PRELOAD`, `LD_LIBRARY_PATH`,
+/// `LD_AUDIT`, `DYLD_INSERT_LIBRARIES`, `BASH_ENV`, `ENV`).
+fn is_safe_client_env_var(kv: &str) -> bool {
+    if kv.contains(['\n', '\r', '\0']) {
+        return false;
+    }
+    let Some((key, _)) = kv.split_once('=') else {
+        return false;
+    };
+    if key.is_empty() {
+        return false;
+    }
+    const BLOCKED_ENV_KEYS: &[&str] = &[
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "LD_AUDIT",
+        "LD_DYNAMIC_WEAK",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "DYLD_FRAMEWORK_PATH",
+        "BASH_ENV",
+        "ENV",
+    ];
+    !BLOCKED_ENV_KEYS
+        .iter()
+        .any(|blocked| key.eq_ignore_ascii_case(blocked))
+}
+
 fn main() -> io::Result<()> {
     let cli = Cli::parse();
     let _ = VERBOSITY.set(cli.verbose);
     let cfg = Config::load();
 
     // Priority: CLI flag > ETR_SERVER_NETWORK_TMOUT env var > config file > default.
-    let reconnect_timeout = Duration::from_secs(
-        cli.reconnect_timeout
-            .or_else(|| {
-                std::env::var("ETR_SERVER_NETWORK_TMOUT")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-            })
-            .or(cfg.server.reconnect_timeout)
-            .unwrap_or(1800),
+    let env_tmout = std::env::var("ETR_SERVER_NETWORK_TMOUT").ok();
+    let reconnect_timeout = resolve_reconnect_timeout(
+        cli.reconnect_timeout,
+        env_tmout.as_deref(),
+        cfg.server.reconnect_timeout,
     );
 
     if let Some(shell) = cli.completions {
@@ -277,18 +318,17 @@ fn run_server(cli: Cli, reconnect_timeout: Duration, own_pref: AddrPref) -> io::
     // an OS-assigned port), writes the port back to the parent, then the parent
     // prints "PORT <n> CERT <hex>" to SSH stdout and exits.
     let (owned_r, owned_w) = nix::unistd::pipe().map_err(|e| io::Error::other(e.to_string()))?;
-    // Convert to raw fds so they can be used after the fork without ownership tracking.
-    let pipe_r: i32 = owned_r.into_raw_fd();
-    let pipe_w: i32 = owned_w.into_raw_fd();
 
     // Fork: parent waits for port from child; child runs the tokio session.
     use nix::unistd::{ForkResult, fork, setsid};
+    // SAFETY: `fork()` is called while the process is still single-threaded (before the
+    // multi-threaded Tokio runtime is constructed below).
     match unsafe { fork() }.map_err(|e| io::Error::other(e.to_string()))? {
         ForkResult::Parent { .. } => {
             // Close write end; read the 2-byte port the child sends.
-            nix::unistd::close(pipe_w).ok();
+            drop(owned_w);
             let mut port_bytes = [0u8; 2];
-            let mut reader = unsafe { std::fs::File::from_raw_fd(pipe_r) };
+            let mut reader = std::fs::File::from(owned_r);
             reader.read_exact(&mut port_bytes)?;
             let actual_port = u16::from_be_bytes(port_bytes);
             println!("PORT {actual_port} CERT {cert_hex}");
@@ -297,7 +337,7 @@ fn run_server(cli: Cli, reconnect_timeout: Duration, own_pref: AddrPref) -> io::
         }
         ForkResult::Child => {
             // Close read end; we'll write the port after binding.
-            nix::unistd::close(pipe_r).ok();
+            drop(owned_r);
             setsid().ok();
         }
     }
@@ -326,9 +366,9 @@ fn run_server(cli: Cli, reconnect_timeout: Duration, own_pref: AddrPref) -> io::
 
             // Send port to parent (2 bytes big-endian), then close the pipe.
             let port_bytes = actual_port.to_be_bytes();
-            let mut writer = unsafe { std::fs::File::from_raw_fd(pipe_w) };
+            let mut writer = std::fs::File::from(owned_w);
             writer.write_all(&port_bytes)?;
-            drop(writer); // closes pipe_w
+            drop(writer); // closes write end of pipe
 
             detach_stdio(&log_path)?;
             run_session(
@@ -346,19 +386,16 @@ fn run_server(cli: Cli, reconnect_timeout: Duration, own_pref: AddrPref) -> io::
 }
 
 #[cfg(unix)]
+fn open_private_server_log(log_path: &std::path::Path) -> io::Result<std::fs::File> {
+    etr::config::open_private_log_file(log_path)
+}
+
+#[cfg(unix)]
 fn detach_stdio(log_path: &std::path::Path) -> io::Result<()> {
     use nix::unistd::{dup2_stderr, dup2_stdin, dup2_stdout};
 
     let null_file = std::fs::File::open("/dev/null").ok();
-
-    if let Some(p) = log_path.parent() {
-        std::fs::create_dir_all(p).ok();
-    }
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)
-        .ok();
+    let log_file = open_private_server_log(log_path).ok();
 
     if let Some(ref f) = null_file {
         dup2_stdin(f).ok();
@@ -373,12 +410,9 @@ fn detach_stdio(log_path: &std::path::Path) -> io::Result<()> {
 
 fn session_log_path() -> std::path::PathBuf {
     dirs::state_dir()
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-                .join(".local/state")
-        })
-        .join("etr")
+        .or_else(|| dirs::home_dir().map(|h| h.join(".local/state")))
+        .map(|d| d.join("etr"))
+        .unwrap_or_else(etr::config::fallback_tmp_state_dir)
         .join("etrs.log")
 }
 
@@ -409,8 +443,11 @@ async fn run_session(
     let mut display_num = None;
 
     if x11_enabled {
-        if let Some(d) = find_free_display() {
-            display_num = Some(d);
+        if let Some((d, unix_listener, tcp_listeners)) = bind_free_x11_display() {
+            let cleanup = X11Cleanup {
+                display_num: d,
+                has_unix_socket: unix_listener.is_some(),
+            };
             let fake_cookie: [u8; 16] = rand::random();
             let fake_cookie_hex = hex_encode(&fake_cookie);
 
@@ -447,28 +484,27 @@ async fn run_session(
                 }
             }
 
-            let socket_path = format!("/tmp/.X11-unix/X{d}");
-            std::fs::create_dir_all("/tmp/.X11-unix").ok();
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions("/tmp/.X11-unix", std::fs::Permissions::from_mode(0o1777))
-                .ok();
-            std::fs::remove_file(&socket_path).ok();
-
-            let active_conn_clone = Arc::clone(&active_conn);
-            let fake_cookie_vec = if xauth_ok {
-                fake_cookie.to_vec()
+            if !xauth_ok {
+                vlog!(
+                    1,
+                    "[etrs] X11: xauth failed; disabling X11 forwarding to prevent unauthenticated display exposure"
+                );
+                drop(unix_listener);
+                drop(tcp_listeners);
+                drop(cleanup);
             } else {
-                Vec::new()
-            };
-            let real_cookie_clone = Arc::clone(&x11_real_cookie);
+                display_num = Some(d);
+                _cleanup = Some(cleanup);
+                let active_conn_clone = Arc::clone(&active_conn);
+                let fake_cookie_vec = fake_cookie.to_vec();
+                let real_cookie_clone = Arc::clone(&x11_real_cookie);
 
-            match tokio::net::UnixListener::bind(&socket_path) {
-                Ok(listener) => {
+                if let Some(unix_listener) = unix_listener {
                     let active_conn = Arc::clone(&active_conn_clone);
                     let fake_cookie = fake_cookie_vec.clone();
                     let real_cookie = Arc::clone(&real_cookie_clone);
                     tokio::spawn(async move {
-                        while let Ok((stream, _)) = listener.accept().await {
+                        while let Ok((stream, _)) = unix_listener.accept().await {
                             let active_conn = Arc::clone(&active_conn);
                             let fake_cookie = fake_cookie.clone();
                             let real_cookie = Arc::clone(&real_cookie);
@@ -491,54 +527,37 @@ async fn run_session(
                         }
                     });
                 }
-                Err(e) => {
-                    vlog!(
-                        1,
-                        "[etrs] X11: failed to bind Unix socket {socket_path}: {e}"
-                    );
+
+                for listener in tcp_listeners {
+                    let active_conn = Arc::clone(&active_conn_clone);
+                    let fake_cookie = fake_cookie_vec.clone();
+                    let real_cookie = Arc::clone(&real_cookie_clone);
+                    tokio::spawn(async move {
+                        while let Ok((stream, _)) = listener.accept().await {
+                            let _ = stream.set_nodelay(true);
+                            let active_conn = Arc::clone(&active_conn);
+                            let fake_cookie = fake_cookie.clone();
+                            let real_cookie = Arc::clone(&real_cookie);
+                            tokio::spawn(async move {
+                                let conn = {
+                                    let g = active_conn.lock().await;
+                                    g.clone()
+                                };
+                                let rc = {
+                                    let g = real_cookie.lock().await;
+                                    g.clone()
+                                };
+                                if let (Some(c), Some(rc_val)) = (conn, rc)
+                                    && let Ok((stream, setup_block)) =
+                                        process_x11_setup(stream, &fake_cookie, &rc_val).await
+                                {
+                                    forward_x11_connection(stream, setup_block, c).await;
+                                }
+                            });
+                        }
+                    });
                 }
             }
-
-            let tcp_port = 6000 + d;
-            for bind_ip in &["127.0.0.1", "[::1]"] {
-                let bind_addr = format!("{bind_ip}:{tcp_port}");
-                match tokio::net::TcpListener::bind(&bind_addr).await {
-                    Ok(listener) => {
-                        let active_conn = Arc::clone(&active_conn_clone);
-                        let fake_cookie = fake_cookie_vec.clone();
-                        let real_cookie = Arc::clone(&real_cookie_clone);
-                        tokio::spawn(async move {
-                            while let Ok((stream, _)) = listener.accept().await {
-                                let _ = stream.set_nodelay(true);
-                                let active_conn = Arc::clone(&active_conn);
-                                let fake_cookie = fake_cookie.clone();
-                                let real_cookie = Arc::clone(&real_cookie);
-                                tokio::spawn(async move {
-                                    let conn = {
-                                        let g = active_conn.lock().await;
-                                        g.clone()
-                                    };
-                                    let rc = {
-                                        let g = real_cookie.lock().await;
-                                        g.clone()
-                                    };
-                                    if let (Some(c), Some(rc_val)) = (conn, rc)
-                                        && let Ok((stream, setup_block)) =
-                                            process_x11_setup(stream, &fake_cookie, &rc_val).await
-                                    {
-                                        forward_x11_connection(stream, setup_block, c).await;
-                                    }
-                                });
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        vlog!(1, "[etrs] X11: failed to bind TCP {bind_addr}: {e}");
-                    }
-                }
-            }
-
-            _cleanup = Some(X11Cleanup { display_num: d });
         } else {
             vlog!(1, "[etrs] X11: no free display numbers available");
         }
@@ -583,6 +602,10 @@ async fn run_session(
     }
     // Apply any extra env vars requested by the client (--env / config [client] env).
     for kv in &extra_env {
+        if !is_safe_client_env_var(kv) {
+            vlog!(1, "[etrs] ignoring unsafe or malformed bootstrap env var");
+            continue;
+        }
         if let Some((k, v)) = kv.split_once('=') {
             cmd.env(k, v);
         }
@@ -767,10 +790,15 @@ async fn run_session(
                 continue;
             }
         };
-        let conn = match conn.await {
-            Ok(c) => c,
-            Err(e) => {
+        const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+        let conn = match tokio::time::timeout(HANDSHAKE_TIMEOUT, conn).await {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => {
                 vlog!(1, "[etrs] QUIC handshake error: {e}");
+                continue;
+            }
+            Err(_) => {
+                vlog!(1, "[etrs] QUIC handshake timed out");
                 continue;
             }
         };
@@ -930,6 +958,58 @@ async fn handle_connection(
         peer,
         hex_encode(&session_id)
     );
+
+    // ── Control stream: first stream the client opens (bounded by timeout) ──
+    const SESSION_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+    let handshake_res = tokio::time::timeout(SESSION_OPEN_TIMEOUT, async {
+        let (ctrl_send, mut ctrl_recv) = conn
+            .accept_bi()
+            .await
+            .map_err(|e| format!("accept_bi error: {e}"))?;
+        let tag = quic::read_tag(&mut ctrl_recv)
+            .await
+            .map_err(|e| format!("read tag error: {e}"))?;
+        if tag != TAG_CONTROL {
+            return Err(format!("expected control tag, got 0x{tag:02x}"));
+        }
+        let session_open = match quic::read_msg(&mut ctrl_recv).await {
+            Ok(Some(env)) => match env.payload {
+                Some(Payload::SessionOpen(so)) => so,
+                _ => return Err("expected SessionOpen".to_string()),
+            },
+            _ => return Err("failed to read SessionOpen".to_string()),
+        };
+        Ok((ctrl_send, ctrl_recv, session_open))
+    })
+    .await;
+
+    let (mut ctrl_send, mut ctrl_recv, session_open) = match handshake_res {
+        Ok(Ok(tuple)) => tuple,
+        Ok(Err(msg)) => {
+            vlog!(1, "[etrs] {msg}");
+            conn.close(quinn::VarInt::from_u32(1), b"invalid control handshake");
+            return false;
+        }
+        Err(_) => {
+            vlog!(1, "[etrs] SessionOpen timed out from {peer}");
+            conn.close(quinn::VarInt::from_u32(1), b"handshake timeout");
+            return false;
+        }
+    };
+
+    // Verify session identity and passkey in constant time before recording login or
+    // mutating any session state.
+    if !quic::constant_time_eq(&session_open.session_id, &session_id) {
+        vlog!(1, "[etrs] session_id mismatch from {peer}");
+        conn.close(quinn::VarInt::from_u32(1), b"authentication failed");
+        return false;
+    }
+    if !quic::constant_time_eq(session_open.passkey.as_bytes(), passkey.as_bytes()) {
+        vlog!(1, "[etrs] passkey mismatch from {peer}");
+        conn.close(quinn::VarInt::from_u32(1), b"authentication failed");
+        return false;
+    }
+
     if let Some(fd) = master_fd {
         let addr = format!(
             "{} via etr [{}]",
@@ -939,51 +1019,6 @@ async fn handle_connection(
         tokio::task::spawn_blocking(move || login::record_login(fd, &addr))
             .await
             .ok();
-    }
-
-    // ── Control stream: first stream the client opens ─────────────────────
-    let (mut ctrl_send, mut ctrl_recv) = match conn.accept_bi().await {
-        Ok(s) => s,
-        Err(e) => {
-            vlog!(1, "[etrs] accept_bi error: {e}");
-            return false;
-        }
-    };
-
-    let tag = match quic::read_tag(&mut ctrl_recv).await {
-        Ok(t) => t,
-        Err(e) => {
-            vlog!(1, "[etrs] read tag error: {e}");
-            return false;
-        }
-    };
-    if tag != TAG_CONTROL {
-        vlog!(1, "[etrs] expected control tag, got 0x{tag:02x}");
-        return false;
-    }
-
-    let session_open = match quic::read_msg(&mut ctrl_recv).await {
-        Ok(Some(env)) => match env.payload {
-            Some(Payload::SessionOpen(so)) => so,
-            _ => {
-                vlog!(1, "[etrs] expected SessionOpen");
-                return false;
-            }
-        },
-        _ => {
-            vlog!(1, "[etrs] failed to read SessionOpen");
-            return false;
-        }
-    };
-
-    // Verify session identity and passkey.
-    if session_open.session_id != session_id {
-        vlog!(1, "[etrs] session_id mismatch from {peer}");
-        return false;
-    }
-    if session_open.passkey != passkey {
-        vlog!(1, "[etrs] passkey mismatch from {peer}");
-        return false;
     }
 
     vlog!(2, "[etrs] session verified peer={peer}");
@@ -1650,6 +1685,13 @@ async fn serve_udp_forward(
     // the correct sender without any last-sender state.
     const SENDER_IDLE: Duration = Duration::from_secs(30);
 
+    struct AbortOnDrop(tokio::task::JoinHandle<()>);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
     // Channel: per-sender reply tasks write here; one collector task drains to quic_send
     // (avoids concurrent writes to the single SendStream).
     let (reply_tx, mut reply_rx) = mpsc::channel::<Envelope>(256);
@@ -1665,7 +1707,8 @@ async fn serve_udp_forward(
     // QUIC → remote UDP, with per-sender socket demux.
     let mut send_task = tokio::spawn(async move {
         // Local map — only this task accesses it, so no locking needed.
-        let mut sender_map: HashMap<(String, u32), (Arc<UdpSocket>, Instant)> = HashMap::new();
+        let mut sender_map: HashMap<(String, u32), (Arc<UdpSocket>, Instant, AbortOnDrop)> =
+            HashMap::new();
 
         while let Ok(Some(env)) = quic::read_msg(&mut quic_recv).await {
             if let Some(Payload::UdpDatagram(dg)) = env.payload {
@@ -1676,13 +1719,13 @@ async fn serve_udp_forward(
                 let now = Instant::now();
 
                 // Evict sockets idle longer than SENDER_IDLE.
-                sender_map.retain(|_, (_, last)| now.duration_since(*last) < SENDER_IDLE);
+                sender_map.retain(|_, (_, last, _)| now.duration_since(*last) < SENDER_IDLE);
 
-                let socket = if let Some((sock, last)) = sender_map.get_mut(&key) {
+                let socket = if let Some((sock, last, _)) = sender_map.get_mut(&key) {
                     *last = now;
                     Arc::clone(sock)
                 } else {
-                    // New sender: bind a fresh ephemeral socket.
+                    // New sender: bind a fresh ephemeral socket before evicting any LRU entry.
                     let sock = match UdpSocket::bind(bind_addr).await {
                         Ok(s) => Arc::new(s),
                         Err(e) => {
@@ -1694,7 +1737,14 @@ async fn serve_udp_forward(
                             continue;
                         }
                     };
-                    sender_map.insert(key.clone(), (Arc::clone(&sock), now));
+                    if sender_map.len() >= etr::forward::MAX_UDP_SENDERS
+                        && let Some(oldest_key) = sender_map
+                            .iter()
+                            .min_by_key(|(_, (_, last, _))| *last)
+                            .map(|(k, _)| k.clone())
+                    {
+                        sender_map.remove(&oldest_key);
+                    }
 
                     // Spawn a reply task: reads remote replies and routes them back to
                     // this specific sender via the shared channel.
@@ -1702,7 +1752,7 @@ async fn serve_udp_forward(
                     let peer_port = key.1;
                     let sock_r = Arc::clone(&sock);
                     let tx = reply_tx.clone();
-                    tokio::spawn(async move {
+                    let reader_handle = tokio::spawn(async move {
                         let mut buf = vec![0u8; 65535];
                         while let Ok(Ok((n, _))) =
                             tokio::time::timeout(SENDER_IDLE, sock_r.recv_from(&mut buf)).await
@@ -1719,6 +1769,10 @@ async fn serve_udp_forward(
                             }
                         }
                     });
+                    sender_map.insert(
+                        key.clone(),
+                        (Arc::clone(&sock), now, AbortOnDrop(reader_handle)),
+                    );
 
                     sock
                 };
@@ -1753,32 +1807,126 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-fn find_free_display() -> Option<u16> {
+/// Atomically locate and bind a free X11 display number in `10..100`, returning the bound
+/// Unix domain socket listener (mode `0600`, when `/tmp/.X11-unix` is present and trusted) and
+/// loopback TCP listeners without a TOCTOU gap or unlinking pre-existing sockets.
+#[cfg(unix)]
+fn bind_free_x11_display() -> Option<(
+    u16,
+    Option<tokio::net::UnixListener>,
+    Vec<tokio::net::TcpListener>,
+)> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let x11_dir = std::path::Path::new("/tmp/.X11-unix");
+    let euid = nix::unistd::geteuid().as_raw();
+    if euid == 0
+        && let Err(e) = std::fs::symlink_metadata(x11_dir)
+        && e.kind() == io::ErrorKind::NotFound
+        && std::fs::DirBuilder::new()
+            .mode(0o1777)
+            .create(x11_dir)
+            .is_ok()
+        && let Ok(dir_file) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_DIRECTORY)
+            .open(x11_dir)
+    {
+        let _ = dir_file.set_permissions(std::fs::Permissions::from_mode(0o1777));
+    }
+    let can_use_unix_socket = match std::fs::symlink_metadata(x11_dir) {
+        Ok(dir_meta) => {
+            let dir_uid = dir_meta.uid();
+            let dir_mode = dir_meta.mode();
+            let is_safe_dir = dir_meta.is_dir()
+                && !dir_meta.file_type().is_symlink()
+                && ((dir_uid == 0 && (dir_mode & 0o1000) != 0)
+                    || (dir_uid == euid && (dir_mode & 0o077) == 0));
+            if !is_safe_dir {
+                eprintln!(
+                    "[etrs] X11: /tmp/.X11-unix has untrusted ownership or permissions; using TCP loopback only"
+                );
+            }
+            is_safe_dir
+        }
+        Err(_) => {
+            vlog!(
+                1,
+                "[etrs] X11: /tmp/.X11-unix is not present; using TCP loopback only"
+            );
+            false
+        }
+    };
+
     for d in 10..100 {
         let socket_path = format!("/tmp/.X11-unix/X{d}");
-        if std::path::Path::new(&socket_path).exists() {
+        if std::fs::symlink_metadata(&socket_path).is_ok() {
             continue;
         }
         let target_v4 = format!("127.0.0.1:{}", 6000 + d);
-        let target_v6 = format!("[::1]:{}", 6000 + d);
-        if std::net::TcpListener::bind(&target_v4).is_ok()
-            && std::net::TcpListener::bind(&target_v6).is_ok()
-        {
-            return Some(d);
+        let Ok(std_v4) = std::net::TcpListener::bind(&target_v4) else {
+            continue;
+        };
+        if std_v4.set_nonblocking(true).is_err() {
+            continue;
         }
+        let Ok(tokio_v4) = tokio::net::TcpListener::from_std(std_v4) else {
+            continue;
+        };
+
+        let mut tcp_listeners = vec![tokio_v4];
+        let target_v6 = format!("[::1]:{}", 6000 + d);
+        match std::net::TcpListener::bind(&target_v6) {
+            Ok(std_v6) => {
+                if std_v6.set_nonblocking(true).is_err() {
+                    continue;
+                }
+                let Ok(tokio_v6) = tokio::net::TcpListener::from_std(std_v6) else {
+                    continue;
+                };
+                tcp_listeners.push(tokio_v6);
+            }
+            Err(e)
+                if e.kind() == io::ErrorKind::AddrNotAvailable
+                    || e.raw_os_error() == Some(nix::libc::EAFNOSUPPORT) =>
+            {
+                // IPv6 loopback is disabled on this host; IPv4 + Unix socket is sufficient.
+            }
+            Err(_) => {
+                // IPv6 port is already in use (or otherwise unavailable for this display);
+                // skip display `d` so `localhost:{d}.0` cannot route to another owner's `[::1]`.
+                continue;
+            }
+        }
+
+        let unix_listener = if can_use_unix_socket {
+            // Bind the Unix domain socket directly without `remove_file`, so we never unlink a
+            // socket owned by another process, then tighten permissions to 0600.
+            let Ok(listener) = tokio::net::UnixListener::bind(&socket_path) else {
+                continue;
+            };
+            let _ = std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600));
+            Some(listener)
+        } else {
+            None
+        };
+        return Some((d, unix_listener, tcp_listeners));
     }
     None
 }
 
 struct X11Cleanup {
     display_num: u16,
+    has_unix_socket: bool,
 }
 
 impl Drop for X11Cleanup {
     fn drop(&mut self) {
         let d = self.display_num;
-        let socket_path = format!("/tmp/.X11-unix/X{d}");
-        std::fs::remove_file(&socket_path).ok();
+        if self.has_unix_socket {
+            let socket_path = format!("/tmp/.X11-unix/X{d}");
+            std::fs::remove_file(&socket_path).ok();
+        }
         let _ = std::process::Command::new("xauth")
             .arg("remove")
             .arg(format!("localhost/unix:{d}"))
@@ -1827,20 +1975,24 @@ where
     let mut data_buf = vec![0u8; data_len_padded];
     stream.read_exact(&mut data_buf).await?;
 
-    if !fake_cookie.is_empty() {
-        if data_len < fake_cookie.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "X11 auth cookie too short",
-            ));
-        }
-        let client_cookie = &data_buf[..fake_cookie.len()];
-        if client_cookie != fake_cookie {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "X11 auth cookie mismatch",
-            ));
-        }
+    if fake_cookie.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "X11 forwarding requires a non-empty server auth cookie",
+        ));
+    }
+    if data_len < fake_cookie.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "X11 auth cookie too short",
+        ));
+    }
+    let client_cookie = &data_buf[..fake_cookie.len()];
+    if !quic::constant_time_eq(client_cookie, fake_cookie) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "X11 auth cookie mismatch",
+        ));
     }
 
     let mut setup_block = Vec::new();
@@ -2150,14 +2302,26 @@ mod tests {
 
     #[test]
     fn test_reconnect_timeout_env_var() {
-        // SAFETY: single-threaded test; no other threads read this var.
-        unsafe { std::env::set_var("ETR_SERVER_NETWORK_TMOUT", "7200") };
-        let timeout: u64 = std::env::var("ETR_SERVER_NETWORK_TMOUT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1800);
-        assert_eq!(timeout, 7200);
-        unsafe { std::env::remove_var("ETR_SERVER_NETWORK_TMOUT") };
+        assert_eq!(
+            resolve_reconnect_timeout(None, Some("7200"), Some(3600)),
+            Duration::from_secs(7200),
+            "env var must beat config value"
+        );
+        assert_eq!(
+            resolve_reconnect_timeout(Some(900), Some("7200"), Some(3600)),
+            Duration::from_secs(900),
+            "CLI flag must beat env var"
+        );
+        assert_eq!(
+            resolve_reconnect_timeout(None, Some("not-a-number"), Some(3600)),
+            Duration::from_secs(3600),
+            "invalid env var falls back to config"
+        );
+        assert_eq!(
+            resolve_reconnect_timeout(None, None, None),
+            Duration::from_secs(1800),
+            "default is 1800s"
+        );
     }
 
     #[test]
@@ -2282,15 +2446,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_process_x11_setup_skip_validation() {
+    async fn test_process_x11_setup_rejects_empty_fake_cookie() {
         let mut input = vec![0x6cu8, 0, 11, 0, 0, 0];
         input.extend_from_slice(&(0u16.to_le_bytes()));
         input.extend_from_slice(&(0u16.to_le_bytes()));
         input.extend_from_slice(&[0, 0]);
 
-        let cursor = std::io::Cursor::new(input);
-        let (_, setup_block) = process_x11_setup(cursor, &[], &[]).await.unwrap();
-        assert_eq!(setup_block.len(), 12);
+        let cursor = std::io::Cursor::new(input.clone());
+        let res = process_x11_setup(cursor, &[], &[]).await;
+        assert!(
+            res.is_err(),
+            "empty fake_cookie must be rejected rather than skipping validation"
+        );
+
+        let cursor2 = std::io::Cursor::new(input);
+        let res2 = process_x11_setup(cursor2, &[], &[9u8; 16]).await;
+        assert!(
+            res2.is_err(),
+            "empty fake_cookie must never inject real_cookie into an unauthenticated connection"
+        );
+    }
+
+    #[test]
+    fn test_is_safe_client_env_var_blocks_dangerous_linker_and_control_vars() {
+        assert!(is_safe_client_env_var("COLORTERM=truecolor"));
+        assert!(is_safe_client_env_var("LANG=en_US.UTF-8"));
+        assert!(!is_safe_client_env_var("LD_PRELOAD=/tmp/evil.so"));
+        assert!(!is_safe_client_env_var("ld_preload=/tmp/evil.so"));
+        assert!(!is_safe_client_env_var("LD_LIBRARY_PATH=/tmp"));
+        assert!(!is_safe_client_env_var(
+            "DYLD_INSERT_LIBRARIES=/tmp/evil.dylib"
+        ));
+        assert!(!is_safe_client_env_var("BASH_ENV=/tmp/rc"));
+        assert!(!is_safe_client_env_var("ENV=/tmp/rc"));
+        assert!(!is_safe_client_env_var("FOO=bar\nETRCMD:id"));
+        assert!(!is_safe_client_env_var("NO_EQUALS"));
+        assert!(!is_safe_client_env_var("=EMPTY_KEY"));
     }
 
     #[tokio::test]

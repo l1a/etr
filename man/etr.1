@@ -1,4 +1,4 @@
-.TH "ETR" "1" "" "etr 0.10.17" "User Commands"
+.TH "ETR" "1" "" "etr 0.10.18" "User Commands"
 
 .SH "NAME"
 .PP
@@ -159,12 +159,12 @@ instead of binding to loopback only\.
 \fB\fB\-X\fP\fP
 .RS
 .PP
-Enable X11 forwarding\. Extracts the local X11 display cookie from the active display (via \fBxauth\fP) and securely forwards it to the server\.
+Enable untrusted X11 forwarding\. Generates an untrusted X11 Security Extension cookie (via \fBxauth generate \.\.\. untrusted\fP, falling back to the display's existing cookie if the X server lacks the SECURITY extension) and forwards X11 connections through a spoofed server\-side cookie\.
 .RE
 \fB\fB\-Y\fP\fP
 .RS
 .PP
-Enable trusted X11 forwarding\. Treated identically to \fB\-X\fP\.
+Enable trusted X11 forwarding\. Extracts the local X11 display cookie from the active display (via \fBxauth list\fP) and forwards X11 connections without X11 Security Extension restrictions\.
 .RE
 \fB\fB\-\-server\-path\fP \fIPATH\fP\fP
 .RS

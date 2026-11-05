@@ -126,8 +126,8 @@ Options:
                                  Forward a local port to a remote address (repeatable)
   -R <[remote_port:]host:port[/udp]>
                                  Forward a remote port to a local address (repeatable)
-  -X                             Enable X11 forwarding
-  -Y                             Enable trusted X11 forwarding (treated same as -X)
+  -X                             Enable untrusted X11 forwarding
+  -Y                             Enable trusted X11 forwarding
   -v, -vv, -vvv                  Verbosity: connection events / QUIC details / stream trace
       --env <KEY[=VALUE]>        Set or forward environment variables to the remote shell (repeatable)
       --server-path <PATH>       Path to etrs on the remote host [default: etrs]
