@@ -264,6 +264,21 @@ pub async fn read_pty_chunk(recv: &mut RecvStream) -> io::Result<Option<(u64, Ve
     Ok(Some((seq, data)))
 }
 
+/// Compare two byte slices in constant time (when lengths match).
+///
+/// Prevents timing side-channels when verifying session passkeys and X11 authentication
+/// cookies: standard slice `==` / `!=` short-circuits on the first differing byte.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= std::hint::black_box(x ^ y);
+    }
+    std::hint::black_box(diff) == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,6 +466,24 @@ mod tests {
         let result = srv_task.await.unwrap();
         assert!(result.is_err(), "expected error for oversized PTY chunk");
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_constant_time_eq() {
+        assert!(constant_time_eq(
+            b"secret-passkey-123",
+            b"secret-passkey-123"
+        ));
+        assert!(!constant_time_eq(
+            b"secret-passkey-123",
+            b"secret-passkey-124"
+        ));
+        assert!(!constant_time_eq(
+            b"secret-passkey-123",
+            b"Xecret-passkey-123"
+        ));
+        assert!(!constant_time_eq(b"short", b"longer"));
+        assert!(constant_time_eq(b"", b""));
     }
 }
 

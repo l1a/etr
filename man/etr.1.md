@@ -126,10 +126,10 @@ SSH channel and pinned for subsequent QUIC connections.
     instead of binding to loopback only.
 
 **-X**
-:   Enable X11 forwarding. Extracts the local X11 display cookie from the active display (via **xauth**) and securely forwards it to the server.
+:   Enable untrusted X11 forwarding. Generates an untrusted X11 Security Extension cookie (via **xauth generate ... untrusted**, falling back to the display's existing cookie if the X server lacks the SECURITY extension) and forwards X11 connections through a spoofed server-side cookie.
 
 **-Y**
-:   Enable trusted X11 forwarding. Treated identically to **-X**.
+:   Enable trusted X11 forwarding. Extracts the local X11 display cookie from the active display (via **xauth list**) and forwards X11 connections without X11 Security Extension restrictions.
 
 **\-\-server-path** *PATH*
 :   Path to the **etrs** binary on the remote host. Defaults to **etrs**

@@ -27,20 +27,39 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.10.17
+## Current state: v0.10.18
 
-`main` carries **0.10.17**. The newest released tag is **`v0.10.15`**, live on GitHub,
-crates.io, the AUR, COPR and the Homebrew tap; **0.10.16–0.10.17 are merged and untagged**
-(documentation and tooling hygiene).
+`main` carries **0.10.18**. The newest released tag is **`v0.10.15`**, live on GitHub,
+crates.io, the AUR, COPR and the Homebrew tap; **0.10.16–0.10.18 are merged and untagged**
+(documentation, tooling hygiene, and security hardening).
 
 The full round trip works on Linux and macOS: SSH bootstrap, QUIC session with pinned
 certificate, PTY, keepalives, reconnect after a drop, `-L`/`-R` TCP and UDP forwarding,
 X11 forwarding, `-4`/`-6` family preference. The Windows **client** works; `etrs` is
-Unix-only by design. 157 tests.
+Unix-only by design. 163 tests.
 
 What is open is listed under **Known gaps / next steps** below.
 
 Recent work worth knowing about, beyond what `git log` says:
+
+- **v0.10.18 — Client/server security hardening across X11, reverse streams, SSH bootstrap, and QUIC handshake.**
+  `etr` now validates every server-initiated `StreamOpen` against the client's active `-X`/`-Y`
+  flag and `-R` specs (`is_authorized_reverse_stream`), refusing unrequested X11 or local-network
+  connections from a compromised remote host. `-X` now generates an untrusted X11 Security
+  Extension cookie (`xauth generate ... untrusted timeout 1800` in a `0700` temp directory, falling
+  back to the display's existing cookie if the X server lacks the `SECURITY` extension) while `-Y`
+  uses the trusted cookie, and `parse_xauth_list_for_display` no longer falls back to an unrelated
+  `MIT-MAGIC-COOKIE-1` entry when no display number matches. `etrs` binds free X11 displays
+  atomically (`bind_free_x11_display`, `0600` Unix socket, no `remove_file` TOCTOU), disables X11
+  forwarding when `xauth add` fails or the spoofed cookie is empty, enforces 10-second timeouts on
+  the QUIC TLS handshake and initial `SessionOpen` control stream, compares passkeys and X11
+  cookies in constant time (`quic::constant_time_eq`), records `utmp`/`utmpx` logins only after
+  `SessionOpen` authentication succeeds, blocks newline/NUL injection and dynamic-linker/shell-init
+  hijacking variables (`LD_PRELOAD`, `LD_LIBRARY_PATH`, `DYLD_INSERT_LIBRARIES`, `BASH_ENV`, `ENV`,
+  etc.) on bootstrap and `SessionOpen.env_vars`, caps concurrent UDP forwarding sender sockets at
+  `MAX_UDP_SENDERS` (`256`) with `AbortOnDrop`, and opens client/server log files with mode `0600`
+  (`O_NOFOLLOW`, `0700` state dir, per-UID `/tmp/etr-<uid>` fallback) while redacting raw stdin
+  keystroke bytes at `-vvv`.
 
 - **v0.10.15 — Deadline-advancing busy-wait UDP pacer measures the true UDP forwarding knee.**
   `tools/stress` (`udp-pump` and `udp-source`) previously paced with a post-send
@@ -322,7 +341,7 @@ just install-tag 0.9.0
 # Code quality gate — run before every commit
 just check            # fmt + clippy, and: standard-check, man-check, packaging-check,
                       #   text-check, wip-check
-just test             # cargo test (157 tests, incl. tools/stress)
+just test             # cargo test (163 tests, incl. tools/stress)
 
 # Man pages are TRACKED (man/etr.1, man/etrs.1) because tag tarballs carry only tracked
 # files and COPR/Homebrew install them from there. Re-run after every version bump.
@@ -807,20 +826,27 @@ the GitHub release has been built.
   immediately below, so restoring it is uncommenting two lines. Deliberately **not** copied from
   retch: its version also sets `if: false`, so a manual dispatch appears to run and silently does
   nothing.
+- **On Windows, `Path::canonicalize` returns a verbatim prefix (`\\?\…`) on which `PathBuf::join("..")`
+  pops the parent component in-place instead of appending `Component::ParentDir`** (v0.10.18).
+  Win32 verbatim paths bypass Windows path normalization, so Rust's `PathBuf::push` normalizes `.`
+  and `..` itself whenever `self` has a verbatim prefix — meaning a test that constructs
+  `canonical_base.join("..").join("etr.log")` to verify `Component::ParentDir` rejection hands the
+  callee a path from which `..` has already vanished on Windows while keeping `..` on Unix. Only
+  canonicalize `std::env::temp_dir()` on Unix (where macOS `/var` is a symlink to `private/var`).
 ---
 
-## Test coverage (157 tests)
+## Test coverage (164 tests)
 
 | Module | What's tested |
 |--------|--------------|
-| `quic` | Transport bounds: the window/chunk-cap relationship is asserted as documentation, with the real guard being the `quinn` floor in Cargo.toml (see v0.9.4 — two test-shaped guards were tried and neither could discriminate). Cert generation, server/client config, write/read Envelope framing, write/read PTY chunk framing |
+| `quic` | Transport bounds: the window/chunk-cap relationship is asserted as documentation, with the real guard being the `quinn` floor in Cargo.toml (see v0.9.4 — two test-shaped guards were tried and neither could discriminate). Cert generation, server/client config, write/read Envelope framing, write/read PTY chunk framing, `constant_time_eq` |
 | `protocol` | SessionOpen/Accept encode-decode (incl. `gateway_ports`, `reverse_forwards`, and `x11_enabled`/`x11_auth_proto`/`x11_auth_cookie` round-trip), StreamOpen/Close, Heartbeat, Disconnect, UdpDatagram |
 | `session/stream` | Acknowledge edge cases, replay from 0, initial seq values |
 | `session/mod` | Close/ack unknown stream, `last_received_map` semantics, collect_replays, `open_stream` idempotence |
-| `bin/etrs` | CLI defaults, verbose count, custom port, subcommand parsing, hex_decode, custom --log-path override, `ETRCMD`/`ETRX11`/`ETRPREFER` bootstrap line parsing (through the shipped `parse_bootstrap_line`), `-4`/`-6` flags and their mutual exclusion, `effective_bind_ip` defaults vs explicit `-b`, client preference overriding the server's own |
+| `bin/etrs` | CLI defaults, verbose count, custom port, subcommand parsing, hex_decode, custom --log-path override, `ETRCMD`/`ETRX11`/`ETRPREFER` bootstrap line parsing (through the shipped `parse_bootstrap_line`), `-4`/`-6` flags and their mutual exclusion, `effective_bind_ip` defaults vs explicit `-b`, client preference overriding the server's own, X11 cookie setup replacement and empty-fake-cookie rejection, `is_safe_client_env_var` linker/shell-init filtering |
 | `login` | no-panic checks for record_login / record_logout with invalid fd |
-| `bin/etr` | CLI defaults, port parsing, target parsing, `-4`/`-6` short and long forms, their mutual exclusion, a family flag ahead of a remote command, CLI-beats-config precedence, no --cipher flag, custom --log-path and --server-log-path overrides, config fallback for log paths, terminal-restore sequences (cursor-safe modes cover mouse/paste/cursor and never move the cursor; screen reset leaves alt-screen without clearing scrollback) |
-| `config` | TOML parse (full section, partial, empty), default values, `gateway_ports` / `forward` / `reverse_forward` / `x11` / `x11_trusted` / `address_family` config keys, `merge_defaults` idempotence |
-| `forward` | UDP fast path: `UdpFrameEncoder` byte-identical to the pre-0.9.2 inline encoder (IPv4/IPv6, empty and 65507-byte payloads), alternating peers, port-only change, round trip through the decoder; `datagram_peer_addr` accepts both families and rejects port 0, ports above 65535 and non-literals. `-L`/`-R` spec parsing: TCP/UDP/IPv6, explicit proto, bad port, empty host, Display; bind address parsing (explicit IP, `[::1]`, wildcard `*`); `get_bind_addresses` with and without gateway flag; `resolve_udp_target`: localhost prefers IPv6, explicit IPv4, unresolvable host, `-4` overriding the IPv6-first default, fallback to the other family; `connect_tcp_preferred`: reaches an IPv4 listener, falls back across families, errors on an unresolvable host; `X11Display` parsing |
+| `bin/etr` | CLI defaults, port parsing, target parsing, `-4`/`-6` short and long forms, their mutual exclusion, a family flag ahead of a remote command, CLI-beats-config precedence, no --cipher flag, custom --log-path and --server-log-path overrides, config fallback for log paths, terminal-restore sequences (cursor-safe modes cover mouse/paste/cursor and never move the cursor; screen reset leaves alt-screen without clearing scrollback), `is_authorized_reverse_stream` X11/reverse-spec enforcement, `posix_shell_quote`, `validate_bootstrap_inputs` |
+| `config` | TOML parse (full section, partial, empty), default values, `gateway_ports` / `forward` / `reverse_forward` / `x11` / `x11_trusted` / `address_family` config keys, `merge_defaults` idempotence, `open_private_log_file` traversal/symlink/writable-parent rejection |
+| `forward` | UDP fast path: `UdpFrameEncoder` byte-identical to the pre-0.9.2 inline encoder (IPv4/IPv6, empty and 65507-byte payloads), alternating peers, port-only change, round trip through the decoder; `datagram_peer_addr` accepts both families and rejects port 0, ports above 65535 and non-literals. `-L`/`-R` spec parsing: TCP/UDP/IPv6, explicit proto, bad port, empty host, Display; bind address parsing (explicit IP, `[::1]`, wildcard `*`); `get_bind_addresses` with and without gateway flag; `resolve_udp_target`: localhost prefers IPv6, explicit IPv4, unresolvable host, `-4` overriding the IPv6-first default, fallback to the other family; `connect_tcp_preferred`: reaches an IPv4 listener, falls back across families, errors on an unresolvable host; `X11Display` parsing, `parse_xauth_list_for_display` exact-display matching without unrelated fallback |
 | `addrfam` | `AddrPref` from flags / config aliases / `ETRPREFER:` wire values (unknown → `Auto` in every direction), `or` fallback, ssh flag mapping, `order_by_family` (preferred family first, stable within a family, identity for `Auto`, single-family and empty input), `first_routable`, `resolve_preferred`, `family_available` |
 | `tools/stress` | `Pacer::new(0)` unpaced no-op, `advance_deadline` coarse-sleep vs `SPIN_HORIZON` spin-window splitting, `MAX_LAG_STEPS` lag clamping without catch-up bursts, and sub-100 µs (`50 µs`) busy-wait accuracy |
