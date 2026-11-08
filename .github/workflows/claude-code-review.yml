@@ -1,23 +1,11 @@
 name: Claude Code Review
 
-# MANUAL ONLY. This does not run on pull requests automatically.
-#
-# WHY. The token behind this action has failed before in a way that is worse than useless:
-# in rusticprofile it went from 19 consecutive green runs to failing every run in ~490 ms on
-# turn 1 at $0.00, posting no findings. A rejection before any tokens are billed is a
-# credential or quota problem, not a verdict on the code -- but left on `pull_request` it
-# becomes a red check on every future PR for a reason unrelated to that PR, which trains
-# everyone to merge over failing checks. That is worse than having no automated review, and
-# this repo has already spent effort on the opposite failure: a review job going GREEN
-# without reviewing anything.
-#
-# Run it deliberately instead:
+# Runs automatically on same-repo pull requests and on manual `workflow_dispatch`:
 #     gh workflow run claude-code-review.yml -f pr=<number>
 #
-# To restore automatic review, put the `pull_request:` trigger back — the block below is
-# kept intact and commented for exactly that. Check the token first: `gh secret list`
-# shows when CLAUDE_CODE_OAUTH_TOKEN was last set, and `claude setup-token` mints a new
-# one. Note `claude.yml` uses the same secret, so @claude mentions fail the same way.
+# Check the token with `gh secret list` (shows when CLAUDE_CODE_OAUTH_TOKEN was last set);
+# `claude setup-token` mints a new one if it ever expires. Note `claude.yml` uses the same
+# secret, so @claude mentions fail the same way.
 #
 # Read-only by design: this job reviews, it does not push. Anything that needs to change
 # the repository goes through `claude.yml`, which is triggered deliberately by an @claude
@@ -31,6 +19,8 @@ name: Claude Code Review
 # `Workflow validation failed` rather than trusting the check mark.
 
 on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
   workflow_dispatch:
     inputs:
       pr:
@@ -38,15 +28,12 @@ on:
         required: true
         type: string
 
-  # Restore automatic review by uncommenting this and deleting the block above.
-  # pull_request:
-  #   types: [opened, synchronize, ready_for_review, reopened]
-
 permissions:
   contents: read
 
 jobs:
   claude-review:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
 
     permissions:
@@ -57,7 +44,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
 
@@ -68,7 +55,7 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
           plugins: 'code-review@claude-code-plugins'
-          prompt: '/code-review:code-review ${{ github.repository }}/pull/${{ inputs.pr }}'
+          prompt: '/code-review:code-review ${{ github.repository }}/pull/${{ inputs.pr || github.event.pull_request.number }}'
           # Dependabot opens PRs as a bot actor, and the action refuses non-human actors
           # unless they are named. Without this, exactly the PRs least likely to get a
           # human read would also get no review. Scoped to dependabot alone.

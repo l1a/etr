@@ -86,10 +86,15 @@ def parse_cargo_version(cargo_toml_text: str) -> str:
     raise ManPageError("could not find `version = \"...\"` in Cargo.toml")
 
 
+def expected_th_header(name: str, version: str) -> bytes:
+    """Return the canonical line-1 `.TH` header for `name` and `version`."""
+    return f'.TH "{name}" "1" "" "etr {version}" "User Commands"'.encode("utf-8")
+
+
 def rewrite_th_header(raw_mandown_output: bytes, name: str, version: str) -> bytes:
     """Normalise mandown output to LF and replace line 1 with the canonical .TH header."""
     lf_bytes = raw_mandown_output.replace(b"\r\n", b"\n")
-    header = f'.TH "{name}" "1" "" "etr {version}" "User Commands"'.encode("utf-8")
+    header = expected_th_header(name, version)
     _, sep, rest = lf_bytes.partition(b"\n")
     if not sep:
         return header + b"\n"
@@ -200,34 +205,52 @@ def _git_show_bytes(repo_root: Path, rev_path: str) -> bytes:
     return proc.stdout
 
 
+def _check_header_and_lf(raw: bytes, label: str, name: str, version: str) -> str | None:
+    """Verify LF line endings and the `.TH` version header even when mandown is absent."""
+    if not raw:
+        return f"error: {label} is missing or empty — run 'just man' and commit the result."
+    if b"\r" in raw:
+        return f"error: {label} contains carriage returns (CRLF) — run 'just man' to normalise to LF."
+    first_line = raw.partition(b"\n")[0]
+    expected_th = expected_th_header(name, version)
+    if first_line != expected_th:
+        return (
+            f"error: {label} is stale (line 1 is {first_line.decode('utf-8', errors='replace')!r}, "
+            f"expected {expected_th.decode('utf-8')!r}) — run 'just man' and commit the result."
+        )
+    return None
+
+
 def check_pages(
     repo_root: Path = REPO_ROOT,
     renderer: Renderer | None = None,
     mandown_lookup: Callable[[str], str | None] = shutil.which,
 ) -> tuple[int, str]:
     """Verify worktree and HEAD man pages are current. Returns (exit_code, message)."""
-    if renderer is None:
-        if mandown_lookup("mandown") is None:
-            return 0, "man-check: mandown not installed — skipping (cargo install mandown)"
+    if renderer is None and mandown_lookup("mandown") is not None:
         renderer = render_with_mandown
 
-    # 1. Worktree check (raw bytes).
+    # 1. Worktree check (.TH header + LF always; full mandown render when available).
     version = parse_cargo_version((repo_root / "Cargo.toml").read_text(encoding="utf-8"))
     for md_rel, name, man_rel in PAGES:
-        expected = renderer(repo_root / md_rel, name, version)
         man_path = repo_root / man_rel
         actual = man_path.read_bytes() if man_path.is_file() else b""
-        if actual != expected:
-            preview = _unified_diff_preview(
-                actual, expected, str(man_rel.as_posix()), f"{man_rel.as_posix()} (rendered)"
-            )
-            msg = (
-                f"error: {man_rel.as_posix()} is stale — run 'just man' and commit the result.\n"
-                "       (the .TH line embeds the version, so a version bump always changes it)"
-            )
-            if preview:
-                msg = f"{msg}\n{preview}"
-            return 1, msg
+        hdr_err = _check_header_and_lf(actual, man_rel.as_posix(), name, version)
+        if hdr_err is not None and renderer is None:
+            return 1, hdr_err
+        if renderer is not None:
+            expected = renderer(repo_root / md_rel, name, version)
+            if actual != expected:
+                preview = _unified_diff_preview(
+                    actual, expected, str(man_rel.as_posix()), f"{man_rel.as_posix()} (rendered)"
+                )
+                msg = (
+                    f"error: {man_rel.as_posix()} is stale — run 'just man' and commit the result.\n"
+                    "       (the .TH line embeds the version, so a version bump always changes it)"
+                )
+                if preview:
+                    msg = f"{msg}\n{preview}"
+                return 1, msg
 
     # 2. HEAD check, against itself.
     if not _git_has_head(repo_root):
@@ -238,6 +261,19 @@ def check_pages(
 
     head_cargo = _git_show_bytes(repo_root, "HEAD:Cargo.toml").decode("utf-8")
     head_version = parse_cargo_version(head_cargo)
+
+    if renderer is None:
+        for _, name, man_rel in PAGES:
+            committed_man = _git_show_bytes(repo_root, f"HEAD:{man_rel.as_posix()}")
+            hdr_err = _check_header_and_lf(
+                committed_man, f" the COMMITTED {man_rel.as_posix()}", name, head_version
+            )
+            if hdr_err is not None:
+                return 1, hdr_err
+        return 0, (
+            f"man pages .TH headers are current (worktree {version}, HEAD {head_version}); "
+            "mandown not installed — skipping body re-render (cargo install mandown)"
+        )
 
     # Temp files live inside `man/` rather than `/tmp`: on a Syncthing-synced tree a
     # cross-filesystem `mv` from tmpfs carries the `user_tmp_t` SELinux label into `~/Sync`
@@ -332,12 +368,15 @@ def self_test() -> int:
         f"got {rewritten!r}",
     )
 
-    # 2. Missing mandown: --check skips (exit 0), --build refuses (exit 1).
+    # 2. Missing mandown: --check still validates .TH version and LF, --build refuses (exit 1).
     with tempfile.TemporaryDirectory() as d:
         root = Path(d)
         _init_fixture_repo(root)
         c_code, c_msg = check_pages(root, renderer=None, mandown_lookup=lambda _: None)
-        assert_true("missing mandown skips check", c_code == 0 and "skipping" in c_msg, c_msg)
+        assert_true("missing mandown checks .TH and skips body render", c_code == 0 and "skipping" in c_msg, c_msg)
+        (root / "Cargo.toml").write_bytes(b'[package]\nname = "etr"\nversion = "0.9.9"\n')
+        c_stale_code, c_stale_msg = check_pages(root, renderer=None, mandown_lookup=lambda _: None)
+        assert_true("missing mandown still catches stale .TH version", c_stale_code == 1 and "man/etr.1 is stale" in c_stale_msg, c_stale_msg)
         b_code, b_msg = build_pages(root, renderer=None, mandown_lookup=lambda _: None)
         assert_true("missing mandown fails build", b_code == 1 and "mandown is required" in b_msg, b_msg)
 

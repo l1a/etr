@@ -27,16 +27,18 @@ jobs:
     runs-on: ubuntu-latest
     container: fedora:latest
     steps:
+      # Installed BEFORE checkout: fedora:latest ships no git, and without it
+      # actions/checkout silently falls back to a REST tarball download with no .git or tags.
+      - name: Install copr-cli
+        run: dnf -y install copr-cli git python3
+
       # fetch-depth: 0 so a workflow_dispatch run can ask git for the last released tag. A
       # tag-triggered run gets it from the ref and does not need the history, but the guard
       # below must work identically either way -- a check that is skipped on one of its two
       # entry points is not a check.
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-
-      - name: Install copr-cli
-        run: dnf -y install copr-cli git python3
 
       - name: Refuse unless Cargo.toml matches the released tag
         run: |

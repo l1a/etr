@@ -783,7 +783,7 @@ fn generate_session_id() -> [u8; 16] {
 }
 
 fn generate_passkey() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     rand::rng()
         .sample_iter(rand::distr::Alphanumeric)
         .take(32)
