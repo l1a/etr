@@ -403,7 +403,7 @@ merge-pr:
     # gate at all, so every merge here has been ungated -- safe only because whoever merged
     # happened to look at CI first.
     echo "Checking CI on this branch..."
-    STATES=$(gh pr view --json statusCheckRollup --jq '[.statusCheckRollup[]? | select(.conclusion != "SKIPPED") | .conclusion]' 2>/dev/null || echo '[]')
+    STATES=$(gh pr view --json statusCheckRollup --jq '[.statusCheckRollup[]? | select((.conclusion // .state // "") != "SKIPPED") | (.conclusion // .state // "")]' 2>/dev/null || echo '[]')
 
     # NO checks at all is not "green", and the arm below cannot tell the difference: an empty
     # rollup matches neither "" nor FAILURE, so without this the recipe would report green and
@@ -420,18 +420,42 @@ merge-pr:
         exit 1
     fi
 
-    if echo "$STATES" | grep -q '""'; then
+    if echo "$STATES" | grep -qE 'PENDING|QUEUED|IN_PROGRESS|WAITING|REQUESTED|""'; then
         echo "Error: checks are still running. Wait for them, or merge deliberately with gh."
         exit 1
     fi
 
     if echo "$STATES" | grep -qE 'FAILURE|TIMED_OUT|CANCELLED|ACTION_REQUIRED'; then
         echo "Error: CI is not green on this branch:"
-        gh pr view --json statusCheckRollup --jq '.statusCheckRollup[]? | select(.conclusion != "SKIPPED" and .conclusion != "SUCCESS") | "  \(.conclusion)  \(.name)"'
+        gh pr view --json statusCheckRollup --jq '.statusCheckRollup[]? | select((.conclusion // .state // "") != "SKIPPED" and (.conclusion // .state // "") != "SUCCESS") | "  \(.conclusion // .state // "UNKNOWN")  \(.name)"'
+        echo "Fix it, or merge deliberately with gh if you have a reason."
+        exit 1
+    fi
+
+    if ! printf '%s' "$STATES" | tr -d '[:space:]' | grep -qE '^\["(SUCCESS|NEUTRAL)"(,"(SUCCESS|NEUTRAL)")*\]$'; then
+        echo "Error: Not all checks concluded SUCCESS or NEUTRAL on this branch:"
+        gh pr view --json statusCheckRollup --jq '.statusCheckRollup[]? | select((.conclusion // .state // "") != "SKIPPED" and (.conclusion // .state // "") != "SUCCESS" and (.conclusion // .state // "") != "NEUTRAL") | "  \(.conclusion // .state // "UNKNOWN")  \(.name)"'
         echo "Fix it, or merge deliberately with gh if you have a reason."
         exit 1
     fi
     echo "CI is green."
+
+    PR_NUM=$(gh pr view --json number --jq .number)
+    if ! UNRESOLVED=$(gh api graphql -F owner='l1a' -F name='etr' -F pr="$PR_NUM" \
+        -f query='query($owner: String!, $name: String!, $pr: Int!) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) { reviewThreads(first: 100) { pageInfo { hasNextPage } nodes { isResolved } } latestReviews(first: 100) { pageInfo { hasNextPage } nodes { state } } comments(first: 100) { pageInfo { hasNextPage } nodes { author { login } } } } } }' \
+        --jq 'if .data.repository.pullRequest == null then error("missing pullRequest") else ([.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)] | length) + ([.data.repository.pullRequest.latestReviews.nodes[] | select(.state == "CHANGES_REQUESTED")] | length) + ([.data.repository.pullRequest.comments.nodes[] | select((.author.login // "") | test("^(claude|cursor|github-advanced-security|codeql)"; "i"))] | length) + (if .data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage or .data.repository.pullRequest.latestReviews.pageInfo.hasNextPage or .data.repository.pullRequest.comments.pageInfo.hasNextPage then 1 else 0 end) end') \
+        || ! [[ "$UNRESOLVED" =~ ^[0-9]+$ ]]; then
+        echo "Error: Could not query review/scanner feedback for PR #${PR_NUM}." >&2
+        exit 1
+    fi
+    if [ "${UNRESOLVED}" != "0" ] && [ "${MERGE_ALLOW_COMMENTS:-}" != "1" ]; then
+        echo "Error: PR #${PR_NUM} has ${UNRESOLVED} unaddressed review/scanner finding(s) (e.g. Claude Code Review, Cursor Bugbot, Cursor Security Agent, CodeQL):" >&2
+        gh api graphql -F owner='l1a' -F name='etr' -F pr="$PR_NUM" \
+            -f query='query($owner: String!, $name: String!, $pr: Int!) { repository(owner: $owner, name: $name) { pullRequest(number: $pr) { reviewThreads(first: 100) { nodes { isResolved path line comments(first: 1) { nodes { author { login } body } } } } latestReviews(first: 100) { nodes { state author { login } body } } comments(first: 100) { nodes { author { login } body } } } } }' \
+            --jq '((.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false) | "  - [thread:\(.comments.nodes[0].author.login // "?")] \(.path):\(.line // "?"): \((.comments.nodes[0].body // "") | split("\n")[0])"), (.data.repository.pullRequest.latestReviews.nodes[] | select(.state == "CHANGES_REQUESTED") | "  - [review:\(.author.login // "?")] CHANGES_REQUESTED: \((.body // "") | split("\n")[0])"), (.data.repository.pullRequest.comments.nodes[] | select((.author.login // "") | test("^(claude|cursor|github-advanced-security|codeql)"; "i")) | "  - [comment:\(.author.login // "?")] \((.body // "") | split("\n")[0])"))' >&2
+        echo "Inspect and address all findings first, or re-run with MERGE_ALLOW_COMMENTS=1 once verified." >&2
+        exit 1
+    fi
 
     echo "Merging PR for branch $BRANCH..."
     gh pr merge --squash --delete-branch
@@ -578,6 +602,8 @@ aur-publish VERSION="":
     fi
     echo "$OUT" | grep -qi 'Permission denied' \
         && fail "the AUR refused this SSH key; register it at https://aur.archlinux.org/account/"
+    echo "$OUT" | grep -qiE 'Commands:|Welcome to AUR|successfully authenticated' \
+        || fail "could not reach the AUR over SSH — it said: $(echo "$OUT" | head -1)"
     pass "AUR reachable and the SSH key is accepted"
 
     echo

@@ -1,6 +1,6 @@
 [package]
 name = "etr"
-version = "0.10.20"
+version = "0.10.21"
 edition = "2024"
 description = "Reconnecting remote shell over QUIC — a Rust implementation of Eternal Terminal (et)"
 license = "GPL-3.0-only"
@@ -42,10 +42,10 @@ prost = "0.14"
 quinn = "0.11.12"
 rcgen = "0.14"
 rustls = "0.23"
-rand = "0.9"
+rand = "0.10"
 crossterm = "0.29"
 nix = { version = "0.31", features = ["fs", "term", "process", "signal", "user"] }
-dirs = "6"
+dirs = "7"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 toml = "1"

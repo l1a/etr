@@ -27,11 +27,12 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.10.20
+## Current state: v0.10.21
 
-`main` carries **0.10.20**. The newest released tag is **`v0.10.19`**, live on GitHub,
-crates.io, the AUR, COPR and the Homebrew tap; **0.10.20 is merged and untagged**
-(Justfile and GitHub Actions workflow standardization across the four-repo fleet).
+`main` carries **0.10.21**. The newest released tag is **`v0.10.19`**, live on GitHub,
+crates.io, the AUR, COPR and the Homebrew tap; **0.10.21 is merged and untagged**
+(Justfile and GitHub Actions workflow standardization and review-comment gate hardening
+across the four-repo fleet).
 
 The full round trip works on Linux and macOS: SSH bootstrap, QUIC session with pinned
 certificate, PTY, keepalives, reconnect after a drop, `-L`/`-R` TCP and UDP forwarding,
@@ -818,14 +819,15 @@ the GitHub release has been built.
   sat in this file for eight releases — one of them turning into a real newline and **splitting
   a paragraph in half**, which is why review never caught it: the file still rendered, just
   wrongly. Write `chr(92)` in Python; never a backslash literal in a shell string.
-- **Claude Code Review runs on `workflow_dispatch` only.** The token behind it has failed in a
-  way worse than useless — in a sibling repo, 19 green runs then failing *every* run in ~490 ms
-  at $0.00 with no findings. A rejection before any tokens are billed is a credential or quota
-  problem, not a verdict on the code, but left on `pull_request` it becomes a red check on every
-  future PR and trains everyone to merge over failing checks. The trigger is kept commented
-  immediately below, so restoring it is uncommenting two lines. Deliberately **not** copied from
-  retch: its version also sets `if: false`, so a manual dispatch appears to run and silently does
-  nothing.
+- **Claude Code Review runs automatically on same-repo `pull_request` events and on `workflow_dispatch`.**
+  The job skips fork PRs (`github.event.pull_request.head.repo.full_name == github.repository`) so
+  untrusted forks without secrets do not fail, and `prompt:` resolves
+  `${{ inputs.pr || github.event.pull_request.number }}` so both automatic PR triggers and manual
+  `gh workflow run claude-code-review.yml -f pr=<number>` dispatches target the right PR. Note that
+  `anthropics/claude-code-action` requires `.github/workflows/claude-code-review.yml` to match the
+  default branch and skips with `Workflow validation failed` on any PR that edits the workflow file
+  itself; the `Report whether the review actually ran` step makes that visible in the job summary
+  and log.
 - **On Windows, `Path::canonicalize` returns a verbatim prefix (`\\?\…`) on which `PathBuf::join("..")`
   pops the parent component in-place instead of appending `Component::ParentDir`** (v0.10.18).
   Win32 verbatim paths bypass Windows path normalization, so Rust's `PathBuf::push` normalizes `.`

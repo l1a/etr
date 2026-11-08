@@ -6,7 +6,7 @@ all AI assistants (Gemini, Claude, etc.) contributing to the **etr** project.
 This file has two parts:
 
 - **Part 1 — Portable Core**: rules that are identical across all of Ken's repos using this
-  pattern (currently `etr`, `retch` and `rusticprofile`). If you change wording here, propagate
+  pattern (currently `etr`, `retch`, `rusticprofile`, and `dog`). If you change wording here, propagate
   the same change to the Portable Core section in sibling repos so they stay in sync.
 - **Part 2 — Project-Specific**: rules that only make sense for `etr`.
 
@@ -52,6 +52,8 @@ that detail; `~/AGENTS.md`'s cross-cutting mandates still apply.
     one's NOTES.md records its own instances.
 * **Constraint:** NEVER run background `git commit` or `git push` without explicit authorization.
 * **Mandate:** ALWAYS ask for explicit permission before submitting a Pull Request (PR) or performing a merge.
+* **Inspect All Security/Bug Scanner and Review Bot Feedback Before Merging:** Automated security/bug scanners and review bots (`Claude Code Review`, `Cursor Bugbot`, `Cursor Security Agent`, `CodeQL`, etc.) post findings across three distinct channels — inline pull request review threads (`reviewThreads`), PR reviews (`latestReviews` with `state: "COMMENTED"` or `"CHANGES_REQUESTED"`), and top-level PR issue comments (`comments`, e.g. `claude[bot]`'s sticky review comment) — while often setting their GitHub Check Run conclusion to `SUCCESS` or `NEUTRAL`. Therefore, `gh pr checks` and `statusCheckRollup` can report all checks non-failing even when real bug or security findings were posted on the PR. Before asking to merge any PR, ALWAYS inspect all three channels (plus any CodeQL check-run annotations) and address all real findings; `just merge-pr` enforces this fail-closed via GraphQL by refusing to merge when unresolved `reviewThreads`, `CHANGES_REQUESTED` `latestReviews`, or top-level bot `comments` (`claude`, `cursor`, `github-advanced-security`, `codeql`) are present unless `MERGE_ALLOW_COMMENTS=1` is explicitly set after verification.
+* **Review and Address Open Dependabot PRs Before Merging:** Before merging a PR (or during maintenance sweeps), check for open Dependabot PRs (`gh pr list --author "app/dependabot"`). Dependabot PRs are never merged directly (they lack our required version bump, `NOTES.md` update, and `just pr` gate); instead, review what Dependabot found (workflows and Cargo dependencies), fold or expand the updates into our gated PR, verify they compile and pass all tests/advisories (`cargo audit`), and let GitHub auto-close the Dependabot PRs once `main` carries the update.
 * **Branch Cleanup:** Delete feature branches from the remote after they are merged. Periodically prune abandoned branches that were never PRed.
 
 ## 2. Engineering Philosophy & Safety
@@ -87,12 +89,17 @@ At the conclusion of any task involving a specific skill:
 2. Did the user have to correct your workflow?
 3. If YES to either, you MUST automatically update the corresponding `SKILL.md` file with the new learning and synchronize the change before declaring the task complete.
 
-## 5. Sandbox Exceptions (`BypassSandbox: true`)
+## 5. Sandbox Bypass (`BypassSandbox: true`) & Sandbox Learning Loop
 Per `~/AGENTS.md` §6 (**Sandbox Bypass & Sandbox Learning Loop**), always run the following universal command classes with `BypassSandbox: true` on the **first** call — never attempt them with `BypassSandbox: false` first:
 * **All `gh` / `ghpub` commands** (`gh pr`, `gh run`, `gh workflow`, `gh api`, `gh issue`, `gh release`): require network access to `api.github.com`.
 * **All `git` write or remote commands** (`git checkout`, `git switch`, `git branch -d/-D`, `git add`, `git rm`, `git mv`, `git commit`, `git merge`, `git rebase`, `git tag`, `git fetch`, `git pull`, `git push`): `.git/` is mounted read-only in the sandbox and remote ops need network access.
 * **`just` shebang and network recipes** (`#!/usr/bin/env ...` recipes write temp scripts to `/run/user/1000/just`, which is read-only inside the sandbox): `just pr`, `just open-pr`, `just merge-pr`, `just prune-branches`, `just github-metadata`, `just publish`, `just aur-publish` / `just publish-aur`, `just brew-publish` / `just publish-brew`.
 * **Cargo network operations:** `cargo update` (use `cargo --config net.retry=0 update`), `cargo fetch`, `cargo publish`, `cargo audit`.
+* **Repo-Local Sandbox Learning Loop:**
+  1. **Read before running:** Check Part 1 §5 and Part 2 §7 (plus any staged entries in `WIP.md`) at session start and pass `BypassSandbox: true` on the **first** invocation for every listed command/recipe.
+  2. **Learn on first failure (never fail twice on the same sandbox boundary):** If a command run with `BypassSandbox: false` fails because of a sandbox boundary (`Read-only file system`, `Could not resolve host`, `no connections available`, `Permission denied` on a non-workspace path/socket, or unmounted interpreter), immediately re-run with `BypassSandbox: true` (do not retry with `BypassSandbox: false`).
+  3. **Clean-tree staging (`WIP.md`):** If a new repo-specific sandbox exception is discovered while on `main` or after a PR's final commit is already pushed and waiting to merge (where modifying tracked `AGENTS.md` would dirty the working tree or invalidate CI checks), record it immediately in `WIP.md` under `## Sandbox Exceptions (staged for AGENTS.md)`.
+  4. **Fold into `AGENTS.md` on the next PR:** Promote any staged entries from `WIP.md` into Part 2 §7 of `AGENTS.md` (or `~/AGENTS.md` §6 if universal) in the very next commit/PR and remove the staged section from `WIP.md`.
 
 ---
 
