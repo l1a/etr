@@ -18,6 +18,22 @@ if [ "${GIT_NO_CHECK:-0}" = "1" ]; then
     exit 0
 fi
 
+# Skip pushes that only delete remote refs or only update branches with no Rust source (e.g. gh-pages).
+saw_ref=0
+needs_check=0
+while read -r _local_ref local_sha remote_ref _remote_sha; do
+    saw_ref=1
+    case "$remote_ref" in
+        refs/heads/gh-pages|gh-pages) continue ;;
+    esac
+    if [ "$local_sha" != "0000000000000000000000000000000000000000" ]; then
+        needs_check=1
+    fi
+done
+if [ "$saw_ref" = "1" ] && [ "$needs_check" = "0" ]; then
+    exit 0
+fi
+
 # Absent `just` must not block a push. The hook is a convenience for contributors who have
 # the toolchain; refusing the push for someone who does not would make the repo unusable
 # rather than safer.
@@ -28,9 +44,7 @@ fi
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 
 echo "[check] Running just check..."
-# NOTE: lowercase `justfile` in this repo — the sibling repos use `Justfile`, and a
-# hardcoded capital-J path silently finds nothing here.
-if ! just --justfile "$REPO_ROOT/justfile" check; then
+if ! just --justfile "$REPO_ROOT/Justfile" check; then
     echo ""
     echo "[check] Failed. Run 'just check' for details; 'cargo fmt' fixes formatting."
     exit 1

@@ -1,0 +1,30 @@
+version: 2
+updates:
+  # Enable Dependabot for Rust (Cargo)
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+    groups:
+      cargo-dependencies:
+        patterns:
+          - "*"
+
+  # Enable Dependabot for GitHub Actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+      include: "scope"
+    # Patterns match dependency NAMES, not branches: "main" matches no action at all.
+    groups:
+      github-actions:
+        patterns:
+          - "*"

@@ -1,0 +1,236 @@
+name: Packaging Verification
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+    paths:
+      - '**/*.rs'
+      - '**/Cargo.toml'
+      - '**/README.md'
+      - 'Cargo.lock'
+      - 'man/**'
+      - 'packaging/**'
+      - 'Justfile'
+      - 'scripts/*_check.py'
+      - 'scripts/render_packaging.py'
+      - '.copr/**'
+      - '.github/workflows/copr.yml'
+      - '.github/workflows/packaging.yml'
+      - '.github/workflows/release.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  guards:
+    name: Offline Packaging Guards
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Renderer and channel guards
+        run: |
+          python3 scripts/render_packaging.py --self-test
+          python3 scripts/packaging_check.py --self-test
+          python3 scripts/packaging_check.py
+
+  aur:
+    name: AUR (Arch)
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install system dependencies
+        run: pacman -Syu --noconfirm git python
+
+      - name: Checkout Code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      # .SRCINFO is what the AUR actually reads, and it restates the PKGBUILD's version and
+      # five checksums. Prove the rendered pair from PKGBUILD.in and SRCINFO.in agrees with
+      # what makepkg --printsrcinfo itself generates from the rendered PKGBUILD.
+      - name: Render PKGBUILD and .SRCINFO
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/aur
+          SHA1="77ccf85843d24ac3216ab31d2584ff4a95869266c59ddb8bc83819425cfc2033"
+          SHA2="1e5c3f0a9b8d7c6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e"
+          SHA3="3c1f7e9a2b8d4c6e0f5a9b3d7c1e5f9a2b6d8c4e0f7a1b5d9c3e7f1a5b9d3c7e"
+          SHA4="4d2e8f0b3c9e5d7f1a6b0c4e8d2f6a0b3c7e9d5f1a8b2c6e0d4f8a2b6c0e4d8f"
+          SHA5="5e3f9a1c4d0f6e8a2b7c1d5f9e3a7b1c4d8f0e6a2b9c3d7f1e5a9b3c7d1f5e9a"
+          ARGS=(
+            --version 0.0.1
+            --sha256 "SHA_ETR_X86_64=$SHA1"
+            --sha256 "SHA_ETRS_X86_64=$SHA2"
+            --sha256 "SHA_ETR_AARCH64=$SHA3"
+            --sha256 "SHA_ETRS_AARCH64=$SHA4"
+            --sha256 "SHA_EXTRAS=$SHA5"
+          )
+          python3 scripts/render_packaging.py --target aur-pkgbuild "${ARGS[@]}" --out /tmp/aur/PKGBUILD
+          python3 scripts/render_packaging.py --target aur-srcinfo  "${ARGS[@]}" --out /tmp/aur/SRCINFO.rendered
+
+      - name: .SRCINFO matches what makepkg generates
+        run: |
+          set -euo pipefail
+          useradd -m builder
+          chown -R builder /tmp/aur
+          su builder -c 'cd /tmp/aur && makepkg --printsrcinfo > SRCINFO.generated'
+          diff -u /tmp/aur/SRCINFO.rendered /tmp/aur/SRCINFO.generated
+          echo ".SRCINFO matches makepkg --printsrcinfo"
+
+  copr:
+    name: COPR SRPM (Fedora)
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - name: Install system dependencies
+        run: dnf -y install git make rpm-build rpmdevtools python3
+
+      - name: Checkout Code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Verify the spec and copr.yml credentials guard
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          python3 scripts/packaging_check.py --self-test
+          python3 scripts/packaging_check.py
+
+      - name: Build the SRPM in a plain container
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/srpm-plain
+          make -f .copr/Makefile srpm outdir=/tmp/srpm-plain
+          ls -1 /tmp/srpm-plain
+
+      - name: Build the SRPM under mock's environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf .copr-build
+          mkdir -p /builddir /tmp/srpm-mock
+          echo "%_topdir /builddir/build" > /builddir/.rpmmacros
+          export HOME=/builddir
+          echo "HOME=$HOME  _topdir=$(rpmbuild --eval '%{_topdir}')"
+          make -f .copr/Makefile srpm outdir=/tmp/srpm-mock
+          ls -1 /tmp/srpm-mock
+
+      - name: Verify the SRPM matches Cargo.toml's version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(python3 scripts/render_packaging.py --print-version)
+          srpm=$(find /tmp/srpm-mock -maxdepth 1 -name '*.src.rpm' -print -quit)
+          if [ -z "$srpm" ]; then
+            echo "::error::no .src.rpm was produced"
+            ls -la /tmp/srpm-mock || true
+            exit 1
+          fi
+          echo "Cargo.toml version: $version"
+          echo "built:              $(basename "$srpm")"
+          case "$(basename "$srpm")" in
+            etr-"$version"-*.src.rpm) ;;
+            *)
+              echo "::error::SRPM name does not carry Cargo.toml's version ($version)"
+              exit 1
+              ;;
+          esac
+          echo "SRPM matches the rendered version"
+
+  brew:
+    name: Homebrew Formula (macOS)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Formula template is valid (offline)
+        run: |
+          python3 scripts/render_packaging.py --self-test
+          python3 scripts/packaging_check.py --self-test
+          python3 scripts/packaging_check.py
+
+      - name: Render the formula for the last released tag
+        run: |
+          set -euo pipefail
+          TAG=$(git describe --tags --abbrev=0 2>/dev/null || true)
+          if [ -z "$TAG" ]; then
+            echo "::error::no tags in this checkout — cannot render a formula to install"
+            exit 1
+          fi
+          VER="${TAG#v}"
+          URL="https://github.com/l1a/etr/archive/refs/tags/${TAG}.tar.gz"
+          echo "last released tag: $TAG"
+          curl -sfL -o /tmp/src.tar.gz "$URL" || { echo "::error::cannot fetch $URL"; exit 1; }
+          SHA=$(shasum -a 256 /tmp/src.tar.gz | cut -d' ' -f1)
+          echo "computed sha256: $SHA"
+          python3 scripts/render_packaging.py --target brew --version "$VER" --sha256 "SHA256=$SHA" \
+            --out /tmp/etr.rb
+          grep -q "refs/tags/v${VER}.tar.gz" /tmp/etr.rb \
+            || { echo "::error::rendered formula does not point at $TAG"; exit 1; }
+          grep -q "sha256 \"${SHA}\"" /tmp/etr.rb \
+            || { echo "::error::rendered formula does not carry the computed sha256"; exit 1; }
+          echo "RENDERED_VER=$VER" >> "$GITHUB_ENV"
+          echo "render verified against the real $TAG tarball"
+
+      - name: Ruby syntax
+        run: ruby -c /tmp/etr.rb
+
+      - name: Stage the formula in a local tap
+        run: |
+          set -euo pipefail
+          brew tap-new --no-git local/test
+          cp /tmp/etr.rb "$(brew --repository local/test)/Formula/etr.rb"
+          echo "staged at $(brew --repository local/test)/Formula/etr.rb"
+
+      - name: Install from source
+        run: brew install --build-from-source local/test/etr
+
+      - name: Run the formula's test block
+        run: brew test local/test/etr
+
+      - name: Audit the formula
+        run: brew audit --formula --strict local/test/etr
+
+      - name: Inspect the installed payload
+        run: |
+          set -euo pipefail
+          PREFIX=$(brew --prefix local/test/etr)
+          echo "prefix: $PREFIX"
+          for b in etr etrs; do
+            test -x "$PREFIX/bin/$b"
+            "$PREFIX/bin/$b" --version
+            MAN=$(find "$PREFIX/share/man/man1" -name "${b}.1*" -print -quit)
+            [ -n "$MAN" ] || { echo "::error::no man page installed for $b"; exit 1; }
+            case "$MAN" in *.gz) gunzip -c "$MAN" > "/tmp/${b}.1" ;; *) cp "$MAN" "/tmp/${b}.1" ;; esac
+            head -1 "/tmp/${b}.1"
+            grep -q '^\.TH' "/tmp/${b}.1" || { echo "::error::man page ${b}.1 has no .TH line"; exit 1; }
+            if grep -m1 '^\.TH' "/tmp/${b}.1" | grep -q '\$'; then
+              echo "::error::man page ${b}.1 .TH contains a literal \$"; exit 1
+            fi
+          done
+          MISSING=0
+          for f in "$PREFIX/etc/bash_completion.d/etr" \
+                   "$PREFIX/etc/bash_completion.d/etrs" \
+                   "$PREFIX/share/zsh/site-functions/_etr" \
+                   "$PREFIX/share/zsh/site-functions/_etrs" \
+                   "$PREFIX/share/fish/vendor_completions.d/etr.fish" \
+                   "$PREFIX/share/fish/vendor_completions.d/etrs.fish"; do
+            if [ -s "$f" ]; then
+              echo "  ok  $f ($(wc -c < "$f" | tr -d ' ') bytes)"
+            else
+              echo "::error::missing or empty completion: $f"
+              MISSING=1
+            fi
+          done
+          if [ "$MISSING" -ne 0 ]; then
+            echo "--- everything actually installed under the prefix ---"
+            find "$PREFIX" -type f | sed "s|^$PREFIX/||" | sort
+            exit 1
+          fi
+          echo "payload verified: two binaries, two man pages, six completion files"

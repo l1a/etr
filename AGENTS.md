@@ -87,6 +87,13 @@ At the conclusion of any task involving a specific skill:
 2. Did the user have to correct your workflow?
 3. If YES to either, you MUST automatically update the corresponding `SKILL.md` file with the new learning and synchronize the change before declaring the task complete.
 
+## 5. Sandbox Exceptions (`BypassSandbox: true`)
+Per `~/AGENTS.md` §6 (**Sandbox Bypass & Sandbox Learning Loop**), always run the following universal command classes with `BypassSandbox: true` on the **first** call — never attempt them with `BypassSandbox: false` first:
+* **All `gh` / `ghpub` commands** (`gh pr`, `gh run`, `gh workflow`, `gh api`, `gh issue`, `gh release`): require network access to `api.github.com`.
+* **All `git` write or remote commands** (`git checkout`, `git switch`, `git branch -d/-D`, `git add`, `git rm`, `git mv`, `git commit`, `git merge`, `git rebase`, `git tag`, `git fetch`, `git pull`, `git push`): `.git/` is mounted read-only in the sandbox and remote ops need network access.
+* **`just` shebang and network recipes** (`#!/usr/bin/env ...` recipes write temp scripts to `/run/user/1000/just`, which is read-only inside the sandbox): `just pr`, `just open-pr`, `just merge-pr`, `just prune-branches`, `just github-metadata`, `just publish`, `just aur-publish` / `just publish-aur`, `just brew-publish` / `just publish-brew`.
+* **Cargo network operations:** `cargo update` (use `cargo --config net.retry=0 update`), `cargo fetch`, `cargo publish`, `cargo audit`.
+
 ---
 
 # Part 2 — Project-Specific: etr
@@ -395,5 +402,13 @@ the recipes assume:
   without those secrets that workflow *skips* rather than fails, so a fork does not go red; on
   `l1a/etr` an empty secret fails the workflow outright. (An expired non-empty token still passes
   the empty check and fails at the `copr-cli` call; always verify from COPR itself per §6.)
+
+## 7. Sandbox Exceptions (`BypassSandbox: true`) — `etr`-Specific
+In addition to Part 1 §5, always run these `etr`-specific recipes with `BypassSandbox: true` on the first call:
+- **`just` shebang, network, and E2E/tmux recipes:** `just audit`, `just install-tag`, `just clean`, `just clean-procs`, `just check-tools`, `just e2e-local`, `just e2e-env-local`, `just e2e-cmd-local`, `just e2e-family-local`, `just e2e-forward-local`, `just e2e-reverse-local`, `just e2e-udp-concurrent`, `just throughput-local`, `just throughput-remote`, `just stress-local`, `just stress-udp-rate`.
+- **Non-interactive `just open-pr` in agent PTYs:** Because `run_command` allocates a PTY (`[ -t 0 ]` is true), bare `just open-pr` invokes `gh pr create` interactively and hangs waiting on `? Title (required)`. Always pass `--fill` (or explicit `--title ... --body-file ...`), e.g. `PR_CONFIRM=y just open-pr --fill`.
+- **Commands that DO work in the sandbox (`BypassSandbox: false`):**
+  - `just`, `just build`, `just build-release`, `just build-stress`, `just test`, `just fmt`, `just fmt-check`, `just clippy`, `just lint`, `just check`, `just man`, `just man-check`, `just standard-check`, `just packaging-check`, `just text-check`, `just wip-check`, `just copr-render`, `just install-hooks`, `just setup`
+  - Read-only `git` commands: `git status`, `git diff`, `git log`, `git show`, `git rev-parse`, `git for-each-ref`
 
 ---

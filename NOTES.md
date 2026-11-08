@@ -27,16 +27,16 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.10.19
+## Current state: v0.10.20
 
-`main` carries **0.10.19**. The newest released tag is **`v0.10.15`**, live on GitHub,
-crates.io, the AUR, COPR and the Homebrew tap; **0.10.16–0.10.19 are merged and untagged**
-(documentation, tooling hygiene, and security hardening).
+`main` carries **0.10.20**. The newest released tag is **`v0.10.19`**, live on GitHub,
+crates.io, the AUR, COPR and the Homebrew tap; **0.10.20 is merged and untagged**
+(Justfile and GitHub Actions workflow standardization across the four-repo fleet).
 
 The full round trip works on Linux and macOS: SSH bootstrap, QUIC session with pinned
 certificate, PTY, keepalives, reconnect after a drop, `-L`/`-R` TCP and UDP forwarding,
 X11 forwarding, `-4`/`-6` family preference. The Windows **client** works; `etrs` is
-Unix-only by design. 163 tests.
+Unix-only by design. 164 tests.
 
 What is open is listed under **Known gaps / next steps** below.
 
@@ -341,7 +341,7 @@ just install-tag 0.9.0
 # Code quality gate — run before every commit
 just check            # fmt + clippy, and: standard-check, man-check, packaging-check,
                       #   text-check, wip-check
-just test             # cargo test (163 tests, incl. tools/stress)
+just test             # cargo test (164 tests, incl. tools/stress)
 
 # Man pages are TRACKED (man/etr.1, man/etrs.1) because tag tarballs carry only tracked
 # files and COPR/Homebrew install them from there. Re-run after every version bump.
