@@ -19,6 +19,10 @@ INSTALL    := home_directory() + "/.cargo/bin"
 BINS      := "etr etrs"
 MAN_PAGES := "man/etr.1 man/etrs.1"
 
+# List available recipes
+default:
+    @just --list
+
 # Do NOT edit inside the markers. Edit templates/justfile-common.just and the two vendored
 # helpers, bump their versions, and propagate to the siblings in their own PRs.
 # `just standard-check` runs the helpers' self-tests and `just check` depends on it.
@@ -102,10 +106,6 @@ standard-check:
 LOG_FILE   := `echo "${XDG_STATE_HOME:-$HOME/.local/state}/etr/etrs.log"`
 TMUX_SESS  := "etr_test"
 
-# List available recipes
-default:
-    @just --list
-
 # ── Code quality ──────────────────────────────────────────────────────────────
 
 # Format source files
@@ -122,6 +122,9 @@ fmt-check:
 clippy:
     cargo clippy --all-targets -- -D warnings
     cargo clippy --manifest-path tools/stress/Cargo.toml --all-targets -- -D warnings
+
+# Run Clippy (alias for clippy)
+lint: clippy
 
 # Run unit and integration tests
 test:
@@ -235,11 +238,12 @@ pr:
         || fail "NOTES.md 'Current state' header not updated to v$CARGO_VER"
     pass "NOTES.md Current state header: v$CARGO_VER"
 
-    # 4. Man pages must build cleanly (man/build/ is gitignored, so there is nothing to
-    #    diff — this just proves mandown still succeeds and the version header is live).
+    # 4. Regenerate man pages and verify they were committed
     info "Building man pages..."
     just man
-    pass "Man pages build cleanly"
+    MAN_DIRTY=$(git diff --name-only man/etr.1 man/etrs.1)
+    [ -n "$MAN_DIRTY" ] && fail "man/etr.1 or man/etrs.1 was updated but not committed — stage and commit them first"
+    pass "man/etr.1 and man/etrs.1 are current and committed"
 
     # 5. cargo check — updates Cargo.lock; verify it was committed
     info "Running cargo check..."
@@ -258,6 +262,22 @@ pr:
     cargo test -q 2>&1
     cargo test --manifest-path tools/stress/Cargo.toml -q 2>&1
     pass "All tests passed"
+
+    # 8. Security audit (advisory — surfaces RustSec advisories locally before CI,
+    #    but does NOT block: advisories can be newly published against unchanged
+    #    transitive deps, which shouldn't hard-fail otherwise-ready work).
+    info "Running cargo audit..."
+    if ! command -v cargo-audit >/dev/null 2>&1; then
+        info "cargo-audit not installed — installing (cargo install cargo-audit)..."
+        cargo install cargo-audit || info "cargo-audit install failed — skipping audit this run"
+    fi
+    if command -v cargo-audit >/dev/null 2>&1; then
+        if cargo audit; then
+            pass "cargo audit: no advisories"
+        else
+            info "cargo audit reported advisories (above) — advisory only, NOT blocking the gate"
+        fi
+    fi
 
     # Manual checklist
     echo -e "\n${BOLD}Automated checks passed.${NC}\n"
@@ -343,6 +363,28 @@ open-pr *ARGS:
 install-hooks:
     @"{{PY}}" scripts/install_hooks.py
 
+# One-time repo setup: install git hooks and any other local tooling
+setup: install-hooks
+    @echo "Repo setup complete."
+
+# Full development setup
+dev: setup fmt clippy test build
+    @echo "Development build complete."
+
+# Delete local branches whose remote branch is gone, if they are merged
+prune-branches:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    git fetch --prune -q origin
+    current=$(git rev-parse --abbrev-ref HEAD)
+    gone=$(git for-each-ref --format='%(refname:short) %(upstream:track)' refs/heads | awk '$2=="[gone]"{print $1}')
+    if [ -z "$gone" ]; then echo "No local branches with a deleted remote branch."; exit 0; fi
+    [ "$current" = "main" ] || echo "Note: you are on $current, not main; a branch is kept unless it is merged into this one."
+    for b in $gone; do
+        if [ "$b" = "$current" ]; then echo "kept     $b (checked out)"; continue; fi
+        if git branch -d "$b" > /dev/null 2>&1; then echo "deleted  $b"; else echo "KEPT     $b (not merged: git branch -D $b to force)"; fi
+    done
+
 # Merge the active PR, switch to main, pull, delete the branch, and reset WIP.md (requires gh)
 merge-pr:
     #!/usr/bin/env bash
@@ -352,6 +394,8 @@ merge-pr:
         echo "Error: You are already on main."
         exit 1
     fi
+    [ "$(gh pr view --json headRefOid --jq .headRefOid)" = "$(git rev-parse HEAD)" ] \
+        || { echo "Error: the PR head is not your local HEAD. Push first, then wait for CI on that commit."; exit 1; }
     # Refuse to merge over a failing check.
     #
     # `gh pr merge` happily merges a red PR when the repository has no branch protection, and
@@ -397,6 +441,10 @@ merge-pr:
     echo "Deleting local branch $BRANCH..."
     git branch -D "$BRANCH" 2>/dev/null || true
     "{{PY}}" scripts/reset_wip.py
+
+# Dry-run publish check for crates.io (no upload)
+publish-check:
+    cargo publish --dry-run
 
 # Publish the CURRENT version to crates.io, the AUR and the Homebrew tap.
 #
@@ -458,16 +506,24 @@ publish:
     cargo publish
     echo "==> Published ${VERSION} to crates.io."
     echo "==> Publishing AUR package..."
-    just publish-aur
+    just aur-publish "${VERSION}"
     echo "==> Publishing Homebrew formula..."
     just brew-publish "${VERSION}"
     echo "==> crates.io, AUR and Homebrew done. COPR builds from the tag via copr.yml."
 
-# Publish/update the AUR package (etr-terminal-bin) from the current version's GitHub release
-publish-aur:
+# Publish/update the AUR package (etr-terminal-bin) from a released tag (defaults to Cargo.toml version)
+aur-publish VERSION="":
     #!/usr/bin/env bash
     set -euo pipefail
-    VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+    BOLD='\033[1m'; GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
+    pass() { echo -e "${GREEN}[✓]${NC} $1"; }
+    fail() { echo -e "${RED}[✗]${NC} $1"; exit 1; }
+    info() { echo -e "${YELLOW}[→]${NC} $1"; }
+
+    VERSION="{{VERSION}}"; VERSION="${VERSION#v}"
+    if [ -z "$VERSION" ]; then
+        VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+    fi
     AUR_PKG="etr-terminal-bin"
     AUR_REMOTE="ssh://aur@aur.archlinux.org/${AUR_PKG}.git"
     BASE_URL="https://github.com/l1a/etr/releases/download/v${VERSION}"
@@ -485,7 +541,7 @@ publish-aur:
             echo "ERROR: ${BASE_URL}/${a} not found." >&2
             echo "The v${VERSION} GitHub release must exist before publishing to the AUR:" >&2
             echo "  git tag v${VERSION} && git push origin v${VERSION}" >&2
-            echo "then wait for the Release workflow to finish and re-run: just publish-aur" >&2
+            echo "then wait for the Release workflow to finish and re-run: just aur-publish ${VERSION}" >&2
             exit 1
         fi
     done
@@ -515,6 +571,35 @@ publish-aur:
         --sha256 "SHA_EXTRAS=${SHA[etr-extras.tar.gz]}"
     )
 
+    info "Checking the AUR is reachable..."
+    OUT=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new aur@aur.archlinux.org help 2>&1 || true)
+    if echo "$OUT" | grep -qi 'maintenance'; then
+        fail "the AUR is in a maintenance window — it said: $(echo "$OUT" | head -1)"
+    fi
+    echo "$OUT" | grep -qi 'Permission denied' \
+        && fail "the AUR refused this SSH key; register it at https://aur.archlinux.org/account/"
+    pass "AUR reachable and the SSH key is accepted"
+
+    echo
+    echo -e "${BOLD}About to publish ${AUR_PKG} ${VERSION} to the AUR.${NC}"
+    echo "This is public and immediate: ${AUR_REMOTE}"
+    echo ""
+    if [ -n "${AUR_CONFIRM:-}" ]; then
+        CONFIRM="$AUR_CONFIRM"
+        echo "Publish to the AUR? [y/N] $CONFIRM   (answered by AUR_CONFIRM)"
+    elif [ -t 0 ]; then
+        echo -n "Publish to the AUR? [y/N] "; read -r CONFIRM
+    else
+        echo -n "Publish to the AUR? [y/N] "
+        read -r -t 10 CONFIRM || CONFIRM=""
+        echo "$CONFIRM"
+        [ -n "$CONFIRM" ] || fail "no terminal and nothing on stdin. Re-run with AUR_CONFIRM=y"
+    fi
+    case "$CONFIRM" in
+        y|Y|yes|YES) ;;
+        *) echo -e "${RED}Aborted.${NC}"; exit 1 ;;
+    esac
+
     echo "==> Cloning ${AUR_REMOTE}..."
     # Cloned fresh each time rather than kept as a working copy: a long-lived clone is how
     # the sibling repo's AUR checkout drifted eleven releases out of date.
@@ -535,6 +620,9 @@ publish-aur:
     git -C "${WORK}/aur" commit -m "Update to v${VERSION}"
     git -C "${WORK}/aur" push
     echo "==> Published ${AUR_PKG} v${VERSION} to the AUR."
+
+# Publish/update the AUR package (alias for aur-publish)
+publish-aur VERSION="": (aur-publish VERSION)
 
 # ── Homebrew ──────────────────────────────────────────────────────────────────
 #
@@ -655,6 +743,9 @@ brew-publish VERSION:
     git -C "$WORK/tap" commit -q -m "etr $VER"
     git -C "$WORK/tap" push -q origin HEAD
     pass "published etr $VER to $TAP_REPO"
+
+# Render the Homebrew formula for a released tag and push it to the tap (alias for brew-publish)
+publish-brew VERSION: (brew-publish VERSION)
 
 # Render the COPR spec as .copr/Makefile will and print it (no network, no rpm tooling).
 #

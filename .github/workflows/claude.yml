@@ -1,5 +1,12 @@
 name: Claude Code
 
+# Responds to an @claude mention on an issue, a PR comment or a review.
+#
+# The action only runs for users with **write access** to this repository, which it
+# enforces itself — see https://github.com/anthropics/claude-code-action/blob/main/docs/security.md
+# That matters here because this repository is public: without it, anyone could trigger a
+# run by commenting.
+
 on:
   issue_comment:
     types: [created]
@@ -21,17 +28,28 @@ jobs:
       (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
       (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
     runs-on: ubuntu-latest
+
+    # These apply to the per-run GITHUB_TOKEN, not to any personal access token.
     permissions:
-      contents: read
-      pull-requests: read
+      contents: write        # push branches
+      pull-requests: write   # gh pr create / edit
       issues: read
       id-token: write
-      actions: read # Required for Claude to read CI results on PRs
+      actions: read          # read CI results on a PR
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 1
+
+      - name: Install build dependencies
+        # `just` drives every gate in this repo; `libutempter0` is linked on Linux;
+        # `mandown` is needed for `just man` on a version bump.
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends just libutempter0
+          cargo install mandown
 
       - name: Run Claude Code
         id: claude
@@ -39,15 +57,27 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
-          # This is an optional setting that allows Claude to read CI results on PRs
           additional_permissions: |
             actions: read
 
-          # Optional: Give a custom prompt to Claude. If this is not specified, Claude will perform the instructions specified in the comment that tagged it.
-          # prompt: 'Update the pull request description to include a summary of changes.'
-
-          # Optional: Add claude_args to customize behavior and configuration
-          # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
-          # or https://code.claude.com/docs/en/cli-reference for available options
-          # claude_args: '--allowed-tools Bash(gh pr *)'
+          claude_args: >-
+            --allowedTools
+            "Bash(cargo fmt *)"
+            "Bash(cargo clippy *)"
+            "Bash(cargo test *)"
+            "Bash(cargo check *)"
+            "Bash(cargo build *)"
+            "Bash(cargo run *)"
+            "Bash(just check)"
+            "Bash(just test)"
+            "Bash(just man)"
+            "Bash(git add *)"
+            "Bash(git commit *)"
+            "Bash(git diff *)"
+            "Bash(git log *)"
+            "Bash(git status)"
+            "Bash(git show *)"
+            "Bash(gh pr create *)"
+            "Bash(gh pr edit *)"
+            "Bash(gh pr view *)"
 

@@ -3,19 +3,35 @@ name: Continuous Integration
 on:
   push:
     branches: [ main, 'feature/**', 'fix/**', 'chore/**' ]
-    paths-ignore:
-      - '**.md'
-      - 'man/**'
   pull_request:
     branches: [ main ]
-    paths-ignore:
-      - '**.md'
-      - 'man/**'
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
+  checks:
+    name: Offline Guards
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Run standard, man, packaging, text, and wip self-tests and guards
+        run: |
+          python3 scripts/install_completions.py --self-test
+          python3 scripts/install_man.py --self-test
+          python3 scripts/gate_conformance.py --self-test
+          python3 scripts/gate_conformance.py Justfile
+          python3 scripts/man_pages.py --self-test
+          python3 scripts/render_packaging.py --self-test
+          python3 scripts/packaging_check.py --self-test
+          python3 scripts/packaging_check.py
+          python3 scripts/text_check.py --self-test
+          python3 scripts/text_check.py
+          python3 scripts/reset_wip.py --self-test
+
   lints:
     name: Formatting and Clippy Lints (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -42,10 +58,14 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libutempter0
 
       - name: Verify Formatting
-        run: cargo fmt --check
+        run: |
+          cargo fmt --check
+          cargo fmt --manifest-path tools/stress/Cargo.toml --check
 
       - name: Run Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: |
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo clippy --manifest-path tools/stress/Cargo.toml --all-targets -- -D warnings
 
   test:
     name: Test Suite (${{ matrix.os }})
@@ -68,7 +88,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libutempter0
 
       - name: Run Tests
-        run: cargo test --all-targets --all-features
+        run: |
+          cargo test --locked --all-targets --all-features
+          cargo test --manifest-path tools/stress/Cargo.toml
 
   # release.yml also cross-compiles windows-aarch64 from windows-latest, but no
   # ARM64 Windows runner exists to actually run tests on it — so this only
@@ -90,17 +112,4 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
       - name: Build etr client for windows-aarch64
-        run: cargo build --release --target aarch64-pc-windows-msvc --bin etr
-
-  audit:
-    name: Security Audit
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      security-events: write
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-
-      - name: Run Cargo Audit
-        uses: actions-rust-lang/audit@72c09e02f132669d52284a3323acdb503cfc1a24 # v1
+        run: cargo build --release --locked --target aarch64-pc-windows-msvc --bin etr

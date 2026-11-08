@@ -1,8 +1,6 @@
 name: Claude Code Review
 
-# Automatic review on every pull request is OFF. Run it deliberately instead:
-#
-#     gh workflow run claude-code-review.yml --ref <branch>
+# MANUAL ONLY. This does not run on pull requests automatically.
 #
 # WHY. The token behind this action has failed before in a way that is worse than useless:
 # in rusticprofile it went from 19 consecutive green runs to failing every run in ~490 ms on
@@ -13,37 +11,44 @@ name: Claude Code Review
 # this repo has already spent effort on the opposite failure: a review job going GREEN
 # without reviewing anything.
 #
-# A check that cannot be believed in either direction is not a check.
+# Run it deliberately instead:
+#     gh workflow run claude-code-review.yml -f pr=<number>
 #
-# The `pull_request` trigger is kept commented immediately below rather than deleted, so
-# restoring it is uncommenting two lines. Diagnostics if it is failing: `gh secret list`
-# shows when CLAUDE_CODE_OAUTH_TOKEN was last set; `claude setup-token` mints a new one.
+# To restore automatic review, put the `pull_request:` trigger back — the block below is
+# kept intact and commented for exactly that. Check the token first: `gh secret list`
+# shows when CLAUDE_CODE_OAUTH_TOKEN was last set, and `claude setup-token` mints a new
+# one. Note `claude.yml` uses the same secret, so @claude mentions fail the same way.
 #
-# NOTE: `claude.yml` (the @claude mention workflow) is untouched and shares the same secret,
-# so mentions fail the same way if the token is bad.
+# Read-only by design: this job reviews, it does not push. Anything that needs to change
+# the repository goes through `claude.yml`, which is triggered deliberately by an @claude
+# mention and has the write permissions to match.
+#
+# A GREEN CHECK HERE DOES NOT PROVE A REVIEW HAPPENED. The action requires this file to be
+# byte-identical to the copy on the default branch and skips with a `success` conclusion
+# when it is not — so any pull request editing this file gets no review, silently. That is
+# a security control (it stops a PR rewriting the workflow and running it with the
+# repository's secret), not a fault. When changing this file, read the job log for
+# `Workflow validation failed` rather than trusting the check mark.
+
 on:
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: 'Pull request number to review'
+        required: true
+        type: string
+
+  # Restore automatic review by uncommenting this and deleting the block above.
   # pull_request:
   #   types: [opened, synchronize, ready_for_review, reopened]
-  # Optional: Only run on specific file changes
-  # paths:
-  #   - "src/**/*.ts"
-  #   - "src/**/*.tsx"
-  #   - "src/**/*.js"
-  #   - "src/**/*.jsx"
-  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
   claude-review:
-    # Optional: Filter by PR author
-    # if: |
-    #   github.event.pull_request.user.login == 'external-contributor' ||
-    #   github.event.pull_request.user.login == 'new-developer' ||
-    #   github.event.pull_request.author_association == 'FIRST_TIME_CONTRIBUTOR'
-
     runs-on: ubuntu-latest
+
     permissions:
       contents: read
       pull-requests: read
@@ -63,7 +68,75 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
           plugins: 'code-review@claude-code-plugins'
-          prompt: '/code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
-          # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
-          # or https://code.claude.com/docs/en/cli-reference for available options
+          prompt: '/code-review:code-review ${{ github.repository }}/pull/${{ inputs.pr }}'
+          # Dependabot opens PRs as a bot actor, and the action refuses non-human actors
+          # unless they are named. Without this, exactly the PRs least likely to get a
+          # human read would also get no review. Scoped to dependabot alone.
+          allowed_bots: 'dependabot[bot]'
+          # One comment per PR, updated in place, rather than a new one each push.
+          use_sticky_comment: true
+
+      # Make the outcome visible without giving this job write access to the PR.
+      #
+      # The action posts only when it has findings, and it also skips silently — with a
+      # `success` conclusion — when workflow validation fails. So a green check plus no
+      # comment has two very different meanings and no way to tell them apart. This writes
+      # which one happened into the run summary, where it is one click from the check mark.
+      - name: Report whether the review actually ran
+        if: always()
+        env:
+          EXECUTION_FILE: ${{ steps.claude-review.outputs.execution_file }}
+        run: |
+          set -uo pipefail
+          {
+            echo "### Claude Code Review"
+            echo
+            if [ -z "${EXECUTION_FILE:-}" ] || [ ! -f "${EXECUTION_FILE:-}" ]; then
+              echo "**The review did NOT run.** No execution output was produced."
+              echo
+              echo "The usual cause is the action's workflow-validation check, which skips"
+              echo "with a \`success\` conclusion when this workflow file differs from the"
+              echo "copy on the default branch — so any PR editing it gets no review."
+              echo "Search the job log for \`Workflow validation failed\` to confirm."
+            else
+              python3 - "$EXECUTION_FILE" <<'PYEOF'
+          import json, sys
+
+          # The execution output has changed shape before and may again, so pull the fields
+          # out defensively rather than assuming a layout. Reporting "ran, shape
+          # unrecognised" is honest; asserting a turn count that is not there is not.
+          try:
+              data = json.load(open(sys.argv[1]))
+          except Exception as e:
+              print(f"**The review ran**, but its output could not be parsed ({e}).")
+              raise SystemExit(0)
+
+          candidates = data if isinstance(data, list) else [data]
+          result = next(
+              (c for c in reversed(candidates)
+               if isinstance(c, dict) and "num_turns" in c),
+              None,
+          )
+
+          if result is None:
+              print("**The review ran**, but produced no recognisable result record.")
+              raise SystemExit(0)
+
+          turns = result.get("num_turns", "?")
+          cost = result.get("total_cost_usd")
+          errored = result.get("is_error", False)
+
+          status = "completed with an error" if errored else "completed"
+          cost_text = f", ${cost:.2f}" if isinstance(cost, (int, float)) else ""
+          print(f"**The review ran** and {status} — {turns} turns{cost_text}.")
+          print()
+          print("Findings, if any, appear as comments on the pull request.")
+          print("No comment means the review found nothing to raise.")
+          PYEOF
+            fi
+          # `tee`, not `>>`: the summary is only visible in the Actions UI, so writing
+          # solely there means the one thing that reports whether a review happened cannot
+          # itself be checked from the logs or the API. Sending it to both makes it
+          # verifiable without a browser.
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
