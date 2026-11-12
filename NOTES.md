@@ -27,12 +27,12 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.10.22
+## Current state: v0.10.23
 
-`main` carries **0.10.22**. The newest released tag is **`v0.10.19`**, live on GitHub,
-crates.io, the AUR, COPR and the Homebrew tap; **0.10.22 is merged and untagged**
-(Justfile and GitHub Actions workflow standardization, review-comment gate hardening,
-and `rand` 0.10.3 update across the four-repo fleet).
+`main` carries **0.10.23**. The newest released tag is **`v0.10.22`**, live on GitHub,
+crates.io, the AUR, COPR and the Homebrew tap; **0.10.23 is merged and untagged**
+(Cargo dependency sweep including `toml` 1.2.1+spec-1.1.0 and `rustix` 1.1.6
+(`RUSTSEC-2026-0486`), plus `anthropics/claude-code-action` 1.0.269).
 
 The full round trip works on Linux and macOS: SSH bootstrap, QUIC session with pinned
 certificate, PTY, keepalives, reconnect after a drop, `-L`/`-R` TCP and UDP forwarding,
