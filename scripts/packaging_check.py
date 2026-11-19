@@ -5,10 +5,10 @@
 
 WHAT THIS IS FOR
 ----------------
-etr publishes to five places -- crates.io, GitHub releases, the AUR, COPR and a Homebrew
-tap -- and each one restates the project's one-line summary and its licence in its own
-vocabulary. `packaging/metadata.toml` is where those are written; this asserts that every
-channel's copy still says what that file says.
+etr publishes to six places -- crates.io, GitHub releases, the AUR, COPR, a Homebrew tap
+and a Windows Scoop bucket -- and each one restates the project's one-line summary and its
+licence in its own vocabulary. `packaging/metadata.toml` is where those are written; this
+asserts that every channel's copy still says what that file says.
 
 It deliberately does NOT check versions or checksums, because those are not written down
 anywhere: the templates carry `@VERSION@`/`@SHA...@` sentinels and
@@ -92,6 +92,7 @@ REQUIRED_SENTINELS = {
     ],
     "packaging/copr/etr.spec": ["@VERSION@"],
     "packaging/homebrew/etr.rb": ["@VERSION@", "@SHA256@"],
+    "packaging/scoop/etr.json": ["@VERSION@", "@SHA256_X86_64@", "@SHA256_ARM64@"],
 }
 
 
@@ -244,6 +245,17 @@ def check_channels_agree(meta: dict, root: Path = REPO_ROOT) -> list[str]:
         problems.append("etr.rb: no license")
     elif m.group(1) != license_id:
         problems.append(f"etr.rb license is {m.group(1)!r}, metadata.toml says {license_id!r}")
+
+    # Scoop manifest: description and license
+    scoop = json.loads(_read(root, "packaging/scoop/etr.json"))
+    if scoop.get("description") != summary:
+        problems.append(
+            f"etr.json description is {scoop.get('description')!r}, metadata.toml says {summary!r}"
+        )
+    if scoop.get("license") != license_id:
+        problems.append(
+            f"etr.json license is {scoop.get('license')!r}, metadata.toml says {license_id!r}"
+        )
 
     return problems
 

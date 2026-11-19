@@ -93,7 +93,7 @@ At the conclusion of any task involving a specific skill:
 Per `~/AGENTS.md` §6 (**Sandbox Bypass & Sandbox Learning Loop**), always run the following universal command classes with `BypassSandbox: true` on the **first** call — never attempt them with `BypassSandbox: false` first:
 * **All `gh` / `ghpub` commands** (`gh pr`, `gh run`, `gh workflow`, `gh api`, `gh issue`, `gh release`): require network access to `api.github.com`.
 * **All `git` write or remote commands** (`git checkout`, `git switch`, `git branch -d/-D`, `git add`, `git rm`, `git mv`, `git commit`, `git merge`, `git rebase`, `git tag`, `git fetch`, `git pull`, `git push`): `.git/` is mounted read-only in the sandbox and remote ops need network access.
-* **`just` shebang and network recipes** (`#!/usr/bin/env ...` recipes write temp scripts to `/run/user/1000/just`, which is read-only inside the sandbox): `just pr`, `just open-pr`, `just merge-pr`, `just prune-branches`, `just github-metadata`, `just publish`, `just aur-publish` / `just publish-aur`, `just brew-publish` / `just publish-brew`.
+* **`just` shebang and network recipes** (`#!/usr/bin/env ...` recipes write temp scripts to `/run/user/1000/just`, which is read-only inside the sandbox): `just pr`, `just open-pr`, `just merge-pr`, `just prune-branches`, `just github-metadata`, `just publish`, `just aur-publish` / `just publish-aur`, `just brew-publish` / `just publish-brew`, `just scoop-publish` / `just publish-scoop`.
 * **Cargo network operations:** `cargo update` (use `cargo --config net.retry=0 update`), `cargo fetch`, `cargo publish`, `cargo audit`.
 * **Repo-Local Sandbox Learning Loop:**
   1. **Read before running:** Check Part 1 §5 and Part 2 §7 (plus any staged entries in `WIP.md`) at session start and pass `BypassSandbox: true` on the **first** invocation for every listed command/recipe.
@@ -300,7 +300,7 @@ Fast-forward an existing clone first (`git pull --ff-only`), or clone freshly
 - [ ] Body summarises *what* changed and *why* (not just a commit list).
 - [ ] Test plan lists manual verification steps the reviewer can follow.
 
-### 4.13 Packaging (five channels since v0.9.0)
+### 4.13 Packaging (six channels since v0.10.24)
 
 `just check` runs `packaging-check`, which covers most of this automatically. The items
 here are the ones a human has to decide.
@@ -308,7 +308,7 @@ here are the ones a human has to decide.
 - [ ] If the one-line summary, the description or the licence changed, change it in
       **`packaging/metadata.toml`** and nowhere else first, then update each channel's copy
       until `just packaging-check` passes. That file is the single source of truth for
-      crates.io, the AUR, COPR, Homebrew and the GitHub About box.
+      crates.io, the AUR, COPR, Homebrew, Scoop and the GitHub About box.
 - [ ] **Never paste a version or a checksum into a packaging template.** They carry
       `@VERSION@` / `@SHA…@` sentinels and are rendered at publish time by
       `scripts/render_packaging.py`. A template that has become a concrete file renders
@@ -334,13 +334,14 @@ After a PR is merged, run `just merge-pr` to switch to `main`, pull, delete the 
 feature branch, and reset `WIP.md` (`Active Branch: none (main is current)`, latest
 commit updated).
 
-## 6. Releasing to all five channels
+## 6. Releasing to all six channels
 
-etr publishes to **GitHub releases, crates.io, the AUR, COPR and a Homebrew tap**. Two of
-those happen by themselves on the tag; three are pushed from a workstation.
+etr publishes to **GitHub releases, crates.io, the AUR, COPR, a Homebrew tap and a Windows
+Scoop bucket**. Two of those happen by themselves on the tag; four are pushed from a
+workstation.
 
-**The order is not arbitrary** — the AUR and Homebrew both consume artifacts that only exist
-once the GitHub release has been built:
+**The order is not arbitrary** — the AUR, Homebrew and Scoop all consume artifacts that only
+exist once the GitHub release has been built:
 
 ```bash
 # 0. On main, clean, at the version you intend to release.
@@ -349,10 +350,10 @@ git checkout main && git pull && git status --porcelain     # must be empty
 # 1. Tag. This alone starts release.yml (GitHub assets) and copr.yml (COPR rebuild).
 git tag v0.9.0 && git push origin v0.9.0
 
-# 2. Wait for release.yml to finish. The AUR and Homebrew steps hard-fail without it.
+# 2. Wait for release.yml to finish. The AUR, Homebrew and Scoop steps hard-fail without it.
 gh run watch "$(gh run list --workflow=release.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
 
-# 3. crates.io, then the AUR, then Homebrew.
+# 3. crates.io, then the AUR, then Homebrew, then Scoop.
 just publish
 ```
 
@@ -369,6 +370,7 @@ curl -sS -A etr-release-check https://crates.io/api/v1/crates/etr | grep -o '"ma
 curl -sS "https://aur.archlinux.org/cgit/aur.git/plain/.SRCINFO?h=etr-terminal-bin" | grep pkgver
 copr-cli get-package --name etr kentobias/etr                # or the COPR web UI
 git ls-remote https://github.com/l1a/homebrew-etr HEAD       # tap moved
+git ls-remote https://github.com/l1a/scoop-etr HEAD          # bucket moved
 ```
 
 **The AUR serves stale reads for a few minutes after a push, and "check cgit instead" is NOT a
@@ -403,6 +405,8 @@ the recipes assume:
 - **AUR**: an SSH key registered with an AUR account that co-maintains `etr-terminal-bin`.
 - **Homebrew**: push access to `github.com/l1a/homebrew-etr`. The tap is created by pushing
   to it; `just brew-publish` handles an empty tap, including pinning its default branch.
+- **Scoop**: push access to `github.com/l1a/scoop-etr`. `just scoop-publish` handles an empty
+  bucket, including pinning its default branch.
 - **COPR**: the `kentobias/etr` project, with **"Enable internet access during builds" ON**
   (the spec resolves crates.io at build time and there is no vendor tarball), plus the
   `COPR_LOGIN` / `COPR_USERNAME` / `COPR_TOKEN` repository secrets for `copr.yml`. On a fork
@@ -415,7 +419,7 @@ In addition to Part 1 §5, always run these `etr`-specific recipes with `BypassS
 - **`just` shebang, network, and E2E/tmux recipes:** `just audit`, `just install-tag`, `just clean`, `just clean-procs`, `just check-tools`, `just e2e-local`, `just e2e-env-local`, `just e2e-cmd-local`, `just e2e-family-local`, `just e2e-forward-local`, `just e2e-reverse-local`, `just e2e-udp-concurrent`, `just throughput-local`, `just throughput-remote`, `just stress-local`, `just stress-udp-rate`.
 - **Non-interactive `just open-pr` in agent PTYs:** Because `run_command` allocates a PTY (`[ -t 0 ]` is true), bare `just open-pr` invokes `gh pr create` interactively and hangs waiting on `? Title (required)`. Always pass `--fill` (or explicit `--title ... --body-file ...`), e.g. `PR_CONFIRM=y just open-pr --fill`.
 - **Commands that DO work in the sandbox (`BypassSandbox: false`):**
-  - `just`, `just build`, `just build-release`, `just build-stress`, `just test`, `just fmt`, `just fmt-check`, `just clippy`, `just lint`, `just check`, `just man`, `just man-check`, `just standard-check`, `just packaging-check`, `just text-check`, `just wip-check`, `just copr-render`, `just install-hooks`, `just setup`
+  - `just`, `just build`, `just build-release`, `just build-stress`, `just test`, `just fmt`, `just fmt-check`, `just clippy`, `just lint`, `just check`, `just man`, `just man-check`, `just standard-check`, `just packaging-check`, `just scoop-check`, `just text-check`, `just wip-check`, `just copr-render`, `just install-hooks`, `just setup`
   - Read-only `git` commands: `git status`, `git diff`, `git log`, `git show`, `git rev-parse`, `git for-each-ref`
 
 ---

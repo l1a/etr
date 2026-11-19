@@ -82,6 +82,15 @@ brew install l1a/etr/etr
 
 Builds from source, so it needs the Rust toolchain — Homebrew installs that automatically as a build dependency. Both `etr` and `etrs` are installed.
 
+### Windows (Scoop)
+
+```powershell
+scoop bucket add l1a https://github.com/l1a/scoop-etr
+scoop install l1a/etr
+```
+
+Installs the prebuilt Windows `etr.exe` client binary (for x86_64 or ARM64).
+
 ### Which one to use
 
 | You want | Use |
@@ -90,6 +99,7 @@ Builds from source, so it needs the Rust toolchain — Homebrew installs that au
 | A prebuilt binary on Arch | the AUR package |
 | System package management on Fedora | COPR |
 | macOS, or Linuxbrew | Homebrew |
+| A prebuilt `etr.exe` client on Windows | Scoop |
 
 **Install it on both ends.** `etr` starts `etrs` on the remote host over SSH, so the server needs `etrs` on its `PATH` too — or point at it explicitly with `etr --server-path /path/to/etrs`.
 

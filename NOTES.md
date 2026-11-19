@@ -27,12 +27,16 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.10.23
+## Current state: v0.10.24
 
-`main` carries **0.10.23**. The newest released tag is **`v0.10.22`**, live on GitHub,
-crates.io, the AUR, COPR and the Homebrew tap; **0.10.23 is merged and untagged**
-(Cargo dependency sweep including `toml` 1.2.1+spec-1.1.0 and `rustix` 1.1.6
-(`RUSTSEC-2026-0486`), plus `anthropics/claude-code-action` 1.0.269).
+`main` carries **0.10.23**; this branch (`feature/scoop-packaging`) bumps to **0.10.24**,
+adds Windows Scoop packaging (`packaging/scoop/etr.json`, `scripts/scoop_check.py`,
+`render_packaging.py --target scoop`, `just scoop-publish` / `just publish-scoop`,
+`scoop` job in `.github/workflows/packaging.yml`, and idempotent crates.io + Scoop
+chaining in `just publish`), and folds Dependabot PRs `#106` (`anthropics/claude-code-action`
+`v1.0.276` + `--permission-mode acceptEdits`) and `#107` (`nix 0.32` + `cargo update`). The
+newest released tag is **`v0.10.22`**, live on GitHub, crates.io, the AUR, COPR and the
+Homebrew tap.
 
 The full round trip works on Linux and macOS: SSH bootstrap, QUIC session with pinned
 certificate, PTY, keepalives, reconnect after a drop, `-L`/`-R` TCP and UDP forwarding,
@@ -359,12 +363,13 @@ just wip-check
 
 ```bash
 just packaging-check          # offline: sentinels intact, every channel agrees (in `just check`)
+just scoop-check              # offline: Scoop manifest template intact (in `packaging-check`)
 just copr-render              # what COPR will be handed, without rpm tooling
 just github-metadata --dry-run  # About-box description/topics vs packaging/metadata.toml
 
 # Release: tag first (starts release.yml AND copr.yml), wait for assets, then push the rest.
 git tag v0.9.0 && git push origin v0.9.0
-just publish                  # crates.io -> AUR -> Homebrew; refuses unless HEAD is the tag
+just publish                  # crates.io -> AUR -> Homebrew -> Scoop; refuses unless HEAD is the tag
 ```
 
 ---
@@ -679,9 +684,9 @@ not a check.** Watch every guard fail on the defect it exists to catch, before b
 
 ### 4. Release and packaging
 
-Five channels: GitHub releases, crates.io, the AUR, COPR and a Homebrew tap. The order in
-`AGENTS.md` §6 is not arbitrary — the AUR and Homebrew consume artefacts that only exist once
-the GitHub release has been built.
+Six channels: GitHub releases, crates.io, the AUR, COPR, a Homebrew tap and a Windows Scoop
+bucket. The order in `AGENTS.md` §6 is not arbitrary — the AUR, Homebrew and Scoop consume
+artefacts that only exist once the GitHub release has been built.
 
 - **No packaging file records a version or a checksum.** Every template carries
   `@VERSION@`/`@SHA…@` sentinels rendered at publish time by `scripts/render_packaging.py`.

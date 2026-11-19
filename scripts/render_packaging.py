@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-only
 # Copyright (C) 2026 l1a
-"""Render packaging/{aur,copr,homebrew} for a released version.
+"""Render packaging/{aur,copr,homebrew,scoop} for a released version.
 
 WHY THIS EXISTS
 ---------------
-The AUR PKGBUILD and .SRCINFO, the COPR spec and the Homebrew formula all need the version
-of the release they package, and three of the four need checksums. A checksum cannot be
-computed before the tag exists, so the tempting answer is to *record* the released version
-in the repository after each tag -- which means writing one fact down in five places and
+The AUR PKGBUILD and .SRCINFO, the COPR spec, the Homebrew formula and the Scoop manifest all
+need the version of the release they package, and four of the five need checksums. A checksum
+cannot be computed before the tag exists, so the tempting answer is to *record* the released
+version in the repository after each tag -- which means writing one fact down in six places and
 keeping them in step forever.
 
 This repo has not paid that bill yet only because it had two channels. Its sibling `retch`
@@ -100,6 +100,7 @@ TARGETS = {
     "aur-srcinfo": Target("packaging/aur/SRCINFO.in", AUR_SHA_KEYS, "AUR .SRCINFO"),
     "copr": Target("packaging/copr/etr.spec", (), "COPR spec"),
     "brew": Target("packaging/homebrew/etr.rb", ("SHA256",), "Homebrew formula"),
+    "scoop": Target("packaging/scoop/etr.json", ("SHA256_X86_64", "SHA256_ARM64"), "Scoop manifest"),
 }
 
 
@@ -283,6 +284,12 @@ def _self_test() -> int:
     check("brew sha", f'sha256 "{_SHA}"' in brew, "rendered formula has no sha256")
     check("brew no sentinel", not SENTINEL_RE.search(brew), "sentinel survived")
 
+    scoop = render("scoop", "1.2.3", {"SHA256_X86_64": _SHA, "SHA256_ARM64": _SHA2})
+    check("scoop version", '"version": "1.2.3"' in scoop, "rendered scoop manifest has no version")
+    check("scoop sha x64", f'"hash": "{_SHA}"' in scoop, "rendered scoop manifest has no x86_64 sha")
+    check("scoop sha arm", f'"hash": "{_SHA2}"' in scoop, "rendered scoop manifest has no arm64 sha")
+    check("scoop no sentinel", not SENTINEL_RE.search(scoop), "sentinel survived")
+
     copr = render("copr", "1.2.3", stamp="Mon Jan 05 2026")
     check("copr version", "\nVersion:        1.2.3\n" in copr, "rendered spec has no Version: 1.2.3")
     check("copr no sentinel", not SENTINEL_RE.search(copr), "sentinel survived")
@@ -309,10 +316,14 @@ def _self_test() -> int:
     refuses("placeholder sha", lambda: render("brew", "1.2.3", {"SHA256": "0" * 64}))
     refuses("sha for copr", lambda: render("copr", "1.2.3", {"SHA256": _SHA}))
     refuses("missing sha", lambda: render("brew", "1.2.3"))
-    # A partially-supplied AUR set must fail rather than render three of four checksums.
+    # A partially-supplied AUR or Scoop set must fail rather than render partial checksums.
     refuses(
         "partial aur shas",
         lambda: render("aur-pkgbuild", "1.2.3", {"SHA_ETR_X86_64": _SHA}),
+    )
+    refuses(
+        "partial scoop shas",
+        lambda: render("scoop", "1.2.3", {"SHA256_X86_64": _SHA}),
     )
     refuses("unknown target", lambda: render("nope", "1.2.3"))
 
@@ -364,8 +375,9 @@ def main() -> int:
         action="append",
         default=[],
         metavar="KEY=HEX",
-        help="a checksum, repeatable. For brew use SHA256=<hex>; for the AUR targets supply "
-        "all four of " + ", ".join(AUR_SHA_KEYS),
+        help="a checksum, repeatable. For brew use SHA256=<hex>; for scoop supply "
+        "SHA256_X86_64=<hex> and SHA256_ARM64=<hex>; for the AUR targets supply all five of "
+        + ", ".join(AUR_SHA_KEYS),
     )
     ap.add_argument("--out", help="write here instead of stdout")
     args = ap.parse_args()
