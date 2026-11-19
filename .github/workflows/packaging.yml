@@ -37,6 +37,8 @@ jobs:
           python3 scripts/render_packaging.py --self-test
           python3 scripts/packaging_check.py --self-test
           python3 scripts/packaging_check.py
+          python3 scripts/scoop_check.py --self-test
+          python3 scripts/scoop_check.py
 
   aur:
     name: AUR (Arch)
@@ -234,3 +236,70 @@ jobs:
             exit 1
           fi
           echo "payload verified: two binaries, two man pages, six completion files"
+
+  scoop:
+    name: Scoop Manifest (Windows)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Manifest template is valid (offline)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python scripts/scoop_check.py --self-test
+          python scripts/scoop_check.py
+          python scripts/render_packaging.py --self-test
+          python scripts/packaging_check.py --self-test
+          python scripts/packaging_check.py
+
+      - name: Render the manifest for the last released tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG=$(git describe --tags --abbrev=0 2>/dev/null || true)
+          if [ -z "$TAG" ]; then
+            echo "::error::no tags in this checkout — cannot render a manifest to install"
+            exit 1
+          fi
+          VER="${TAG#v}"
+          URL_X64="https://github.com/l1a/etr/releases/download/${TAG}/etr-windows-x86_64.exe"
+          URL_ARM="https://github.com/l1a/etr/releases/download/${TAG}/etr-windows-aarch64.exe"
+          echo "last released tag: $TAG"
+          curl -sfL -o "$RUNNER_TEMP/etr-windows-x86_64.exe" "$URL_X64" || { echo "::error::cannot fetch $URL_X64"; exit 1; }
+          curl -sfL -o "$RUNNER_TEMP/etr-windows-aarch64.exe" "$URL_ARM" || { echo "::error::cannot fetch $URL_ARM"; exit 1; }
+          SHA_X64=$(python -c "import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$RUNNER_TEMP/etr-windows-x86_64.exe")
+          SHA_ARM=$(python -c "import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$RUNNER_TEMP/etr-windows-aarch64.exe")
+          echo "computed sha256 x86_64:  $SHA_X64"
+          echo "computed sha256 aarch64: $SHA_ARM"
+          python scripts/render_packaging.py --target scoop --version "$VER" \
+            --sha256 "SHA256_X86_64=$SHA_X64" --sha256 "SHA256_ARM64=$SHA_ARM" \
+            --out "$RUNNER_TEMP/etr.json"
+          echo "RENDERED_VER=$VER" >> "$GITHUB_ENV"
+          echo "render verified against the real $TAG Windows binaries"
+
+      - name: Install Scoop and verify manifest install
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Get-Command scoop -ErrorAction SilentlyContinue)) {
+            Invoke-RestMethod -Uri https://get.scoop.sh | Invoke-Expression
+            $env:PATH = "$HOME\scoop\shims;$env:PATH"
+          }
+          $bucketDir = Join-Path $env:RUNNER_TEMP "scoop-bucket\bucket"
+          New-Item -ItemType Directory -Force -Path $bucketDir | Out-Null
+          Copy-Item "$env:RUNNER_TEMP\etr.json" (Join-Path $bucketDir "etr.json")
+          scoop install (Join-Path $bucketDir "etr.json")
+          $verOut = & etr --version
+          Write-Host "Installed: $verOut"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "etr --version failed with exit code $LASTEXITCODE"
+            exit 1
+          }
+          if ($verOut -notmatch [regex]::Escape($env:RENDERED_VER)) {
+            Write-Error "Expected version $($env:RENDERED_VER) in output: $verOut"
+            exit 1
+          }

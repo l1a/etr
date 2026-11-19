@@ -2,9 +2,9 @@
 #
 # Most channels carry their text inside the artifact they publish: crates.io reads the
 # published Cargo.toml and README, the AUR the PKGBUILD, COPR's RPM the spec, Homebrew the
-# formula. Those files keep their own readable copy -- Cargo.toml cannot be templated, and
-# the rest are read by people -- and `scripts/packaging_check.py`, run by `just check`,
-# fails when any copy drifts from what is written here.
+# formula, Scoop the JSON manifest. Those files keep their own readable copy -- Cargo.toml
+# cannot be templated, and the rest are read by people -- and `scripts/packaging_check.py`,
+# run by `just check`, fails when any copy drifts from what is written here.
 #
 # Two channels keep their text on the SERVICE instead, where no artifact ever reaches it:
 # the COPR project page and the GitHub repository's About box. Those are PUSHED from here --

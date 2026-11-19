@@ -209,6 +209,13 @@ packaging-check:
     @"{{PY}}" scripts/render_packaging.py --self-test
     @"{{PY}}" scripts/packaging_check.py --self-test
     @"{{PY}}" scripts/packaging_check.py
+    @"{{PY}}" scripts/scoop_check.py --self-test
+    @"{{PY}}" scripts/scoop_check.py
+
+# Prove packaging/scoop/etr.json is still a template (offline)
+scoop-check:
+    @"{{PY}}" scripts/scoop_check.py --self-test
+    @"{{PY}}" scripts/scoop_check.py
 
 # Pre-PR gate: run all automated checks and print manual checklist before opening a PR.
 # All items must pass before calling `gh pr create`. See AGENTS.md Part 2 §4.
@@ -470,17 +477,18 @@ merge-pr:
 publish-check:
     cargo publish --dry-run
 
-# Publish the CURRENT version to crates.io, the AUR and the Homebrew tap.
+# Publish the CURRENT version to crates.io, the AUR, the Homebrew tap and the Scoop bucket.
 #
 # COPR is deliberately absent: .github/workflows/copr.yml rebuilds it from the tag itself, so
 # by the time this runs COPR is already building. GitHub releases are likewise built by
-# release.yml on the tag. This recipe covers the three channels that need a push from a
+# release.yml on the tag. This recipe covers the four channels that need a push from a
 # workstation.
 #
-# ORDER MATTERS: crates.io first (it is the only irreversible one), then the two that depend
-# on the GitHub release assets existing.
+# ORDER MATTERS: crates.io first (it is the only irreversible one, and is skipped if the
+# version is already on the index), then the three that depend on the GitHub release assets
+# existing.
 
-# Publish the current version to crates.io, the AUR and the Homebrew tap
+# Publish the current version to crates.io, the AUR, the Homebrew tap and the Scoop bucket
 publish:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -521,19 +529,27 @@ publish:
         echo "ERROR: working tree has uncommitted changes. Commit or discard them first." >&2
         exit 1
     fi
-    echo "==> Running cargo publish --dry-run..."
-    if ! cargo publish --dry-run; then
-        echo "ERROR: dry-run failed — not publishing." >&2
-        exit 1
+    if curl -fsSL -H "User-Agent: etr-publish-check" \
+        "https://crates.io/api/v1/crates/etr/${VERSION}" \
+        | grep -q "\"num\":\"${VERSION}\""; then
+        echo "==> etr v${VERSION} is already on crates.io — skipping."
+    else
+        echo "==> Running cargo publish --dry-run..."
+        if ! cargo publish --dry-run; then
+            echo "ERROR: dry-run failed — not publishing." >&2
+            exit 1
+        fi
+        echo "==> Dry-run passed. Publishing to crates.io..."
+        cargo publish
+        echo "==> Published ${VERSION} to crates.io."
     fi
-    echo "==> Dry-run passed. Publishing to crates.io..."
-    cargo publish
-    echo "==> Published ${VERSION} to crates.io."
     echo "==> Publishing AUR package..."
     just aur-publish "${VERSION}"
     echo "==> Publishing Homebrew formula..."
     just brew-publish "${VERSION}"
-    echo "==> crates.io, AUR and Homebrew done. COPR builds from the tag via copr.yml."
+    echo "==> Publishing Scoop manifest..."
+    just scoop-publish "${VERSION}"
+    echo "==> crates.io, AUR, Homebrew and Scoop done. COPR builds from the tag via copr.yml."
 
 # Publish/update the AUR package (etr-terminal-bin) from a released tag (defaults to Cargo.toml version)
 aur-publish VERSION="":
@@ -663,8 +679,8 @@ publish-aur VERSION="": (aur-publish VERSION)
 # the formula is a template, and this is the moment the released version and its checksum come
 # into existence. Nothing in the repo holds a value to bump.
 
-# Render the Homebrew formula for a released tag and push it to the tap
-brew-publish VERSION:
+# Render the Homebrew formula for a released tag and push it to the tap (defaults to Cargo.toml version)
+brew-publish VERSION="":
     #!/usr/bin/env bash
     set -euo pipefail
     GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; BOLD='\033[1m'; NC='\033[0m'
@@ -674,6 +690,9 @@ brew-publish VERSION:
 
     TAP_REPO="git@github.com:l1a/homebrew-etr.git"
     VER="{{VERSION}}"; VER="${VER#v}"
+    if [ -z "$VER" ]; then
+        VER=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+    fi
     [ -n "$VER" ] || fail "brew-publish needs a version, e.g. just brew-publish 0.9.0"
 
     "{{PY}}" scripts/packaging_check.py || fail "packaging checks failed — not publishing"
@@ -771,7 +790,92 @@ brew-publish VERSION:
     pass "published etr $VER to $TAP_REPO"
 
 # Render the Homebrew formula for a released tag and push it to the tap (alias for brew-publish)
-publish-brew VERSION: (brew-publish VERSION)
+publish-brew VERSION="": (brew-publish VERSION)
+
+# Render the Scoop manifest for a released tag and push it to the bucket (defaults to Cargo.toml version)
+scoop-publish VERSION="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; BOLD='\033[1m'; NC='\033[0m'
+    pass() { echo -e "${GREEN}[✓]${NC} $1"; }
+    fail() { echo -e "${RED}[✗]${NC} $1"; exit 1; }
+    info() { echo -e "${YELLOW}[→]${NC} $1"; }
+
+    BUCKET_REPO="git@github.com:l1a/scoop-etr.git"
+    VER="{{VERSION}}"; VER="${VER#v}"
+    if [ -z "$VER" ]; then
+        VER=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+    fi
+    [ -n "$VER" ] || fail "scoop-publish needs a version, e.g. just scoop-publish 0.10.24"
+
+    "{{PY}}" scripts/scoop_check.py || fail "scoop template checks failed — not publishing"
+    "{{PY}}" scripts/packaging_check.py || fail "packaging checks failed — not publishing"
+    pass "scoop template and packaging checks pass"
+
+    WORK=$(mktemp -d)
+    trap 'rm -rf "$WORK"' EXIT
+    URL_X64="https://github.com/l1a/etr/releases/download/v${VER}/etr-windows-x86_64.exe"
+    URL_ARM="https://github.com/l1a/etr/releases/download/v${VER}/etr-windows-aarch64.exe"
+    info "Downloading and checksumming the v$VER Windows release binaries..."
+    curl -sfL -o "$WORK/etr-windows-x86_64.exe" "$URL_X64" \
+        || fail "no release binary at $URL_X64 — tag and release v$VER first"
+    curl -sfL -o "$WORK/etr-windows-aarch64.exe" "$URL_ARM" \
+        || fail "no release binary at $URL_ARM — tag and release v$VER first"
+    SHA_X64=$("{{PY}}" -c "import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$WORK/etr-windows-x86_64.exe")
+    SHA_ARM=$("{{PY}}" -c "import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$WORK/etr-windows-aarch64.exe")
+    pass "v$VER x86_64: $(wc -c < "$WORK/etr-windows-x86_64.exe" | tr -d ' ') bytes, sha256 $SHA_X64"
+    pass "v$VER aarch64: $(wc -c < "$WORK/etr-windows-aarch64.exe" | tr -d ' ') bytes, sha256 $SHA_ARM"
+
+    "{{PY}}" scripts/render_packaging.py --target scoop --version "$VER" \
+        --sha256 "SHA256_X86_64=$SHA_X64" --sha256 "SHA256_ARM64=$SHA_ARM" \
+        --out "$WORK/etr.json"
+    pass "rendered Scoop manifest for v$VER"
+
+    echo
+    echo -e "${BOLD}About to publish etr $VER to the Scoop bucket.${NC}"
+    echo "This is public and immediate: $BUCKET_REPO"
+    echo ""
+    if [ -n "${SCOOP_CONFIRM:-}" ]; then
+        CONFIRM="$SCOOP_CONFIRM"
+        echo "Publish to the Scoop bucket? [y/N] $CONFIRM   (answered by SCOOP_CONFIRM)"
+    elif [ -t 0 ]; then
+        echo -n "Publish to the Scoop bucket? [y/N] "; read -r CONFIRM
+    else
+        echo -n "Publish to the Scoop bucket? [y/N] "
+        read -r -t 10 CONFIRM || CONFIRM=""
+        echo "$CONFIRM"
+        [ -n "$CONFIRM" ] || fail "no terminal and nothing on stdin. Re-run with SCOOP_CONFIRM=y"
+    fi
+    case "$CONFIRM" in
+        y|Y|yes|YES) ;;
+        *) echo -e "${RED}Aborted.${NC}"; exit 1 ;;
+    esac
+
+    info "Cloning the Scoop bucket..."
+    git clone -q "$BUCKET_REPO" "$WORK/bucket" \
+        || fail "could not clone $BUCKET_REPO — does the bucket exist, and is the SSH key registered?"
+    mkdir -p "$WORK/bucket/bucket"
+    cp "$WORK/etr.json" "$WORK/bucket/bucket/etr.json"
+
+    if ! git -C "$WORK/bucket" rev-parse --verify -q HEAD >/dev/null 2>&1; then
+        git -C "$WORK/bucket" symbolic-ref HEAD refs/heads/main
+        info "empty bucket: default branch pinned to main"
+    fi
+
+    git -C "$WORK/bucket" config user.name  "$(git -C "{{justfile_directory()}}" config user.name)"
+    git -C "$WORK/bucket" config user.email "$(git -C "{{justfile_directory()}}" config user.email)"
+
+    git -C "$WORK/bucket" add bucket/etr.json
+    if git -C "$WORK/bucket" diff --cached --quiet; then
+        pass "bucket already has this exact manifest — nothing to push"
+        exit 0
+    fi
+    git -C "$WORK/bucket" commit -q -m "etr $VER"
+    git -C "$WORK/bucket" push -q origin HEAD
+    pass "published etr $VER to $BUCKET_REPO"
+
+# Render the Scoop manifest for a released tag and push it to the bucket (alias for scoop-publish)
+publish-scoop VERSION="": (scoop-publish VERSION)
 
 # Render the COPR spec as .copr/Makefile will and print it (no network, no rpm tooling).
 #
