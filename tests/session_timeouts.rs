@@ -81,6 +81,14 @@ impl Drop for DaemonGuard {
 }
 
 fn spawn_etrs(args: &[&str], extra_bootstrap_lines: &[&str]) -> DaemonGuard {
+    spawn_etrs_with_cmd(args, "sleep 30", extra_bootstrap_lines)
+}
+
+fn spawn_etrs_with_cmd(
+    args: &[&str],
+    remote_cmd: &str,
+    extra_bootstrap_lines: &[&str],
+) -> DaemonGuard {
     let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
     let base_dir = etr::config::fallback_tmp_state_dir()
         .join(format!("it-timeouts-{}-{n}", std::process::id()));
@@ -97,6 +105,7 @@ fn spawn_etrs(args: &[&str], extra_bootstrap_lines: &[&str]) -> DaemonGuard {
     let mut cmd = Command::new(etrs_bin());
     cmd.args(["-b", "127.0.0.1"])
         .args(args)
+        .env("SHELL", "/bin/sh")
         .env("XDG_STATE_HOME", &state_home)
         .env("XDG_CONFIG_HOME", &config_home)
         .env_remove("ETR_SERVER_NETWORK_TMOUT")
@@ -115,7 +124,7 @@ fn spawn_etrs(args: &[&str], extra_bootstrap_lines: &[&str]) -> DaemonGuard {
             hex_encode(&session_id)
         )
         .unwrap();
-        writeln!(stdin, "ETRCMD:sleep 30").unwrap();
+        writeln!(stdin, "ETRCMD:{remote_cmd}").unwrap();
         for line in extra_bootstrap_lines {
             writeln!(stdin, "{line}").unwrap();
         }
@@ -383,5 +392,36 @@ async fn test_authenticated_session_ignores_sigusr1_and_uses_reconnect_timeout()
         "daemon {} should exit after 2s reconnect timeout",
         guard.pid
     );
+    assert!(!guard.session_file().exists());
+}
+
+#[test]
+fn test_clean_waits_past_sighup_escalation_for_hup_ignoring_shell() {
+    let guard = spawn_etrs_with_cmd(
+        &["--connect-timeout", "60", "--signal-timeout", "0"],
+        "trap '' HUP; exec sleep 30",
+        &[],
+    );
+    // Allow /bin/sh to install `trap '' HUP` before signalling.
+    std::thread::sleep(Duration::from_millis(200));
+
+    let clean_out = Command::new(etrs_bin())
+        .arg("--clean")
+        .env("XDG_STATE_HOME", &guard.state_home)
+        .env("XDG_CONFIG_HOME", &guard.config_home)
+        .output()
+        .unwrap();
+    assert!(clean_out.status.success());
+
+    let stdout = String::from_utf8_lossy(&clean_out.stdout);
+    assert!(
+        stdout.contains("Terminated 1 disconnected session(s)"),
+        "expected clean termination despite HUP-ignoring child (takes >1s), got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("still running"),
+        "etrs --clean raced with hangup_child SIGHUP escalation: {stdout}"
+    );
+    assert!(!process_is_live_etrs(guard.pid));
     assert!(!guard.session_file().exists());
 }

@@ -350,10 +350,7 @@ fn main() -> io::Result<()> {
 
 #[cfg(unix)]
 fn cmd_list_sessions() -> io::Result<()> {
-    use etr::sessions::{
-        SessionStatus, format_duration, format_timeout, list_sessions_in, now_unix_secs,
-        sessions_dir,
-    };
+    use etr::sessions::{format_session_table, list_sessions_in, now_unix_secs, sessions_dir};
 
     let res = list_sessions_in(&sessions_dir())?;
     if res.sessions.is_empty() {
@@ -369,36 +366,7 @@ fn cmd_list_sessions() -> io::Result<()> {
     }
 
     let now = now_unix_secs();
-    println!(
-        "{:<8} {:<13} {:<6} {:<8} {:<10} {:<16} {:<10} TIMEOUT",
-        "PID", "STATE", "PORT", "MODE", "UPTIME", "PEER", "IDLE"
-    );
-    for s in &res.sessions {
-        let uptime = format_duration(now.saturating_sub(s.started_at));
-        let idle = match s.state {
-            SessionStatus::Connected => "-".to_string(),
-            SessionStatus::Waiting | SessionStatus::Disconnected => {
-                format_duration(now.saturating_sub(s.disconnected_at.unwrap_or(s.started_at)))
-            }
-        };
-        let timeout = match s.state {
-            SessionStatus::Waiting => format_timeout(s.connect_timeout),
-            SessionStatus::Connected | SessionStatus::Disconnected => {
-                format_timeout(s.reconnect_timeout)
-            }
-        };
-        println!(
-            "{:<8} {:<13} {:<6} {:<8} {:<10} {:<16} {:<10} {}",
-            s.pid,
-            s.state.as_str(),
-            s.port,
-            s.mode.as_str(),
-            uptime,
-            s.peer.as_deref().unwrap_or("-"),
-            idle,
-            timeout,
-        );
-    }
+    print!("{}", format_session_table(&res.sessions, now));
     if res.pruned_stale > 0 {
         println!("(pruned {} stale record(s))", res.pruned_stale);
     }
