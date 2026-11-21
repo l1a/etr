@@ -12,6 +12,7 @@ jobs:
   build:
     name: Build (${{ matrix.suffix }})
     runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
     strategy:
       fail-fast: false
       matrix:
@@ -19,10 +20,12 @@ jobs:
           # etrs (the server) is Unix-only by design (fork/setsid daemonization),
           # so Unix builds ship both binaries; Windows builds ship the etr client only.
           - os: ubuntu-latest
+            container: fedora:latest
             artifact: release-linux-x86_64
             suffix: linux-x86_64
             bins: both
           - os: ubuntu-24.04-arm
+            container: fedora:latest
             artifact: release-linux-aarch64
             suffix: linux-aarch64
             bins: both
@@ -40,20 +43,33 @@ jobs:
             bins: client
             target: aarch64-pc-windows-msvc
     steps:
+      - name: Install system dependencies (Fedora)
+        if: matrix.container
+        run: dnf install -y git curl gcc make libutempter-devel
+
       - name: Checkout Code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Install Rust toolchain (Fedora)
+        if: matrix.container
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
+          sh /tmp/rustup-init.sh -y --default-toolchain stable --profile minimal
+          rm -f /tmp/rustup-init.sh
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/cargo" --version
+          "$HOME/.cargo/bin/rustc" --version
+
       - name: Setup Rust Toolchain
+        if: ${{ !matrix.container }}
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           targets: ${{ matrix.target }}
 
       - name: Cache Cargo Dependencies
+        if: ${{ !matrix.container }}
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-
-      - name: Install libutempter (Linux only)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libutempter0
 
       - name: Build release binaries
         shell: bash
