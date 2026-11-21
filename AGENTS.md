@@ -416,7 +416,7 @@ the recipes assume:
 
 ## 7. Sandbox Exceptions (`BypassSandbox: true`) — `etr`-Specific
 In addition to Part 1 §5, always run these `etr`-specific recipes with `BypassSandbox: true` on the first call:
-- **`just` shebang, network, and E2E/tmux recipes:** `just audit`, `just install-tag`, `just clean`, `just clean-procs`, `just check-tools`, `just e2e-local`, `just e2e-env-local`, `just e2e-cmd-local`, `just e2e-family-local`, `just e2e-forward-local`, `just e2e-reverse-local`, `just e2e-udp-concurrent`, `just throughput-local`, `just throughput-remote`, `just stress-local`, `just stress-udp-rate`.
+- **`just` shebang, network, and E2E/tmux recipes:** `just audit`, `just install-tag`, `just clean`, `just clean-procs`, `just check-tools`, `just e2e-local`, `just e2e-env-local`, `just e2e-cmd-local`, `just e2e-family-local`, `just e2e-forward-local`, `just e2e-reverse-local`, `just e2e-udp-concurrent`, `just e2e-timeouts-local`, `just throughput-local`, `just throughput-remote`, `just stress-local`, `just stress-udp-rate`.
 - **Non-interactive `just open-pr` in agent PTYs:** Because `run_command` allocates a PTY (`[ -t 0 ]` is true), bare `just open-pr` invokes `gh pr create` interactively and hangs waiting on `? Title (required)`. Always pass `--fill` (or explicit `--title ... --body-file ...`), e.g. `PR_CONFIRM=y just open-pr --fill`.
 - **Commands that DO work in the sandbox (`BypassSandbox: false`):**
   - `just`, `just build`, `just build-release`, `just build-stress`, `just test`, `just fmt`, `just fmt-check`, `just clippy`, `just lint`, `just check`, `just man`, `just man-check`, `just standard-check`, `just packaging-check`, `just scoop-check`, `just text-check`, `just wip-check`, `just copr-render`, `just install-hooks`, `just setup`

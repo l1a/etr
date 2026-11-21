@@ -131,6 +131,20 @@ SSH channel and pinned for subsequent QUIC connections.
 **-Y**
 :   Enable trusted X11 forwarding. Extracts the local X11 display cookie from the active display (via **xauth list**) and forwards X11 connections without X11 Security Extension restrictions.
 
+**\-\-reconnect\-timeout** *SECS*
+:   Per-session server reconnect timeout in seconds (**0** = stay alive forever).
+    Sent to **etrs**(1) over SSH during bootstrap; overrides the remote config
+    file and **ETR_SERVER_NETWORK_TMOUT**, and defaults to **etrs**'s compiled-in
+    **345600** seconds (96 hours / 4 days) when unset. Config file equivalent:
+    **reconnect_timeout** under **\[client\]**.
+
+**\-\-connect\-timeout** *SECS*
+:   Per-session initial connect timeout in seconds before the client's first
+    authenticated QUIC connection (**0** = stay alive forever). Sent to
+    **etrs**(1) over SSH during bootstrap; defaults to **etrs**'s compiled-in
+    **60** seconds when unset. Config file equivalent: **connect_timeout**
+    under **\[client\]**.
+
 **\-\-server-path** *PATH*
 :   Path to the **etrs** binary on the remote host. Defaults to **etrs**
     (relies on **PATH**), or the value of **server_path** in the config file.
@@ -188,6 +202,12 @@ x11 = false
 
 # Enable trusted X11 forwarding (default: false)
 x11_trusted = false
+
+# Per-session server reconnect timeout in seconds (default: 345600 / 96h; 0 = forever)
+reconnect_timeout = 345600
+
+# Per-session initial connect timeout in seconds (default: 60; 0 = forever)
+connect_timeout = 60
 ```
 
 # FILES
