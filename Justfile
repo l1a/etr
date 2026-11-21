@@ -10,7 +10,6 @@ ETRS_BIN   := justfile_directory() + "/target/debug/etrs"
 ETR_REL    := justfile_directory() + "/target/release/etr"
 ETRS_REL   := justfile_directory() + "/target/release/etrs"
 STRESS_BIN := justfile_directory() + "/tools/stress/target/release/stress_tool"
-INSTALL    := home_directory() + "/.cargo/bin"
 
 # ===== PROJECT — the only part of the install family this repo owns =====
 #
@@ -1000,7 +999,7 @@ check-tools:
 #
 # etr is launched as the tmux session command (not via send-keys) to avoid
 # the .zshrc startup race.
-e2e-local: check-tools install
+e2e-local: check-tools build
     #!/usr/bin/env bash
     set -euo pipefail
 
@@ -1028,7 +1027,7 @@ e2e-local: check-tools install
     # startup race and makes #{pane_pid} == etr's PID.
     echo "==> Launching etr client in tmux session '{{TMUX_SESS}}'..."
     tmux new-session -d -s "{{TMUX_SESS}}" -x 200 -y 50 -- \
-        "{{INSTALL}}/etr" -v localhost
+        "{{ETR_BIN}}" -v --server-path "{{ETRS_BIN}}" localhost
 
     # ── 2. Wait for "[etr] Connected." in the client log ─────────────────────
     echo "    waiting for etr to connect..."
@@ -1077,7 +1076,10 @@ e2e-local: check-tools install
     fi
 
     # ── 4. Reconnect test ────────────────────────────────────────────────────
-    ETRS_PID=$(pgrep -x etrs 2>/dev/null | head -1 || true)
+    ETRS_PID=""
+    for p in $(pgrep -x -u "$(id -u)" etrs 2>/dev/null || true); do
+        [[ "$ETRS_PRE" == *" $p "* ]] || { ETRS_PID="$p"; break; }
+    done
     if [[ -z "$ETRS_PID" ]]; then
         echo "SKIP: etrs PID not found; skipping reconnect test" >&2
     else
@@ -1107,7 +1109,7 @@ e2e-local: check-tools install
     echo "==> All tests passed."
 
 # Run the local E2E test for --env variable forwarding to the remote shell
-e2e-env-local: check-tools install
+e2e-env-local: check-tools build
     #!/usr/bin/env bash
     set -euo pipefail
 
@@ -1133,7 +1135,7 @@ e2e-env-local: check-tools install
     echo "==> Launching etr with --env ETR_TEST_SET=hello_env --env ETR_TEST_FWD..."
     export ETR_TEST_FWD="forwarded_value_$$"
     tmux new-session -d -s "$TMUX_SESS_ENV" -x 200 -y 50 -- \
-        "{{INSTALL}}/etr" -v \
+        "{{ETR_BIN}}" -v --server-path "{{ETRS_BIN}}" \
             --env "ETR_TEST_SET=hello_env" \
             --env "ETR_TEST_FWD" \
             localhost
@@ -1200,7 +1202,7 @@ e2e-env-local: check-tools install
     echo "==> All --env tests passed."
 
 # Run the local E2E test for remote command execution (etr host 'command')
-e2e-cmd-local: check-tools install
+e2e-cmd-local: check-tools build
     #!/usr/bin/env bash
     set -euo pipefail
 
@@ -1228,7 +1230,7 @@ e2e-cmd-local: check-tools install
     # long enough to capture; the session ends when the command exits.
     echo "==> Launching etr with remote command: echo ${SENTINEL} && sleep 5"
     tmux new-session -d -s "$TMUX_SESS_CMD" -x 200 -y 50 -- \
-        "{{INSTALL}}/etr" -v localhost "echo ${SENTINEL} && sleep 5"
+        "{{ETR_BIN}}" -v --server-path "{{ETRS_BIN}}" localhost "echo ${SENTINEL} && sleep 5"
 
     # ── 2. Wait for "[etr] Connected." ────────────────────────────────────────
     echo "    waiting for etr to connect..."
@@ -1282,7 +1284,7 @@ e2e-cmd-local: check-tools install
     TMUX_SESS_FAST="etr_cmd_fast_test"
     echo "==> Part 2: fast-exit command ('true') must not hang..."
     tmux new-session -d -s "$TMUX_SESS_FAST" -x 200 -y 50 -- \
-        "{{INSTALL}}/etr" -v localhost true
+        "{{ETR_BIN}}" -v --server-path "{{ETRS_BIN}}" localhost true
 
     FAST_EXIT=0
     for i in $(seq 1 20); do
@@ -1347,7 +1349,7 @@ e2e-cmd-local: check-tools install
     PYEOF
 
     "{{PY}}" "$PTY_HELPER" \
-        "exec {{INSTALL}}/etr localhost 'echo ${SENTINEL_EOF}' </dev/null" > "$OUT_FILE" 2>&1 || true
+        "exec '{{ETR_BIN}}' --server-path '{{ETRS_BIN}}' localhost 'echo ${SENTINEL_EOF}' </dev/null" > "$OUT_FILE" 2>&1 || true
 
     if ! grep -q "${SENTINEL_EOF}" "$OUT_FILE"; then
         echo "FAIL: output of a remote command was lost when stdin was redirected." >&2
@@ -1365,7 +1367,7 @@ e2e-cmd-local: check-tools install
     echo "==> Part 4: a stdin-reading command must see EOF and exit..."
     START=$(date +%s)
     "{{PY}}" "$PTY_HELPER" \
-        "exec sh -c 'printf \"${SENTINEL_CAT}\\n\" | {{INSTALL}}/etr localhost cat'" \
+        "exec sh -c 'printf \"${SENTINEL_CAT}\\n\" | \"{{ETR_BIN}}\" --server-path \"{{ETRS_BIN}}\" localhost cat'" \
         > "$OUT_FILE" 2>&1 || true
     ELAPSED=$(( $(date +%s) - START ))
 
@@ -1404,7 +1406,7 @@ e2e-cmd-local: check-tools install
     # reporting nothing about the panic it exists to catch.
     NOTTY_RC=0
     "{{PY}}" "$NOTTY_HELPER" \
-        "exec {{INSTALL}}/etr localhost 'echo ${SENTINEL_NOTTY}' </dev/null" \
+        "exec '{{ETR_BIN}}' --server-path '{{ETRS_BIN}}' localhost 'echo ${SENTINEL_NOTTY}' </dev/null" \
         > "$OUT_FILE" 2>/dev/null || NOTTY_RC=$?
 
     if [[ $NOTTY_RC -eq 101 ]]; then
@@ -1434,7 +1436,7 @@ e2e-cmd-local: check-tools install
     # Same `set -e` guard as Part 5 -- and here a non-zero exit is the *expected*
     # result, so without it this check could never pass.
     INT_RC=0
-    "{{PY}}" "$NOTTY_HELPER" "exec {{INSTALL}}/etr localhost </dev/null" \
+    "{{PY}}" "$NOTTY_HELPER" "exec '{{ETR_BIN}}' --server-path '{{ETRS_BIN}}' localhost </dev/null" \
         > "$OUT_FILE" 2>&1 || INT_RC=$?
 
     if [[ $INT_RC -eq 0 ]]; then
@@ -1472,7 +1474,7 @@ e2e-cmd-local: check-tools install
     # actually killed was somebody else's.)
     BEFORE_PIDS=$(procs_snapshot etrs)
     "{{PY}}" "$NOTTY_HELPER" \
-        "exec {{INSTALL}}/etr localhost 'sleep 300' </dev/null >/dev/null 2>&1 &
+        "exec '{{ETR_BIN}}' --server-path '{{ETRS_BIN}}' localhost 'sleep 300' </dev/null >/dev/null 2>&1 &
          sleep 6; exit 0" >/dev/null 2>&1 || true
 
     ETRS_TD=""
@@ -1531,7 +1533,7 @@ e2e-cmd-local: check-tools install
 #
 # `-vv` rather than `-v`: the chosen peer address is logged at level 2. The log
 # file is only written when stdin is a terminal, which is why these run in tmux.
-e2e-family-local: check-tools install
+e2e-family-local: check-tools build
     #!/usr/bin/env bash
     set -euo pipefail
 
@@ -1559,7 +1561,7 @@ e2e-family-local: check-tools install
         > "$CLIENT_LOG"
         tmux kill-session -t "$TMUX_SESS_FAM" 2>/dev/null || true
         tmux new-session -d -s "$TMUX_SESS_FAM" -x 200 -y 50 -- \
-            "{{INSTALL}}/etr" -vv "$flag" "$target" "echo ${sentinel}; sleep 3"
+            "{{ETR_BIN}}" -vv --server-path "{{ETRS_BIN}}" "$flag" "$target" "echo ${sentinel}; sleep 3"
         local i
         for i in $(seq 1 30); do
             sleep 1
@@ -1642,7 +1644,7 @@ e2e-family-local: check-tools install
     echo "==> All address-family tests passed."
 
 # Run the local E2E test for local port forwarding -L (TCP + UDP, IPv4 + IPv6, reconnect)
-e2e-forward-local: check-tools install
+e2e-forward-local: check-tools build
     #!/usr/bin/env bash
     set -euo pipefail
 
@@ -1683,7 +1685,7 @@ e2e-forward-local: check-tools install
     # Launch etr with -L specs
     echo "==> Launching etr with -L specs..."
     tmux new-session -d -s "$TMUX_FORWARD" -x 200 -y 50 -- \
-        "{{INSTALL}}/etr" -v \
+        "{{ETR_BIN}}" -v --server-path "{{ETRS_BIN}}" \
         -L "${TCP_FWD_PORT}:localhost:${TCP_ECHO_PORT}" \
         -L "${UDP_FWD_PORT}:127.0.0.1:${UDP_ECHO_PORT}/udp" \
         localhost
@@ -1775,7 +1777,10 @@ e2e-forward-local: check-tools install
     fi
 
     # ── Reconnect test ────────────────────────────────────────────────────────
-    ETRS_PID=$(pgrep -x etrs 2>/dev/null | head -1 || true)
+    ETRS_PID=""
+    for p in $(pgrep -x -u "$(id -u)" etrs 2>/dev/null || true); do
+        [[ "$ETRS_PRE" == *" $p "* ]] || { ETRS_PID="$p"; break; }
+    done
     if [[ -z "$ETRS_PID" ]]; then
         echo "SKIP: etrs PID not found; skipping reconnect test" >&2
     else
@@ -1826,7 +1831,7 @@ e2e-forward-local: check-tools install
     echo "==> All -L forward E2E tests passed."
 
 # Run the local E2E test for reverse port forwarding (both TCP and UDP)
-e2e-reverse-local: check-tools install
+e2e-reverse-local: check-tools build
     #!/usr/bin/env bash
     set -euo pipefail
 
@@ -1866,7 +1871,7 @@ e2e-reverse-local: check-tools install
     # Launch etr with reverse forwarding specs
     echo "==> Launching etr with -R specs..."
     tmux new-session -d -s "$TMUX_REVERSE" -x 200 -y 50 -- \
-        "{{INSTALL}}/etr" -v \
+        "{{ETR_BIN}}" -v --server-path "{{ETRS_BIN}}" \
         -R "${TCP_REMOTE_PORT}:localhost:${TCP_LOCAL_PORT}" \
         -R "${UDP_REMOTE_PORT}:127.0.0.1:${UDP_LOCAL_PORT}/udp" \
         localhost
@@ -1968,7 +1973,10 @@ e2e-reverse-local: check-tools install
     fi
 
     # ── Reconnect test ────────────────────────────────────────────────────────
-    ETRS_PID=$(pgrep -x etrs 2>/dev/null | head -1 || true)
+    ETRS_PID=""
+    for p in $(pgrep -x -u "$(id -u)" etrs 2>/dev/null || true); do
+        [[ "$ETRS_PRE" == *" $p "* ]] || { ETRS_PID="$p"; break; }
+    done
     if [[ -z "$ETRS_PID" ]]; then
         echo "SKIP: etrs PID not found; skipping reconnect test" >&2
     else
@@ -2024,7 +2032,7 @@ e2e-reverse-local: check-tools install
 # remote UDP target always went to whichever sender sent last (last-sender-wins).
 # This test sends interleaved datagrams from two independent sockets and asserts
 # each socket receives its own reply — not the other sender's.
-e2e-udp-concurrent: check-tools install
+e2e-udp-concurrent: check-tools build
     #!/usr/bin/env bash
     set -euo pipefail
 
@@ -2056,7 +2064,7 @@ e2e-udp-concurrent: check-tools install
 
     echo "==> Launching etr with -L UDP spec..."
     tmux new-session -d -s "$TMUX_CONC" -x 200 -y 50 -- \
-        "{{INSTALL}}/etr" -v \
+        "{{ETR_BIN}}" -v --server-path "{{ETRS_BIN}}" \
         -L "${UDP_FWD_PORT}:127.0.0.1:${UDP_ECHO_PORT}/udp" \
         localhost
 
@@ -2087,6 +2095,192 @@ e2e-udp-concurrent: check-tools install
 
     echo ""
     echo "==> Concurrent UDP sender regression test passed."
+
+# Run the local E2E test for session timeouts, SIGUSR1 immunity/reaping, --list, and --clean
+e2e-timeouts-local: check-tools build
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    # Reap only what THIS test starts -- never a live session on this machine.
+    source scripts/e2e_procs.sh
+    ETRS_PRE=$(procs_snapshot etrs)
+
+    TEST_TMP=$(mktemp -d)
+    TEST_STATE="$TEST_TMP/state"
+    TEST_CFG="$TEST_TMP/config"
+    LOG_A="$TEST_TMP/etr-a.log"
+    LOG_B="$TEST_TMP/etr-b.log"
+    TMUX_A="etr_timeouts_a"
+    TMUX_B="etr_timeouts_b"
+    mkdir -m 0700 -p "$TEST_STATE" "$TEST_STATE/etr" "$TEST_CFG"
+
+    ETRS_WRAP="$TEST_TMP/etrs-wrap.sh"
+    cat > "$ETRS_WRAP" <<EOF
+    #!/bin/sh
+    export XDG_STATE_HOME="$TEST_STATE"
+    export XDG_CONFIG_HOME="$TEST_CFG"
+    exec "{{ETRS_BIN}}" "\$@"
+    EOF
+    chmod 700 "$ETRS_WRAP"
+
+    cleanup() {
+        echo ""
+        echo "--- cleanup ---"
+        tmux kill-session -t "$TMUX_A" 2>/dev/null && echo "killed tmux session $TMUX_A" || true
+        tmux kill-session -t "$TMUX_B" 2>/dev/null && echo "killed tmux session $TMUX_B" || true
+        procs_reap etrs "${ETRS_PRE:-}"
+        rm -rf "$TEST_TMP"
+    }
+    trap cleanup EXIT
+
+    # ── 1. Launch two concurrent isolated sessions with client timeout overrides ─
+    echo "==> Launching session A (reconnect=3s) and session B (reconnect=3600s)..."
+    tmux new-session -d -s "$TMUX_A" -x 200 -y 50 -- \
+        env XDG_STATE_HOME="$TEST_STATE" XDG_CONFIG_HOME="$TEST_CFG" \
+        "{{ETR_BIN}}" -v --log-path "$LOG_A" --reconnect-timeout 3 --connect-timeout 30 --server-path "$ETRS_WRAP" localhost
+    tmux new-session -d -s "$TMUX_B" -x 200 -y 50 -- \
+        env XDG_STATE_HOME="$TEST_STATE" XDG_CONFIG_HOME="$TEST_CFG" \
+        "{{ETR_BIN}}" -v --log-path "$LOG_B" --reconnect-timeout 3600 --connect-timeout 30 --server-path "$ETRS_WRAP" localhost
+
+    echo "    waiting for both clients to connect..."
+    READY=0
+    for _ in $(seq 1 30); do
+        if grep -q '\[etr\] Connected\.' "$LOG_A" 2>/dev/null \
+            && grep -q '\[etr\] Connected\.' "$LOG_B" 2>/dev/null; then
+            READY=1
+            break
+        fi
+        sleep 1
+    done
+    if [[ $READY -eq 0 ]]; then
+        echo "ERROR: both clients did not connect within 30 s" >&2
+        echo "--- log A ---" >&2; cat "$LOG_A" >&2 || true
+        echo "--- log B ---" >&2; cat "$LOG_B" >&2 || true
+        exit 1
+    fi
+
+    SENTINEL_A="TIMEOUT_A_READY_$$"
+    SENTINEL_B="TIMEOUT_B_READY_$$"
+    tmux send-keys -t "$TMUX_A" "echo ${SENTINEL_A}" Enter
+    tmux send-keys -t "$TMUX_B" "echo ${SENTINEL_B}" Enter
+    READY=0
+    for _ in $(seq 1 20); do
+        if tmux capture-pane -t "$TMUX_A" -p -S - 2>/dev/null | grep -q "${SENTINEL_A}" \
+            && tmux capture-pane -t "$TMUX_B" -p -S - 2>/dev/null | grep -q "${SENTINEL_B}"; then
+            READY=1
+            break
+        fi
+        sleep 1
+    done
+    if [[ $READY -eq 0 ]]; then
+        echo "ERROR: remote shell sentinels not seen within 20 s" >&2
+        tmux capture-pane -t "$TMUX_A" -p -S - >&2 || true
+        tmux capture-pane -t "$TMUX_B" -p -S - >&2 || true
+        exit 1
+    fi
+    echo "    both sessions up."
+
+    # ── 2. Verify etrs --list shows both connected sessions and forwarded timeouts ─
+    echo "==> Checking etrs --list..."
+    LIST1=$(XDG_STATE_HOME="$TEST_STATE" "{{ETRS_BIN}}" --list)
+    PID_A=$(awk '$2=="connected" && $NF=="3s"{print $1; exit}' <<<"$LIST1")
+    PID_B=$(awk '$2=="connected" && $NF=="1h"{print $1; exit}' <<<"$LIST1")
+    if [[ -z "${PID_A:-}" || -z "${PID_B:-}" ]]; then
+        echo "FAIL: expected connected rows with 3s and 1h timeouts in --list:" >&2
+        echo "$LIST1" >&2
+        exit 1
+    fi
+    echo "    PASS: --list shows PID_A=$PID_A (3s) and PID_B=$PID_B (1h)."
+
+    # ── 3. Connected sessions must ignore SIGUSR1 and --clean ─────────────────
+    echo "==> Verifying connected sessions ignore SIGUSR1 and etrs --clean..."
+    kill -USR1 "$PID_A" "$PID_B"
+    CLEAN_CONN=$(XDG_STATE_HOME="$TEST_STATE" "{{ETRS_BIN}}" --clean)
+    if ! grep -q "No disconnected etrs sessions eligible for cleanup" <<<"$CLEAN_CONN" \
+        || ! grep -q "connected: 2" <<<"$CLEAN_CONN"; then
+        echo "FAIL: unexpected --clean output while both sessions connected:" >&2
+        echo "$CLEAN_CONN" >&2
+        exit 1
+    fi
+
+    ALIVE_A="STILL_ALIVE_A_$$"
+    ALIVE_B="STILL_ALIVE_B_$$"
+    tmux send-keys -t "$TMUX_A" "echo ${ALIVE_A}" Enter
+    tmux send-keys -t "$TMUX_B" "echo ${ALIVE_B}" Enter
+    ALIVE=0
+    for _ in $(seq 1 5); do
+        if tmux capture-pane -t "$TMUX_A" -p -S - 2>/dev/null | grep -q "${ALIVE_A}" \
+            && tmux capture-pane -t "$TMUX_B" -p -S - 2>/dev/null | grep -q "${ALIVE_B}"; then
+            ALIVE=1
+            break
+        fi
+        sleep 1
+    done
+    if [[ $ALIVE -eq 0 ]]; then
+        echo "FAIL: connected session stopped responding after SIGUSR1 / --clean" >&2
+        exit 1
+    fi
+    echo "    PASS: connected sessions ignored SIGUSR1 and --clean."
+
+    # ── 4. Abrupt drop: A expires via 3s timeout; B drains SIGUSR1 & stays alive ─
+    echo "==> Simulating abrupt client drop (SIGKILL on clients)..."
+    ETR_PID_A=$(tmux list-panes -t "$TMUX_A" -F '#{pane_pid}' | head -1)
+    ETR_PID_B=$(tmux list-panes -t "$TMUX_B" -F '#{pane_pid}' | head -1)
+    kill -9 "$ETR_PID_A" "$ETR_PID_B" 2>/dev/null || true
+    tmux kill-session -t "$TMUX_A" 2>/dev/null || true
+    tmux kill-session -t "$TMUX_B" 2>/dev/null || true
+
+    echo "    waiting up to 50 s for 30s QUIC idle + 3s reconnect timeout on A and disconnected B..."
+    SETTLED=0
+    LIST2=""
+    for _ in $(seq 1 50); do
+        if ! kill -0 "$PID_A" 2>/dev/null; then
+            LIST2=$(XDG_STATE_HOME="$TEST_STATE" "{{ETRS_BIN}}" --list)
+            if grep -Eq "^${PID_B}[[:space:]]+disconnected[[:space:]]" <<<"$LIST2"; then
+                SETTLED=1
+                break
+            fi
+        fi
+        sleep 1
+    done
+    if [[ $SETTLED -eq 0 ]]; then
+        echo "FAIL: session A ($PID_A) did not expire or session B ($PID_B) did not reach disconnected within 50 s" >&2
+        echo "--- --list ---" >&2
+        XDG_STATE_HOME="$TEST_STATE" "{{ETRS_BIN}}" --list >&2 || true
+        ps -o pid=,stat=,args= -p "$PID_A" "$PID_B" >&2 || true
+        exit 1
+    fi
+    echo "    PASS: session A ($PID_A) exited after 3s timeout; session B ($PID_B) is disconnected."
+
+    # ── 5. --clean --older-than skips recent B; plain --clean reaps B via SIGUSR1 ─
+    echo "==> Verifying etrs --clean --older-than 3600 skips B, then etrs --clean reaps B..."
+    CLEAN_OLD=$(XDG_STATE_HOME="$TEST_STATE" "{{ETRS_BIN}}" --clean --older-than 3600)
+    if ! grep -q "No disconnected etrs sessions eligible for cleanup" <<<"$CLEAN_OLD" \
+        || ! grep -q "recent: 1" <<<"$CLEAN_OLD" \
+        || ! kill -0 "$PID_B" 2>/dev/null; then
+        echo "FAIL: --clean --older-than 3600 should skip recent session B ($PID_B):" >&2
+        echo "$CLEAN_OLD" >&2
+        exit 1
+    fi
+
+    CLEAN_NOW=$(XDG_STATE_HOME="$TEST_STATE" "{{ETRS_BIN}}" --clean)
+    if ! grep -q "Terminated 1 disconnected session(s)" <<<"$CLEAN_NOW" \
+        || kill -0 "$PID_B" 2>/dev/null; then
+        echo "FAIL: --clean failed to reap disconnected session B ($PID_B):" >&2
+        echo "$CLEAN_NOW" >&2
+        exit 1
+    fi
+
+    LIST_END=$(XDG_STATE_HOME="$TEST_STATE" "{{ETRS_BIN}}" --list)
+    if [[ "$LIST_END" != "No active etrs sessions." ]]; then
+        echo "FAIL: expected clean registry after reaping B, got:" >&2
+        echo "$LIST_END" >&2
+        exit 1
+    fi
+    echo "    PASS: --clean --older-than skipped recent session; --clean reaped B cleanly."
+
+    echo ""
+    echo "==> All timeout and cleanup E2E tests passed."
 
 # Find the UDP forwarding rate that actually survives the tunnel.
 #
@@ -2123,7 +2317,7 @@ e2e-udp-concurrent: check-tools install
 # THROUGHPUT_SECS=n to change the run length (default 15).
 
 # One-way TCP goodput through a -L forward vs the raw loopback path
-throughput-local: check-tools install build-stress
+throughput-local: check-tools build-release build-stress
     #!/usr/bin/env bash
     set -euo pipefail
     source scripts/e2e_procs.sh
@@ -2163,7 +2357,7 @@ throughput-local: check-tools install build-stress
     SINK_PID=$!
     sleep 0.5
     tmux new-session -d -s "$TMUX_T" -x 200 -y 50 -- \
-        "{{INSTALL}}/etr" -v -L "${FWD_PORT}:127.0.0.1:${SINK_PORT}" localhost
+        "{{ETR_REL}}" -v --server-path "{{ETRS_REL}}" -L "${FWD_PORT}:127.0.0.1:${SINK_PORT}" localhost
     READY=0
     for i in $(seq 1 30); do
         sleep 1
@@ -2186,7 +2380,7 @@ throughput-local: check-tools install build-stress
 # --server-path against the staged copy.
 
 # One-way TCP goodput through a -L forward to HOST, vs the raw path to it
-throughput-remote HOST: check-tools install build-stress
+throughput-remote HOST: check-tools build-release build-stress
     #!/usr/bin/env bash
     set -euo pipefail
     source scripts/e2e_procs.sh
@@ -2269,7 +2463,7 @@ throughput-remote HOST: check-tools install build-stress
     SINK_SSH=$!
     sleep 2
     tmux new-session -d -s "$TMUX_T" -x 200 -y 50 -- \
-        "{{INSTALL}}/etr" -v -L "${FWD_PORT}:127.0.0.1:${SINK_PORT}" --server-path "$RETRS" "$HOST"
+        "{{ETR_REL}}" -v -L "${FWD_PORT}:127.0.0.1:${SINK_PORT}" --server-path "$RETRS" "$HOST"
     READY=0
     for i in $(seq 1 40); do
         sleep 1
@@ -2286,7 +2480,7 @@ throughput-remote HOST: check-tools install build-stress
     "{{PY}}" scripts/throughput_report.py "$BASE_LINE" "$ETR_LINE"
 
 # Sweep the offered UDP rate and report delivered vs offered, to find the sustainable rate
-stress-udp-rate: check-tools install build-stress
+stress-udp-rate: check-tools build-release build-stress
     #!/usr/bin/env bash
     set -euo pipefail
 
@@ -2320,7 +2514,7 @@ stress-udp-rate: check-tools install build-stress
 
     echo "==> etr -L ${UDP_FWD_PORT}:127.0.0.1:${UDP_ECHO_PORT}/udp"
     tmux new-session -d -s "$TMUX_RATE" -x 200 -y 50 -- \
-        "{{INSTALL}}/etr" -v -L "${UDP_FWD_PORT}:127.0.0.1:${UDP_ECHO_PORT}/udp" localhost
+        "{{ETR_REL}}" -v --server-path "{{ETRS_REL}}" -L "${UDP_FWD_PORT}:127.0.0.1:${UDP_ECHO_PORT}/udp" localhost
 
     READY=0
     for i in $(seq 1 30); do
@@ -2371,7 +2565,7 @@ stress-udp-rate: check-tools install build-stress
 # buffers).
 #
 # Requires: python3, tmux, passwordless SSH to localhost.
-stress-local: check-tools install build-stress
+stress-local: check-tools build-release build-stress
     #!/usr/bin/env bash
     set -euo pipefail
 
@@ -2442,7 +2636,7 @@ stress-local: check-tools install build-stress
     echo "==> etr -L ${TCP_FWD_PORT}:localhost:${TCP_ECHO_PORT} -L ${UDP_FWD_PORT}:localhost:${UDP_ECHO_PORT}/udp"
     echo "       -R ${TCP_R_FWD_PORT}:localhost:${TCP_R_ECHO_PORT} -R ${UDP_R_FWD_PORT}:localhost:${UDP_R_ECHO_PORT}/udp localhost"
     tmux new-session -d -s "$STRESS_SESS" -x 220 -y 50 -- \
-        "{{INSTALL}}/etr" -v \
+        "{{ETR_REL}}" -v --server-path "{{ETRS_REL}}" \
         -L "${TCP_FWD_PORT}:localhost:${TCP_ECHO_PORT}" \
         -L "${UDP_FWD_PORT}:localhost:${UDP_ECHO_PORT}/udp" \
         -R "${TCP_R_FWD_PORT}:localhost:${TCP_R_ECHO_PORT}" \

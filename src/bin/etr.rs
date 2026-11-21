@@ -299,11 +299,7 @@ macro_rules! vlog {
 }
 
 fn client_log_path() -> std::path::PathBuf {
-    dirs::state_dir()
-        .or_else(|| dirs::home_dir().map(|h| h.join(".local/state")))
-        .map(|d| d.join("etr"))
-        .unwrap_or_else(etr::config::fallback_tmp_state_dir)
-        .join("etr.log")
+    etr::config::state_dir().join("etr.log")
 }
 
 /// Open (or create) the client log file with restrictive `0600` permissions (and `0700` parent
@@ -385,6 +381,18 @@ struct Cli {
     /// Enable trusted X11 forwarding
     #[arg(short = 'Y')]
     x11_trusted: bool,
+
+    /// Per-session server reconnect timeout in seconds (0 = stay alive forever).
+    /// Sent to etrs over SSH; overrides remote config and env, and defaults to
+    /// etrs's 345600s (96h / 4 days) when unset.
+    #[arg(long, value_name = "SECS")]
+    reconnect_timeout: Option<u64>,
+
+    /// Per-session server initial connect timeout in seconds before the first
+    /// authenticated connection (0 = stay alive forever). Sent to etrs over SSH;
+    /// defaults to etrs's 60s when unset.
+    #[arg(long, value_name = "SECS")]
+    connect_timeout: Option<u64>,
 
     /// Generate shell completions for the specified shell
     #[arg(long, value_enum, value_name = "SHELL")]
@@ -675,6 +683,8 @@ async fn main() -> io::Result<()> {
 
     let x11_trusted = cli.x11_trusted || cfg.client.x11_trusted.unwrap_or(false);
     let x11_enabled = cli.x11 || cfg.client.x11.unwrap_or(false) || x11_trusted;
+    let reconnect_timeout = cli.reconnect_timeout.or(cfg.client.reconnect_timeout);
+    let connect_timeout = cli.connect_timeout.or(cfg.client.connect_timeout);
 
     let (server_port, server_cert) = match bootstrap_ssh(
         &target,
@@ -695,6 +705,8 @@ async fn main() -> io::Result<()> {
         x11_enabled,
         ssh_family_flag,
         addr_pref,
+        reconnect_timeout,
+        connect_timeout,
         cli.verbose,
     ) {
         Ok(r) => r,
@@ -875,6 +887,8 @@ fn bootstrap_ssh(
     x11_enabled: bool,
     ssh_family_flag: Option<&str>,
     addr_pref: AddrPref,
+    reconnect_timeout: Option<u64>,
+    connect_timeout: Option<u64>,
     verbose: u8,
 ) -> io::Result<(u16, Vec<u8>)> {
     validate_bootstrap_inputs(target, term, env_vars, remote_command)?;
@@ -921,6 +935,12 @@ fn bootstrap_ssh(
     // this stays compatible in both directions.
     if let Some(v) = addr_pref.wire() {
         stdin.write_all(format!("ETRPREFER:{v}\n").as_bytes())?;
+    }
+    if let Some(secs) = reconnect_timeout {
+        stdin.write_all(format!("ETRRECONNECTTIMEOUT:{secs}\n").as_bytes())?;
+    }
+    if let Some(secs) = connect_timeout {
+        stdin.write_all(format!("ETRCONNECTTIMEOUT:{secs}\n").as_bytes())?;
     }
     if let Some(cmd) = remote_command {
         stdin.write_all(format!("ETRCMD:{cmd}\n").as_bytes())?;
@@ -2705,5 +2725,59 @@ mod tests {
                 .is_err(),
             "raw newline in remote_command must be rejected"
         );
+    }
+
+    #[test]
+    fn test_timeout_flags_and_config_precedence() {
+        let cli = Cli::try_parse_from([
+            "etr",
+            "--reconnect-timeout",
+            "86400",
+            "--connect-timeout",
+            "120",
+            "host",
+        ])
+        .unwrap();
+        assert_eq!(cli.reconnect_timeout, Some(86400));
+        assert_eq!(cli.connect_timeout, Some(120));
+
+        let cli_zero = Cli::try_parse_from([
+            "etr",
+            "--reconnect-timeout",
+            "0",
+            "--connect-timeout",
+            "0",
+            "host",
+        ])
+        .unwrap();
+        assert_eq!(cli_zero.reconnect_timeout, Some(0));
+        assert_eq!(cli_zero.connect_timeout, Some(0));
+
+        let cfg: Config =
+            toml::from_str("[client]\nreconnect_timeout = 3600\nconnect_timeout = 45\n").unwrap();
+        let default_cli = Cli::try_parse_from(["etr", "host"]).unwrap();
+        assert_eq!(
+            default_cli
+                .reconnect_timeout
+                .or(cfg.client.reconnect_timeout),
+            Some(3600)
+        );
+        assert_eq!(
+            default_cli.connect_timeout.or(cfg.client.connect_timeout),
+            Some(45)
+        );
+        assert_eq!(
+            cli.reconnect_timeout.or(cfg.client.reconnect_timeout),
+            Some(86400)
+        );
+        assert_eq!(
+            cli.connect_timeout.or(cfg.client.connect_timeout),
+            Some(120)
+        );
+
+        let mut cmd = Cli::command();
+        let help = cmd.render_help().to_string();
+        assert!(help.contains("--reconnect-timeout"));
+        assert!(help.contains("--connect-timeout"));
     }
 }

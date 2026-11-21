@@ -1,4 +1,4 @@
-.TH "ETR" "1" "" "etr 0.10.24" "User Commands"
+.TH "ETR" "1" "" "etr 0.11.0" "User Commands"
 
 .SH "NAME"
 .PP
@@ -166,6 +166,24 @@ Enable untrusted X11 forwarding\. Generates an untrusted X11 Security Extension 
 .PP
 Enable trusted X11 forwarding\. Extracts the local X11 display cookie from the active display (via \fBxauth list\fP) and forwards X11 connections without X11 Security Extension restrictions\.
 .RE
+\fB\fB\-\-reconnect\-timeout\fP \fISECS\fP\fP
+.RS
+.PP
+Per\-session server reconnect timeout in seconds (\fB0\fP = stay alive forever)\.
+Sent to \fBetrs\fP(1) over SSH during bootstrap; overrides the remote config
+file and \fBETR_SERVER_NETWORK_TMOUT\fP, and defaults to \fBetrs\fP's compiled\-in
+\fB345600\fP seconds (96 hours / 4 days) when unset\. Config file equivalent:
+\fBreconnect_timeout\fP under \fB[client]\fP\.
+.RE
+\fB\fB\-\-connect\-timeout\fP \fISECS\fP\fP
+.RS
+.PP
+Per\-session initial connect timeout in seconds before the client's first
+authenticated QUIC connection (\fB0\fP = stay alive forever)\. Sent to
+\fBetrs\fP(1) over SSH during bootstrap; defaults to \fBetrs\fP's compiled\-in
+\fB60\fP seconds when unset\. Config file equivalent: \fBconnect_timeout\fP
+under \fB[client]\fP\.
+.RE
 \fB\fB\-\-server\-path\fP \fIPATH\fP\fP
 .RS
 .PP
@@ -237,6 +255,12 @@ x11 = false
 
 # Enable trusted X11 forwarding (default: false)
 x11_trusted = false
+
+# Per\-session server reconnect timeout in seconds (default: 345600 / 96h; 0 = forever)
+reconnect_timeout = 345600
+
+# Per\-session initial connect timeout in seconds (default: 60; 0 = forever)
+connect_timeout = 60
 .fi
 .RE
 

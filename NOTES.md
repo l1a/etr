@@ -27,21 +27,24 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.10.24
+## Current state: v0.11.0
 
-`main` carries **0.10.23**; this branch (`feature/scoop-packaging`) bumps to **0.10.24**,
-adds Windows Scoop packaging (`packaging/scoop/etr.json`, `scripts/scoop_check.py`,
-`render_packaging.py --target scoop`, `just scoop-publish` / `just publish-scoop`,
-`scoop` job in `.github/workflows/packaging.yml`, and idempotent crates.io + Scoop
-chaining in `just publish`), and folds Dependabot PRs `#106` (`anthropics/claude-code-action`
-`v1.0.276` + `--permission-mode acceptEdits`) and `#107` (`nix 0.32` + `cargo update`). The
-newest released tag is **`v0.10.22`**, live on GitHub, crates.io, the AUR, COPR and the
-Homebrew tap.
+`main` carries **0.10.24**; this branch (`feature/session-timeouts-and-cleanup`) bumps to
+**0.11.0**, raises the default disconnected `reconnect_timeout` from 30 minutes (`1800` s) to
+**96 hours (4 days / `345600` s)** with **`0` = stay alive forever**, separates the
+initial post-bootstrap **`connect_timeout` (`60` s default, `0` = forever)** gated on first
+authenticated `SessionOpen`, adds client-side timeout forwarding over SSH bootstrap
+(`etr --reconnect-timeout` / `--connect-timeout` and `[client]` config via
+`ETRRECONNECTTIMEOUT:` / `ETRCONNECTTIMEOUT:`), adds `SIGUSR1` disconnected-only reaping
+with **`signal_timeout` (`0` s default)**, and adds a `0700`/`0600` per-user session
+registry under `$XDG_STATE_HOME/etr/sessions/<pid>.toml` powering **`etrs --list`** and
+**`etrs --clean [--older-than SECS]`**. The newest released tag is **`v0.10.24`**, live on
+GitHub, crates.io, the AUR, COPR, Homebrew, and Scoop.
 
 The full round trip works on Linux and macOS: SSH bootstrap, QUIC session with pinned
 certificate, PTY, keepalives, reconnect after a drop, `-L`/`-R` TCP and UDP forwarding,
 X11 forwarding, `-4`/`-6` family preference. The Windows **client** works; `etrs` is
-Unix-only by design. 164 tests.
+Unix-only by design. 179 tests.
 
 What is open is listed under **Known gaps / next steps** below.
 
@@ -177,10 +180,14 @@ The client detects a dropped connection when any of its per-connection tasks
 fail (QUIC stream errors / connection close).  It loops: re-connect via QUIC,
 send SessionOpen with `last_received_seq` watermarks, receive SessionAccept,
 replay unacknowledged outbound data (stdin history), resume the PTY stream.
-The server keeps session state (send history, PTY) alive across reconnects
-for up to 30 minutes.  A new QUIC source address is fine — the session is
-keyed by `session_id` + `passkey`, not the peer address.  On clean disconnect,
-`etrs` exits immediately.
+After SSH bootstrap, `etrs` waits up to **60 seconds** by default (`connect_timeout`,
+`0` = forever) for the first authenticated `SessionOpen`; once authenticated, it
+keeps session state (send history, PTY) alive across reconnects for up to **96 hours
+(4 days / 345,600 s)** by default (`reconnect_timeout`, `0` = stay alive forever).
+A new QUIC source address is fine — the session is keyed by `session_id` + `passkey`,
+not the peer address.  On clean disconnect, `etrs` exits immediately.  `SIGUSR1`
+(or `etrs --clean`) terminates only waiting/disconnected sessions past `signal_timeout`;
+connected sessions ignore and drain `SIGUSR1`.
 
 ---
 
@@ -301,10 +308,19 @@ server_path = "/usr/local/bin/etrs"
 # Which IP version to try first: "ipv4", "ipv6" or "auto" (default)
 address_family = "auto"
 
+# Per-session server timeouts forwarded over SSH (0 = stay alive forever)
+reconnect_timeout = 345600
+connect_timeout = 60
+
 [server]
 # Same for etrs: forward-target resolution, and the default bind
 # ("ipv4" binds 0.0.0.0; "ipv6"/"auto" bind the dual-stack [::]).
 address_family = "auto"
+
+# Server-side defaults (0 = forever for reconnect/connect; 0 = immediate for SIGUSR1)
+reconnect_timeout = 345600
+connect_timeout = 60
+signal_timeout = 0
 ```
 
 Run `etr --generate-config` for the fully-commented file, or `etr --merge-config`
@@ -346,7 +362,7 @@ just install-tag 0.9.0
 # Code quality gate — run before every commit
 just check            # fmt + clippy, and: standard-check, man-check, packaging-check,
                       #   text-check, wip-check
-just test             # cargo test (164 tests, incl. tools/stress)
+just test             # cargo test (179 tests, incl. tools/stress)
 
 # Man pages are TRACKED (man/etr.1, man/etrs.1) because tag tarballs carry only tracked
 # files and COPR/Homebrew install them from there. Re-run after every version bump.
@@ -398,6 +414,9 @@ just e2e-local
 
 # -4/-6 actually change the family connected over (not just that they parse)
 just e2e-family-local
+
+# Session timeouts, SIGUSR1, --list and --clean
+just e2e-timeouts-local
 
 # Memory/throughput stress test (1 PTY + 2 -L forward streams, all directions)
 just stress-local
@@ -566,6 +585,7 @@ not a check.** Watch every guard fail on the defect it exists to catch, before b
   session; a pid that did not exist a moment ago can only be ours. Running a test suite is
   not a request to drop the user's sessions — and this project's own use case is developing
   remotely on the machine being tested.
+- **Local E2E, throughput, and stress recipes run `./target/{debug,release}/etr --server-path ./target/{debug,release}/etrs` via `build`/`build-release`, never `just install`**, so `~/.cargo/bin` crates.io registry tracking (`cargo install-update`) and user man/completion files stay untouched (`~/AGENTS.md` §4).
 - **Never `pkill -f`.** A full-command-line match also matches the recipe's own shell, whose
   command line contains the pattern (`~/AGENTS.md` §10, three separate incidents). Use
   `pgrep -x`, a pid, or a pidfile. It has been hit *again* here, in a test harness, after
@@ -840,9 +860,16 @@ artefacts that only exist once the GitHub release has been built.
   `canonical_base.join("..").join("etr.log")` to verify `Component::ParentDir` rejection hands the
   callee a path from which `..` has already vanished on Windows while keeping `..` on Unix. Only
   canonicalize `std::env::temp_dir()` on Unix (where macOS `/var` is a symlink to `private/var`).
+- **`kill(pid, 0)` and `/proc/<pid>/comm` report exited zombies (`Z`) as live, and `<pid>.toml` must
+  wait until signal handlers are installed** (v0.11.0). Under a container or sandbox `PID 1` that
+  does not immediately reap reparented grandchildren (observed in `bwrap`), an exited `etrs` child
+  remains `Z` so `process_is_live_etrs` must reject `Z`/`X` in `/proc/<pid>/stat` (and `ps -o state=`
+  on non-Linux). In `run_session`, `<pid>.toml` must only be written *after* `tokio::signal::unix::signal`
+  registers `SIGUSR1`/`SIGTERM`/`SIGHUP`; registering earlier leaves a startup window where `etrs --clean`
+  hits the OS default `SIGUSR1` termination disposition before `Drop` or `hangup_child` can run.
 ---
 
-## Test coverage (164 tests)
+## Test coverage (179 tests)
 
 | Module | What's tested |
 |--------|--------------|
@@ -850,10 +877,12 @@ artefacts that only exist once the GitHub release has been built.
 | `protocol` | SessionOpen/Accept encode-decode (incl. `gateway_ports`, `reverse_forwards`, and `x11_enabled`/`x11_auth_proto`/`x11_auth_cookie` round-trip), StreamOpen/Close, Heartbeat, Disconnect, UdpDatagram |
 | `session/stream` | Acknowledge edge cases, replay from 0, initial seq values |
 | `session/mod` | Close/ack unknown stream, `last_received_map` semantics, collect_replays, `open_stream` idempotence |
-| `bin/etrs` | CLI defaults, verbose count, custom port, subcommand parsing, hex_decode, custom --log-path override, `ETRCMD`/`ETRX11`/`ETRPREFER` bootstrap line parsing (through the shipped `parse_bootstrap_line`), `-4`/`-6` flags and their mutual exclusion, `effective_bind_ip` defaults vs explicit `-b`, client preference overriding the server's own, X11 cookie setup replacement and empty-fake-cookie rejection, `is_safe_client_env_var` linker/shell-init filtering |
+| `sessions` | `format_duration` / `format_timeout`, `is_eligible_for_clean`, `SessionRecord` TOML round-trip, `SessionRegistryGuard` atomic `0600`/`0700` lifecycle + drop cleanup, symlink rejection, stale/non-`etrs`/zombie PID auto-pruning |
+| `bin/etrs` | CLI defaults, verbose count, custom port, subcommand parsing, hex_decode, custom --log-path override, `ETRCMD`/`ETRX11`/`ETRPREFER`/`ETRRECONNECTTIMEOUT`/`ETRCONNECTTIMEOUT` bootstrap line parsing (through the shipped `parse_bootstrap_line`), `-4`/`-6` flags and their mutual exclusion, `effective_bind_ip` defaults vs explicit `-b`, client preference overriding the server's own, timeout precedence (`CLI > client > env > config > default`, `0` → infinite), `--list`/`--clean`/`--older-than` CLI rules, X11 cookie setup replacement and empty-fake-cookie rejection, `is_safe_client_env_var` linker/shell-init filtering |
 | `login` | no-panic checks for record_login / record_logout with invalid fd |
-| `bin/etr` | CLI defaults, port parsing, target parsing, `-4`/`-6` short and long forms, their mutual exclusion, a family flag ahead of a remote command, CLI-beats-config precedence, no --cipher flag, custom --log-path and --server-log-path overrides, config fallback for log paths, terminal-restore sequences (cursor-safe modes cover mouse/paste/cursor and never move the cursor; screen reset leaves alt-screen without clearing scrollback), `is_authorized_reverse_stream` X11/reverse-spec enforcement, `posix_shell_quote`, `validate_bootstrap_inputs` |
-| `config` | TOML parse (full section, partial, empty), default values, `gateway_ports` / `forward` / `reverse_forward` / `x11` / `x11_trusted` / `address_family` config keys, `merge_defaults` idempotence, `open_private_log_file` traversal/symlink/writable-parent rejection |
+| `bin/etr` | CLI defaults, port parsing, target parsing, `-4`/`-6` short and long forms, their mutual exclusion, a family flag ahead of a remote command, `--reconnect-timeout`/`--connect-timeout` CLI-beats-config precedence, no --cipher flag, custom --log-path and --server-log-path overrides, config fallback for log paths, terminal-restore sequences (cursor-safe modes cover mouse/paste/cursor and never move the cursor; screen reset leaves alt-screen without clearing scrollback), `is_authorized_reverse_stream` X11/reverse-spec enforcement, `posix_shell_quote`, `validate_bootstrap_inputs` |
+| `config` | TOML parse (full section, partial, empty), default values, `gateway_ports` / `forward` / `reverse_forward` / `x11` / `x11_trusted` / `address_family` / `reconnect_timeout` / `connect_timeout` / `signal_timeout` config keys (incl. `0`), section-aware `merge_defaults` idempotence, `open_private_log_file` traversal/symlink/writable-parent rejection |
 | `forward` | UDP fast path: `UdpFrameEncoder` byte-identical to the pre-0.9.2 inline encoder (IPv4/IPv6, empty and 65507-byte payloads), alternating peers, port-only change, round trip through the decoder; `datagram_peer_addr` accepts both families and rejects port 0, ports above 65535 and non-literals. `-L`/`-R` spec parsing: TCP/UDP/IPv6, explicit proto, bad port, empty host, Display; bind address parsing (explicit IP, `[::1]`, wildcard `*`); `get_bind_addresses` with and without gateway flag; `resolve_udp_target`: localhost prefers IPv6, explicit IPv4, unresolvable host, `-4` overriding the IPv6-first default, fallback to the other family; `connect_tcp_preferred`: reaches an IPv4 listener, falls back across families, errors on an unresolvable host; `X11Display` parsing, `parse_xauth_list_for_display` exact-display matching without unrelated fallback |
 | `addrfam` | `AddrPref` from flags / config aliases / `ETRPREFER:` wire values (unknown → `Auto` in every direction), `or` fallback, ssh flag mapping, `order_by_family` (preferred family first, stable within a family, identity for `Auto`, single-family and empty input), `first_routable`, `resolve_preferred`, `family_available` |
+| `tests/session_timeouts` | End-to-end `etrs` daemon tests: 1 s initial connect timeout, `ETRCONNECTTIMEOUT` client bootstrap override, `SIGUSR1` reaping + `signal_timeout` grace period, `--list` and `--clean --older-than`, and real QUIC auth (`Connected` ignores & drains `SIGUSR1` → abrupt drop → `Disconnected` → `ETRRECONNECTTIMEOUT` expiry) |
 | `tools/stress` | `Pacer::new(0)` unpaced no-op, `advance_deadline` coarse-sleep vs `SPIN_HORIZON` spin-window splitting, `MAX_LAG_STEPS` lag clamping without catch-up bursts, and sub-100 µs (`50 µs`) busy-wait accuracy |
