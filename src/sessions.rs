@@ -133,6 +133,78 @@ pub fn format_timeout(secs: u64) -> String {
     }
 }
 
+/// Column headers printed by `etrs --list`.
+pub const LIST_HEADERS: [&str; 8] = [
+    "PID", "STATE", "PORT", "MODE", "UPTIME", "PEER", "IDLE", "TIMEOUT",
+];
+
+/// Format session records as an aligned table with dynamic column widths.
+///
+/// Returns an empty string when `sessions` is empty so callers can handle
+/// empty-state messaging separately.  Each column widens to fit its header and
+/// widest cell with a 2-space gutter, and the final column has no trailing
+/// padding.
+pub fn format_session_table(sessions: &[SessionRecord], now: u64) -> String {
+    if sessions.is_empty() {
+        return String::new();
+    }
+
+    let rows: Vec<[String; 8]> = sessions
+        .iter()
+        .map(|s| {
+            let uptime = format_duration(now.saturating_sub(s.started_at));
+            let idle = match s.state {
+                SessionStatus::Connected => "-".to_string(),
+                SessionStatus::Waiting | SessionStatus::Disconnected => {
+                    format_duration(now.saturating_sub(s.disconnected_at.unwrap_or(s.started_at)))
+                }
+            };
+            let timeout = match s.state {
+                SessionStatus::Waiting => format_timeout(s.connect_timeout),
+                SessionStatus::Connected | SessionStatus::Disconnected => {
+                    format_timeout(s.reconnect_timeout)
+                }
+            };
+            [
+                s.pid.to_string(),
+                s.state.as_str().to_string(),
+                s.port.to_string(),
+                s.mode.as_str().to_string(),
+                uptime,
+                s.peer.as_deref().unwrap_or("-").to_string(),
+                idle,
+                timeout,
+            ]
+        })
+        .collect();
+
+    let mut widths: [usize; 8] = LIST_HEADERS.map(str::len);
+    for row in &rows {
+        for (w, cell) in widths.iter_mut().zip(row.iter()) {
+            *w = (*w).max(cell.chars().count());
+        }
+    }
+
+    let mut out = String::new();
+    append_table_row(&mut out, &LIST_HEADERS, &widths);
+    for row in &rows {
+        let cells = row.each_ref().map(String::as_str);
+        append_table_row(&mut out, &cells, &widths);
+    }
+    out
+}
+
+fn append_table_row(out: &mut String, cells: &[&str; 8], widths: &[usize; 8]) {
+    use std::fmt::Write;
+
+    if let Some((last, init)) = cells.split_last() {
+        for (cell, width) in init.iter().zip(widths.iter()) {
+            let _ = write!(out, "{cell:<width$}  ");
+        }
+        let _ = writeln!(out, "{last}");
+    }
+}
+
 #[cfg(unix)]
 mod unix_imp {
     use super::*;
@@ -423,8 +495,14 @@ mod unix_imp {
             }
         }
 
+        // Exceed utempter logout + hangup_child's 1 s SIGHUP-to-SIGKILL escalation
+        // so cleanly terminating daemons are reported as exited, while fast
+        // exits still return immediately on the first 50 ms tick.
+        const CLEAN_WAIT_TICKS: usize = 60;
+        const CLEAN_WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
         if !report.signalled.is_empty() {
-            for _ in 0..20 {
+            for _ in 0..CLEAN_WAIT_TICKS {
                 if report
                     .signalled
                     .iter()
@@ -432,7 +510,7 @@ mod unix_imp {
                 {
                     break;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                std::thread::sleep(CLEAN_WAIT_INTERVAL);
             }
             for &pid in &report.signalled {
                 if process_is_live_etrs(pid) {
@@ -641,5 +719,143 @@ mod tests {
         assert!(!self_file.exists());
 
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn test_format_session_table_aligns_ipv6_and_mixed_peers() {
+        let now = 10_000;
+        let ipv6_peer = "2001:db8:85a3:1234:5678:8a2e:370:7334";
+        let records = vec![
+            SessionRecord {
+                pid: 82193,
+                port: 47064,
+                started_at: now - (17 * 60 + 13),
+                state: SessionStatus::Disconnected,
+                peer: Some(ipv6_peer.to_string()),
+                disconnected_at: Some(now - (3 * 60 + 50)),
+                reconnect_timeout: 345_600,
+                connect_timeout: 60,
+                mode: SessionMode::Shell,
+            },
+            SessionRecord {
+                pid: 84497,
+                port: 36376,
+                started_at: now - 95,
+                state: SessionStatus::Connected,
+                peer: Some("192.0.2.10".to_string()),
+                disconnected_at: None,
+                reconnect_timeout: 345_600,
+                connect_timeout: 60,
+                mode: SessionMode::Shell,
+            },
+            SessionRecord {
+                pid: 900,
+                port: 50000,
+                started_at: now - 5,
+                state: SessionStatus::Waiting,
+                peer: None,
+                disconnected_at: Some(now - 5),
+                reconnect_timeout: 0,
+                connect_timeout: 60,
+                mode: SessionMode::Command,
+            },
+        ];
+
+        let table = format_session_table(&records, now);
+        let lines: Vec<&str> = table.lines().collect();
+        assert_eq!(lines.len(), 4);
+        for line in &lines {
+            assert_eq!(
+                *line,
+                line.trim_end(),
+                "unexpected trailing spaces: {line:?}"
+            );
+        }
+
+        let header = lines[0];
+        let offsets: Vec<usize> = LIST_HEADERS
+            .iter()
+            .map(|h| header.find(h).unwrap())
+            .collect();
+
+        let expected_rows = [
+            [
+                "82193",
+                "disconnected",
+                "47064",
+                "shell",
+                "17m 13s",
+                ipv6_peer,
+                "3m 50s",
+                "4d 0h",
+            ],
+            [
+                "84497",
+                "connected",
+                "36376",
+                "shell",
+                "1m 35s",
+                "192.0.2.10",
+                "-",
+                "4d 0h",
+            ],
+            ["900", "waiting", "50000", "command", "5s", "-", "5s", "1m"],
+        ];
+
+        for (line, expected) in lines[1..].iter().zip(expected_rows.iter()) {
+            for (idx, (&offset, cell)) in offsets.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    line[offset..].starts_with(cell),
+                    "column {idx} ({}) misaligned in {line:?}: expected {cell:?} at {offset}",
+                    LIST_HEADERS[idx]
+                );
+                if idx > 0 {
+                    assert_eq!(&line[offset - 2..offset], "  ");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_format_session_table_empty_and_wide_columns() {
+        assert_eq!(format_session_table(&[], 1000), "");
+
+        let now = 20_000_000;
+        let records = vec![SessionRecord {
+            pid: 1_234_567,
+            port: 65535,
+            started_at: now - (120 * 86_400 + 5 * 3600),
+            state: SessionStatus::Connected,
+            peer: Some("2001:db8::1".to_string()),
+            disconnected_at: None,
+            reconnect_timeout: 0,
+            connect_timeout: 0,
+            mode: SessionMode::Command,
+        }];
+
+        let table = format_session_table(&records, now);
+        let lines: Vec<&str> = table.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], lines[0].trim_end());
+        assert_eq!(lines[1], lines[1].trim_end());
+
+        let header = lines[0];
+        let row = lines[1];
+        for (h, val) in LIST_HEADERS.iter().zip([
+            "1234567",
+            "connected",
+            "65535",
+            "command",
+            "120d 5h",
+            "2001:db8::1",
+            "-",
+            "forever",
+        ]) {
+            let offset = header.find(h).unwrap();
+            assert!(
+                row[offset..].starts_with(val),
+                "header {h} at {offset} does not match {val:?} in {row:?}"
+            );
+        }
     }
 }
