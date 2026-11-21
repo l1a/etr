@@ -65,14 +65,14 @@ Installs both binaries, both man pages and bash/zsh/fish completions.
 
 (The AUR packages named `etr`/`etr-bin` are an unrelated traceroute tool.)
 
-### Fedora / RHEL (COPR)
+### Fedora (COPR)
 
 ```bash
 sudo dnf copr enable kentobias/etr
 sudo dnf install etr
 ```
 
-Builds from source for x86_64 and aarch64, and installs both binaries, both man pages and bash/zsh/fish completions.
+Builds are provided for Fedora 44 and 45 on `x86_64` and `aarch64`, installing both binaries, both man pages and bash/zsh/fish completions.
 
 ### macOS and Linux (Homebrew)
 

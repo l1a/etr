@@ -5,6 +5,8 @@ sudo dnf copr enable kentobias/etr
 sudo dnf install etr
 ```
 
+Builds are provided for Fedora 44 and 45 on `x86_64` and `aarch64`.
+
 This installs both binaries: `etr` (the client) and `etrs` (the per-session server).
 
 **Install it on both ends.** `etr` starts `etrs` on the remote host over SSH, so the *server* needs the package too — or at least `etrs` on its `PATH`. If `etrs` lives somewhere unusual there, point at it with `etr --server-path /path/to/etrs`.

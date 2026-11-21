@@ -27,7 +27,7 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.11.0
+## Current state: v0.11.1
 
 `main` carries **0.10.24**; this branch (`feature/session-timeouts-and-cleanup`) bumps to
 **0.11.0**, raises the default disconnected `reconnect_timeout` from 30 minutes (`1800` s) to
