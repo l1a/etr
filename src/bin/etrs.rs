@@ -56,6 +56,18 @@ macro_rules! vlog {
     };
 }
 
+/// Default reconnect window in seconds after an authenticated client disconnects
+/// (96 hours / 4 days).  `0` disables the timeout (stay alive forever).
+const DEFAULT_RECONNECT_TIMEOUT_SECS: u64 = 345_600;
+
+/// Default initial connect timeout in seconds while waiting for the client's
+/// first authenticated QUIC connection after SSH bootstrap.  `0` disables it.
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 60;
+
+/// Default minimum seconds a session must be disconnected before `SIGUSR1`
+/// terminates it.
+const DEFAULT_SIGNAL_TIMEOUT_SECS: u64 = 0;
+
 #[derive(Parser)]
 #[command(
     name = "etrs",
@@ -91,10 +103,36 @@ struct Cli {
     log_path: Option<std::path::PathBuf>,
 
     /// How long (seconds) to keep a session alive while the client is
-    /// disconnected. Override via ETR_SERVER_NETWORK_TMOUT or config file
-    /// [server] reconnect_timeout. Default: 1800 (30 min).
+    /// disconnected (0 = stay alive forever). Override via client flag/config,
+    /// ETR_SERVER_NETWORK_TMOUT, or [server] reconnect_timeout.
+    /// Default: 345600 (96h / 4 days).
     #[arg(long, value_name = "SECS")]
     reconnect_timeout: Option<u64>,
+
+    /// How long (seconds) to wait for the client's first authenticated QUIC
+    /// connection after SSH bootstrap (0 = stay alive forever). Override via
+    /// client flag/config, ETR_SERVER_CONNECT_TMOUT, or [server] connect_timeout.
+    /// Default: 60.
+    #[arg(long, value_name = "SECS")]
+    connect_timeout: Option<u64>,
+
+    /// Minimum seconds a session must be disconnected before SIGUSR1 terminates
+    /// it (connected sessions always ignore SIGUSR1). Override via
+    /// ETR_SERVER_SIGNAL_TMOUT or [server] signal_timeout. Default: 0.
+    #[arg(long, value_name = "SECS")]
+    signal_timeout: Option<u64>,
+
+    /// List running etrs sessions and their state, then exit
+    #[arg(long, conflicts_with = "clean")]
+    list: bool,
+
+    /// Terminate disconnected/waiting etrs sessions via SIGUSR1, then exit
+    #[arg(long, conflicts_with = "list")]
+    clean: bool,
+
+    /// With --clean, only terminate sessions disconnected/waiting for at least SECS
+    #[arg(long, value_name = "SECS", requires = "clean")]
+    older_than: Option<u64>,
 
     /// Generate shell completions for the specified shell
     #[arg(long, value_enum, value_name = "SHELL")]
@@ -126,6 +164,10 @@ enum BootstrapLine {
     X11,
     /// `ETRPREFER:<4|6>` — the client's `-4`/`-6` address-family preference.
     Prefer(AddrPref),
+    /// `ETRRECONNECTTIMEOUT:<secs>` — client's requested reconnect timeout (`0` = forever).
+    ReconnectTimeout(Option<u64>),
+    /// `ETRCONNECTTIMEOUT:<secs>` — client's requested initial connect timeout (`0` = forever).
+    ConnectTimeout(Option<u64>),
 }
 
 /// Classify one bootstrap line.  Shared by [`run_server`] and its tests so the
@@ -137,6 +179,10 @@ fn parse_bootstrap_line(line: &str) -> BootstrapLine {
         BootstrapLine::X11
     } else if let Some(v) = line.strip_prefix("ETRPREFER:") {
         BootstrapLine::Prefer(AddrPref::from_wire(v))
+    } else if let Some(v) = line.strip_prefix("ETRRECONNECTTIMEOUT:") {
+        BootstrapLine::ReconnectTimeout(v.trim().parse().ok())
+    } else if let Some(v) = line.strip_prefix("ETRCONNECTTIMEOUT:") {
+        BootstrapLine::ConnectTimeout(v.trim().parse().ok())
     } else {
         BootstrapLine::Env(line.to_string())
     }
@@ -157,19 +203,56 @@ fn effective_bind_ip(explicit: Option<&str>, pref: AddrPref) -> String {
     }
 }
 
-/// Resolve the session reconnect timeout (seconds) using the documented precedence:
-/// CLI flag > `ETR_SERVER_NETWORK_TMOUT` env var > `config.toml` `[server] reconnect_timeout` > 1800s.
-fn resolve_reconnect_timeout(
+/// Resolve a timeout in seconds using the documented precedence:
+/// server CLI flag > client bootstrap override > env var > `config.toml` > built-in default.
+fn resolve_timeout_secs(
+    cli_val: Option<u64>,
+    client_val: Option<u64>,
+    env_val: Option<&str>,
+    cfg_val: Option<u64>,
+    default_secs: u64,
+) -> u64 {
+    cli_val
+        .or(client_val)
+        .or_else(|| env_val.and_then(|v| v.trim().parse().ok()))
+        .or(cfg_val)
+        .unwrap_or(default_secs)
+}
+
+/// Convert a timeout in seconds into an optional `Duration`, treating `0` as
+/// infinite (`None`).
+fn timeout_from_secs(secs: u64) -> Option<Duration> {
+    if secs == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(secs))
+    }
+}
+
+/// Resolve the `SIGUSR1` disconnected grace period (seconds) using:
+/// CLI flag > `ETR_SERVER_SIGNAL_TMOUT` env var > `[server] signal_timeout` > 0 s.
+fn resolve_signal_timeout(
     cli_val: Option<u64>,
     env_val: Option<&str>,
     cfg_val: Option<u64>,
 ) -> Duration {
     Duration::from_secs(
         cli_val
-            .or_else(|| env_val.and_then(|v| v.parse().ok()))
+            .or_else(|| env_val.and_then(|v| v.trim().parse().ok()))
             .or(cfg_val)
-            .unwrap_or(1800),
+            .unwrap_or(DEFAULT_SIGNAL_TIMEOUT_SECS),
     )
+}
+
+/// Raw timeout inputs collected before reading the client bootstrap stream.
+struct TimeoutInputs {
+    cli_reconnect: Option<u64>,
+    env_reconnect: Option<String>,
+    cfg_reconnect: Option<u64>,
+    cli_connect: Option<u64>,
+    env_connect: Option<String>,
+    cfg_connect: Option<u64>,
+    signal_timeout: Duration,
 }
 
 /// Check whether a `KEY=VALUE` environment variable supplied during SSH bootstrap is safe to
@@ -207,15 +290,6 @@ fn is_safe_client_env_var(kv: &str) -> bool {
 fn main() -> io::Result<()> {
     let cli = Cli::parse();
     let _ = VERBOSITY.set(cli.verbose);
-    let cfg = Config::load();
-
-    // Priority: CLI flag > ETR_SERVER_NETWORK_TMOUT env var > config file > default.
-    let env_tmout = std::env::var("ETR_SERVER_NETWORK_TMOUT").ok();
-    let reconnect_timeout = resolve_reconnect_timeout(
-        cli.reconnect_timeout,
-        env_tmout.as_deref(),
-        cfg.server.reconnect_timeout,
-    );
 
     if let Some(shell) = cli.completions {
         let mut cmd = Cli::command();
@@ -242,17 +316,154 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
+    if cli.list {
+        return cmd_list_sessions();
+    }
+    if cli.clean {
+        return cmd_clean_sessions(cli.older_than.unwrap_or(0));
+    }
+
+    let cfg = Config::load();
+
+    let timeouts = TimeoutInputs {
+        cli_reconnect: cli.reconnect_timeout,
+        env_reconnect: std::env::var("ETR_SERVER_NETWORK_TMOUT").ok(),
+        cfg_reconnect: cfg.server.reconnect_timeout,
+        cli_connect: cli.connect_timeout,
+        env_connect: std::env::var("ETR_SERVER_CONNECT_TMOUT").ok(),
+        cfg_connect: cfg.server.connect_timeout,
+        signal_timeout: resolve_signal_timeout(
+            cli.signal_timeout,
+            std::env::var("ETR_SERVER_SIGNAL_TMOUT").ok().as_deref(),
+            cfg.server.signal_timeout,
+        ),
+    };
+
     // This server's own preference: CLI flags win over [server] address_family.
     // A connecting client's `ETRPREFER:` line overrides it for forward targets
     // only — the bind address is this host's business.
     let own_pref = AddrPref::from_flags(cli.prefer_ipv4, cli.prefer_ipv6)
         .or(AddrPref::from_config(cfg.server.address_family.as_deref()));
 
-    run_server(cli, reconnect_timeout, own_pref)
+    run_server(cli, timeouts, own_pref)
+}
+
+#[cfg(unix)]
+fn cmd_list_sessions() -> io::Result<()> {
+    use etr::sessions::{
+        SessionStatus, format_duration, format_timeout, list_sessions_in, now_unix_secs,
+        sessions_dir,
+    };
+
+    let res = list_sessions_in(&sessions_dir())?;
+    if res.sessions.is_empty() {
+        if res.pruned_stale > 0 {
+            println!(
+                "No active etrs sessions (pruned {} stale record(s)).",
+                res.pruned_stale
+            );
+        } else {
+            println!("No active etrs sessions.");
+        }
+        return Ok(());
+    }
+
+    let now = now_unix_secs();
+    println!(
+        "{:<8} {:<13} {:<6} {:<8} {:<10} {:<16} {:<10} TIMEOUT",
+        "PID", "STATE", "PORT", "MODE", "UPTIME", "PEER", "IDLE"
+    );
+    for s in &res.sessions {
+        let uptime = format_duration(now.saturating_sub(s.started_at));
+        let idle = match s.state {
+            SessionStatus::Connected => "-".to_string(),
+            SessionStatus::Waiting | SessionStatus::Disconnected => {
+                format_duration(now.saturating_sub(s.disconnected_at.unwrap_or(s.started_at)))
+            }
+        };
+        let timeout = match s.state {
+            SessionStatus::Waiting => format_timeout(s.connect_timeout),
+            SessionStatus::Connected | SessionStatus::Disconnected => {
+                format_timeout(s.reconnect_timeout)
+            }
+        };
+        println!(
+            "{:<8} {:<13} {:<6} {:<8} {:<10} {:<16} {:<10} {}",
+            s.pid,
+            s.state.as_str(),
+            s.port,
+            s.mode.as_str(),
+            uptime,
+            s.peer.as_deref().unwrap_or("-"),
+            idle,
+            timeout,
+        );
+    }
+    if res.pruned_stale > 0 {
+        println!("(pruned {} stale record(s))", res.pruned_stale);
+    }
+    Ok(())
 }
 
 #[cfg(not(unix))]
-fn run_server(_cli: Cli, _reconnect_timeout: Duration, _own_pref: AddrPref) -> io::Result<()> {
+fn cmd_list_sessions() -> io::Result<()> {
+    eprintln!(
+        "etrs (the etr server) only runs on Unix (Linux/macOS): session management is \
+         not supported on Windows."
+    );
+    std::process::exit(1);
+}
+
+#[cfg(unix)]
+fn cmd_clean_sessions(older_than_secs: u64) -> io::Result<()> {
+    use etr::sessions::{clean_sessions_in, sessions_dir};
+
+    let report = clean_sessions_in(&sessions_dir(), older_than_secs)?;
+    if report.signalled.is_empty() {
+        println!(
+            "No disconnected etrs sessions eligible for cleanup \
+             (connected: {}, recent: {}, pruned stale: {}).",
+            report.skipped_connected, report.skipped_recent, report.pruned_stale
+        );
+        return Ok(());
+    }
+
+    if !report.exited.is_empty() {
+        let pids: Vec<String> = report.exited.iter().map(u32::to_string).collect();
+        println!(
+            "Terminated {} disconnected session(s): {}",
+            report.exited.len(),
+            pids.join(", ")
+        );
+    }
+    if !report.still_running.is_empty() {
+        let pids: Vec<String> = report.still_running.iter().map(u32::to_string).collect();
+        println!(
+            "Signalled {} session(s) still running (signal_timeout or reconnected): {}",
+            report.still_running.len(),
+            pids.join(", ")
+        );
+    }
+    if report.skipped_connected > 0 || report.skipped_recent > 0 || report.pruned_stale > 0 {
+        println!(
+            "Skipped connected: {}, skipped recent: {}, pruned stale: {}.",
+            report.skipped_connected, report.skipped_recent, report.pruned_stale
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn cmd_clean_sessions(_older_than_secs: u64) -> io::Result<()> {
+    eprintln!(
+        "etrs (the etr server) only runs on Unix (Linux/macOS): session management is \
+         not supported on Windows."
+    );
+    std::process::exit(1);
+}
+
+#[cfg(not(unix))]
+fn run_server(_cli: Cli, _timeouts: TimeoutInputs, _own_pref: AddrPref) -> io::Result<()> {
     eprintln!(
         "etrs (the etr server) only runs on Unix (Linux/macOS): it relies on \
          fork/setsid and Unix domain sockets for X11 forwarding. Run etrs on the \
@@ -262,7 +473,7 @@ fn run_server(_cli: Cli, _reconnect_timeout: Duration, _own_pref: AddrPref) -> i
 }
 
 #[cfg(unix)]
-fn run_server(cli: Cli, reconnect_timeout: Duration, own_pref: AddrPref) -> io::Result<()> {
+fn run_server(cli: Cli, timeouts: TimeoutInputs, own_pref: AddrPref) -> io::Result<()> {
     // Read session bootstrap line from SSH stdin: SESSION_ID_HEX/PASSKEY/TERM
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
@@ -287,6 +498,8 @@ fn run_server(cli: Cli, reconnect_timeout: Duration, own_pref: AddrPref) -> io::
     let mut remote_command: Option<String> = None;
     let mut x11_enabled = false;
     let mut client_pref = AddrPref::Auto;
+    let mut client_reconnect_timeout: Option<u64> = None;
+    let mut client_connect_timeout: Option<u64> = None;
     {
         use std::io::BufRead;
         let stdin = io::stdin();
@@ -297,12 +510,38 @@ fn run_server(cli: Cli, reconnect_timeout: Duration, own_pref: AddrPref) -> io::
                     BootstrapLine::Command(cmd) => remote_command = Some(cmd),
                     BootstrapLine::X11 => x11_enabled = true,
                     BootstrapLine::Prefer(p) => client_pref = p,
+                    BootstrapLine::ReconnectTimeout(v) => {
+                        if let Some(secs) = v {
+                            client_reconnect_timeout = Some(secs);
+                        }
+                    }
+                    BootstrapLine::ConnectTimeout(v) => {
+                        if let Some(secs) = v {
+                            client_connect_timeout = Some(secs);
+                        }
+                    }
                     BootstrapLine::Env(kv) => extra_env.push(kv),
                 },
                 Err(_) => break,
             }
         }
     }
+
+    let reconnect_timeout_secs = resolve_timeout_secs(
+        timeouts.cli_reconnect,
+        client_reconnect_timeout,
+        timeouts.env_reconnect.as_deref(),
+        timeouts.cfg_reconnect,
+        DEFAULT_RECONNECT_TIMEOUT_SECS,
+    );
+    let connect_timeout_secs = resolve_timeout_secs(
+        timeouts.cli_connect,
+        client_connect_timeout,
+        timeouts.env_connect.as_deref(),
+        timeouts.cfg_connect,
+        DEFAULT_CONNECT_TIMEOUT_SECS,
+    );
+    let signal_timeout = timeouts.signal_timeout;
 
     // The client's -4/-6 governs how this server resolves the targets of that
     // session's -L forwards; without one, this server's own flag applies.  Set
@@ -376,7 +615,9 @@ fn run_server(cli: Cli, reconnect_timeout: Duration, own_pref: AddrPref) -> io::
                 session_id,
                 passkey,
                 term,
-                reconnect_timeout,
+                reconnect_timeout_secs,
+                connect_timeout_secs,
+                signal_timeout,
                 extra_env,
                 remote_command,
                 x11_enabled,
@@ -409,15 +650,43 @@ fn detach_stdio(log_path: &std::path::Path) -> io::Result<()> {
 }
 
 fn session_log_path() -> std::path::PathBuf {
-    dirs::state_dir()
-        .or_else(|| dirs::home_dir().map(|h| h.join(".local/state")))
-        .map(|d| d.join("etr"))
-        .unwrap_or_else(etr::config::fallback_tmp_state_dir)
-        .join("etrs.log")
+    etr::config::state_dir().join("etrs.log")
+}
+
+/// Drain any queued signal notifications without blocking so a `SIGUSR1`
+/// delivered while connected cannot linger and kill the session after disconnect.
+#[cfg(unix)]
+async fn drain_signal(sig: &mut tokio::signal::unix::Signal) {
+    use std::task::Poll;
+    while std::future::poll_fn(|cx| match sig.poll_recv(cx) {
+        Poll::Ready(Some(())) => Poll::Ready(true),
+        Poll::Ready(None) | Poll::Pending => Poll::Ready(false),
+    })
+    .await
+    {}
+}
+
+/// Wait for an incoming QUIC connection, optionally bounded by `timeout`.
+#[cfg(unix)]
+async fn accept_with_optional_timeout(
+    endpoint: &quinn::Endpoint,
+    timeout: Option<Duration>,
+) -> Result<Option<quinn::Incoming>, tokio::time::error::Elapsed> {
+    match timeout {
+        Some(dur) => tokio::time::timeout(dur, endpoint.accept()).await,
+        None => Ok(endpoint.accept().await),
+    }
+}
+
+/// Outcome of a single accepted QUIC connection handled by [`handle_connection`].
+#[cfg(unix)]
+struct ConnectionOutcome {
+    authenticated: bool,
+    clean_disconnect: bool,
 }
 
 /// Run the session reconnect loop until the client cleanly disconnects or
-/// the reconnect window expires.
+/// the initial-connect / reconnect window expires.
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 async fn run_session(
@@ -425,16 +694,19 @@ async fn run_session(
     session_id: [u8; 16],
     passkey: String,
     term: String,
-    reconnect_timeout: Duration,
+    reconnect_timeout_secs: u64,
+    connect_timeout_secs: u64,
+    signal_timeout: Duration,
     extra_env: Vec<String>,
     remote_command: Option<String>,
     x11_enabled: bool,
 ) -> io::Result<()> {
+    let port = endpoint.local_addr()?.port();
     vlog!(
         1,
         "[etrs] session {} port={}",
         hex_encode(&session_id),
-        endpoint.local_addr()?.port()
+        port
     );
 
     let active_conn = Arc::new(Mutex::new(None));
@@ -702,13 +974,21 @@ async fn run_session(
     let active_reverse_listeners = Arc::new(Mutex::new(std::collections::HashSet::new()));
 
     // ── Reconnect loop ───────────────────────────────────────────────────────
-    let reconnect_window = reconnect_timeout;
+    let reconnect_timeout = timeout_from_secs(reconnect_timeout_secs);
+    let connect_timeout = timeout_from_secs(connect_timeout_secs);
+    let mut has_ever_connected = false;
+    let mut wait_started_at = tokio::time::Instant::now();
 
     use tokio::signal::unix::SignalKind;
 
     let mut sigterm =
         tokio::signal::unix::signal(SignalKind::terminate()).map_err(io::Error::other)?;
     let mut sighup = tokio::signal::unix::signal(SignalKind::hangup()).map_err(io::Error::other)?;
+    // Single SIGUSR1 listener — intentionally NOT polled during active
+    // connections (any signal delivered while connected is drained once the
+    // connection ends).
+    let mut sigusr1 =
+        tokio::signal::unix::signal(SignalKind::user_defined1()).map_err(io::Error::other)?;
     // A second pair of listeners that cover the window while handle_connection
     // is running.  Tokio notifies every registered listener for a signal, so
     // a single SIGTERM wakes both; whichever select is currently being polled
@@ -718,7 +998,59 @@ async fn run_session(
     let mut sighup_conn =
         tokio::signal::unix::signal(SignalKind::hangup()).map_err(io::Error::other)?;
 
+    // Publish `<pid>.toml` ONLY after all signal handlers (especially SIGUSR1)
+    // are installed so `etrs --clean` / `pkill -USR1` never hits a startup
+    // default-disposition window.
+    let mode = if remote_command.is_some() {
+        etr::sessions::SessionMode::Command
+    } else {
+        etr::sessions::SessionMode::Shell
+    };
+    let now = etr::sessions::now_unix_secs();
+    let registry = Arc::new(Mutex::new(
+        match etr::sessions::SessionRegistryGuard::register(
+            etr::sessions::sessions_dir(),
+            etr::sessions::SessionRecord {
+                pid: std::process::id(),
+                port,
+                started_at: now,
+                state: etr::sessions::SessionStatus::Waiting,
+                peer: None,
+                disconnected_at: Some(now),
+                reconnect_timeout: reconnect_timeout_secs,
+                connect_timeout: connect_timeout_secs,
+                mode,
+            },
+        ) {
+            Ok(g) => Some(g),
+            Err(e) => {
+                vlog!(1, "[etrs] warning: could not register session file: {e}");
+                None
+            }
+        },
+    ));
+
     loop {
+        let active_limit = if has_ever_connected {
+            reconnect_timeout
+        } else {
+            connect_timeout
+        };
+        let remaining = active_limit.map(|limit| limit.saturating_sub(wait_started_at.elapsed()));
+        if remaining == Some(Duration::ZERO) {
+            if has_ever_connected {
+                vlog!(1, "[etrs] reconnect window expired, shutting down");
+            } else {
+                vlog!(1, "[etrs] initial connect timeout expired, shutting down");
+            }
+            if has_ever_connected && let Some(fd) = master_fd {
+                tokio::task::spawn_blocking(move || login::record_logout(fd))
+                    .await
+                    .ok();
+            }
+            break;
+        }
+
         let mut shell_rx = shell_exit_rx.clone();
         let incoming = tokio::select! {
             biased;
@@ -739,19 +1071,38 @@ async fn run_session(
             }
             _ = sigterm.recv() => {
                 vlog!(1, "[etrs] SIGTERM received, shutting down");
-                if let Some(fd) = master_fd {
+                if has_ever_connected && let Some(fd) = master_fd {
                     tokio::task::spawn_blocking(move || login::record_logout(fd)).await.ok();
                 }
                 break;
             }
             _ = sighup.recv() => {
                 vlog!(1, "[etrs] SIGHUP received, shutting down");
-                if let Some(fd) = master_fd {
+                if has_ever_connected && let Some(fd) = master_fd {
                     tokio::task::spawn_blocking(move || login::record_logout(fd)).await.ok();
                 }
                 break;
             }
-            res = tokio::time::timeout(reconnect_window, endpoint.accept()) => {
+            _ = sigusr1.recv() => {
+                let elapsed = wait_started_at.elapsed();
+                if elapsed >= signal_timeout {
+                    vlog!(1, "[etrs] SIGUSR1 received while disconnected, shutting down");
+                    if has_ever_connected && let Some(fd) = master_fd {
+                        tokio::task::spawn_blocking(move || login::record_logout(fd))
+                            .await
+                            .ok();
+                    }
+                    break;
+                }
+                vlog!(
+                    1,
+                    "[etrs] SIGUSR1 ignored (disconnected {}s < signal_timeout {}s)",
+                    elapsed.as_secs(),
+                    signal_timeout.as_secs()
+                );
+                continue;
+            }
+            res = accept_with_optional_timeout(&endpoint, remaining) => {
                 match res {
                     Ok(Some(inc)) => inc,
                     // These two arms used to `break` without recording a logout, unlike
@@ -763,7 +1114,7 @@ async fn run_session(
                     // `ktobias pts/3 ::1 via etr … gone - no logout` in utmp.
                     Ok(None) => {
                         vlog!(1, "[etrs] endpoint closed");
-                        if let Some(fd) = master_fd {
+                        if has_ever_connected && let Some(fd) = master_fd {
                             tokio::task::spawn_blocking(move || login::record_logout(fd))
                                 .await
                                 .ok();
@@ -771,8 +1122,12 @@ async fn run_session(
                         break;
                     }
                     Err(_) => {
-                        vlog!(1, "[etrs] reconnect window expired, shutting down");
-                        if let Some(fd) = master_fd {
+                        if has_ever_connected {
+                            vlog!(1, "[etrs] reconnect window expired, shutting down");
+                        } else {
+                            vlog!(1, "[etrs] initial connect timeout expired, shutting down");
+                        }
+                        if has_ever_connected && let Some(fd) = master_fd {
                             tokio::task::spawn_blocking(move || login::record_logout(fd))
                                 .await
                                 .ok();
@@ -806,7 +1161,7 @@ async fn run_session(
         // Run handle_connection, but also watch for signals so that
         // `pkill etrs` during an active session is handled promptly.
         let conn_for_sig = conn.clone();
-        let (clean, signal_shutdown) = tokio::select! {
+        let (outcome, signal_shutdown) = tokio::select! {
             r = handle_connection(
                 conn,
                 session_id,
@@ -821,19 +1176,32 @@ async fn run_session(
                 Arc::clone(&active_reverse_listeners),
                 shell_exit_rx.clone(),
                 Arc::clone(&x11_real_cookie),
+                Arc::clone(&registry),
             ) => (r, false),
             _ = sigterm_conn.recv() => {
                 vlog!(1, "[etrs] SIGTERM during active session, closing connection");
                 conn_for_sig.close(quinn::VarInt::from_u32(0), b"server shutdown");
                 // Allow Quinn to flush the CONNECTION_CLOSE frame.
                 tokio::time::sleep(Duration::from_millis(200)).await;
-                (false, true)
+                (
+                    ConnectionOutcome {
+                        authenticated: false,
+                        clean_disconnect: false,
+                    },
+                    true,
+                )
             }
             _ = sighup_conn.recv() => {
                 vlog!(1, "[etrs] SIGHUP during active session, closing connection");
                 conn_for_sig.close(quinn::VarInt::from_u32(0), b"server shutdown");
                 tokio::time::sleep(Duration::from_millis(200)).await;
-                (false, true)
+                (
+                    ConnectionOutcome {
+                        authenticated: false,
+                        clean_disconnect: false,
+                    },
+                    true,
+                )
             }
         };
 
@@ -841,7 +1209,19 @@ async fn run_session(
         *outbound_ctrl_tx.lock().unwrap() = None;
         *active_conn.lock().await = None;
 
-        if clean {
+        if outcome.authenticated {
+            has_ever_connected = true;
+            wait_started_at = tokio::time::Instant::now();
+            drain_signal(&mut sigusr1).await;
+            if !outcome.clean_disconnect
+                && !signal_shutdown
+                && let Some(ref mut g) = *registry.lock().await
+            {
+                g.set_disconnected();
+            }
+        }
+
+        if outcome.clean_disconnect {
             vlog!(1, "[etrs] client disconnected cleanly, shutting down");
             break;
         }
@@ -855,6 +1235,8 @@ async fn run_session(
             break;
         }
     }
+
+    drop(registry);
 
     // Every path out of the loop above lands here. If the shell is still running,
     // hang it up before returning -- otherwise this process cannot exit at all.
@@ -933,7 +1315,8 @@ async fn hangup_child(child_pid: Option<u32>) {
 type PtyTx = Arc<std::sync::Mutex<Option<mpsc::Sender<(u64, Vec<u8>)>>>>;
 type CtrlTx = Arc<std::sync::Mutex<Option<mpsc::Sender<Envelope>>>>;
 
-/// Handle one QUIC connection.  Returns `true` on clean Disconnect.
+/// Handle one QUIC connection.  Reports whether authentication succeeded and
+/// whether the client ended with a clean `Disconnect`.
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 async fn handle_connection(
@@ -950,7 +1333,8 @@ async fn handle_connection(
     active_reverse_listeners: Arc<Mutex<std::collections::HashSet<String>>>,
     shell_exit_rx: tokio::sync::watch::Receiver<bool>,
     x11_real_cookie: Arc<Mutex<Option<Vec<u8>>>>,
-) -> bool {
+    registry: Arc<Mutex<Option<etr::sessions::SessionRegistryGuard>>>,
+) -> ConnectionOutcome {
     let peer = conn.remote_address();
     vlog!(
         1,
@@ -988,12 +1372,18 @@ async fn handle_connection(
         Ok(Err(msg)) => {
             vlog!(1, "[etrs] {msg}");
             conn.close(quinn::VarInt::from_u32(1), b"invalid control handshake");
-            return false;
+            return ConnectionOutcome {
+                authenticated: false,
+                clean_disconnect: false,
+            };
         }
         Err(_) => {
             vlog!(1, "[etrs] SessionOpen timed out from {peer}");
             conn.close(quinn::VarInt::from_u32(1), b"handshake timeout");
-            return false;
+            return ConnectionOutcome {
+                authenticated: false,
+                clean_disconnect: false,
+            };
         }
     };
 
@@ -1002,12 +1392,22 @@ async fn handle_connection(
     if !quic::constant_time_eq(&session_open.session_id, &session_id) {
         vlog!(1, "[etrs] session_id mismatch from {peer}");
         conn.close(quinn::VarInt::from_u32(1), b"authentication failed");
-        return false;
+        return ConnectionOutcome {
+            authenticated: false,
+            clean_disconnect: false,
+        };
     }
     if !quic::constant_time_eq(session_open.passkey.as_bytes(), passkey.as_bytes()) {
         vlog!(1, "[etrs] passkey mismatch from {peer}");
         conn.close(quinn::VarInt::from_u32(1), b"authentication failed");
-        return false;
+        return ConnectionOutcome {
+            authenticated: false,
+            clean_disconnect: false,
+        };
+    }
+
+    if let Some(ref mut g) = *registry.lock().await {
+        g.set_connected(peer.ip().to_canonical().to_string());
     }
 
     if let Some(fd) = master_fd {
@@ -1047,7 +1447,10 @@ async fn handle_connection(
         .await
         .is_err()
     {
-        return false;
+        return ConnectionOutcome {
+            authenticated: true,
+            clean_disconnect: false,
+        };
     }
 
     // Update active connection
@@ -1165,7 +1568,10 @@ async fn handle_connection(
         Ok(s) => s,
         Err(_) => {
             dispatch_task.abort();
-            return false;
+            return ConnectionOutcome {
+                authenticated: true,
+                clean_disconnect: false,
+            };
         }
     };
 
@@ -1294,7 +1700,10 @@ async fn handle_connection(
         clean,
         conn.close_reason()
     );
-    clean
+    ConnectionOutcome {
+        authenticated: true,
+        clean_disconnect: clean,
+    }
 }
 
 // ── Forward helpers (server side) ────────────────────────────────────────────
@@ -2218,6 +2627,38 @@ mod tests {
             parse_bootstrap_line("ETRFUTURE:x"),
             BootstrapLine::Env("ETRFUTURE:x".to_string())
         );
+        assert_eq!(
+            parse_bootstrap_line("ETRRECONNECTTIMEOUT:0"),
+            BootstrapLine::ReconnectTimeout(Some(0))
+        );
+        assert_eq!(
+            parse_bootstrap_line("ETRRECONNECTTIMEOUT:7200"),
+            BootstrapLine::ReconnectTimeout(Some(7200))
+        );
+        assert_eq!(
+            parse_bootstrap_line("ETRRECONNECTTIMEOUT:invalid"),
+            BootstrapLine::ReconnectTimeout(None)
+        );
+        assert_eq!(
+            parse_bootstrap_line("ETRCONNECTTIMEOUT:120"),
+            BootstrapLine::ConnectTimeout(Some(120))
+        );
+        assert_eq!(
+            parse_bootstrap_line("ETRCONNECTTIMEOUT:0"),
+            BootstrapLine::ConnectTimeout(Some(0))
+        );
+    }
+
+    #[test]
+    fn test_bootstrap_timeout_lines_do_not_leak_into_env() {
+        let (extra_env, _, _, _) = drive_bootstrap(&[
+            "KEY=VALUE",
+            "ETRRECONNECTTIMEOUT:7200",
+            "ETRCONNECTTIMEOUT:120",
+            "ETRRECONNECTTIMEOUT:invalid",
+            "OTHER=foo",
+        ]);
+        assert_eq!(extra_env, vec!["KEY=VALUE", "OTHER=foo"]);
     }
 
     /// A client's `ETRPREFER:` wins over the server's own flag; a client that
@@ -2303,24 +2744,98 @@ mod tests {
     #[test]
     fn test_reconnect_timeout_env_var() {
         assert_eq!(
-            resolve_reconnect_timeout(None, Some("7200"), Some(3600)),
-            Duration::from_secs(7200),
+            resolve_timeout_secs(
+                None,
+                None,
+                Some("7200"),
+                Some(3600),
+                DEFAULT_RECONNECT_TIMEOUT_SECS
+            ),
+            7200,
             "env var must beat config value"
         );
         assert_eq!(
-            resolve_reconnect_timeout(Some(900), Some("7200"), Some(3600)),
-            Duration::from_secs(900),
-            "CLI flag must beat env var"
+            resolve_timeout_secs(
+                None,
+                Some(5400),
+                Some("7200"),
+                Some(3600),
+                DEFAULT_RECONNECT_TIMEOUT_SECS
+            ),
+            5400,
+            "client bootstrap override must beat env var"
         );
         assert_eq!(
-            resolve_reconnect_timeout(None, Some("not-a-number"), Some(3600)),
-            Duration::from_secs(3600),
+            resolve_timeout_secs(
+                Some(900),
+                Some(5400),
+                Some("7200"),
+                Some(3600),
+                DEFAULT_RECONNECT_TIMEOUT_SECS
+            ),
+            900,
+            "server CLI flag must beat client override and env var"
+        );
+        assert_eq!(
+            resolve_timeout_secs(
+                None,
+                None,
+                Some("not-a-number"),
+                Some(3600),
+                DEFAULT_RECONNECT_TIMEOUT_SECS
+            ),
+            3600,
             "invalid env var falls back to config"
         );
         assert_eq!(
-            resolve_reconnect_timeout(None, None, None),
-            Duration::from_secs(1800),
-            "default is 1800s"
+            resolve_timeout_secs(None, None, None, None, DEFAULT_RECONNECT_TIMEOUT_SECS),
+            345_600,
+            "default is 345600s (96h / 4 days)"
+        );
+        assert_eq!(timeout_from_secs(0), None, "0 means infinite (forever)");
+        assert_eq!(
+            timeout_from_secs(345_600),
+            Some(Duration::from_secs(345_600))
+        );
+    }
+
+    #[test]
+    fn test_connect_and_signal_timeout_resolution() {
+        assert_eq!(
+            resolve_timeout_secs(None, None, None, None, DEFAULT_CONNECT_TIMEOUT_SECS),
+            60
+        );
+        assert_eq!(
+            resolve_timeout_secs(
+                Some(15),
+                Some(30),
+                Some("45"),
+                Some(90),
+                DEFAULT_CONNECT_TIMEOUT_SECS
+            ),
+            15
+        );
+        assert_eq!(
+            resolve_timeout_secs(
+                None,
+                Some(0),
+                Some("45"),
+                Some(90),
+                DEFAULT_CONNECT_TIMEOUT_SECS
+            ),
+            0
+        );
+        assert_eq!(timeout_from_secs(0), None);
+        assert_eq!(timeout_from_secs(60), Some(Duration::from_secs(60)));
+
+        assert_eq!(resolve_signal_timeout(None, None, None), Duration::ZERO);
+        assert_eq!(
+            resolve_signal_timeout(None, Some("120"), Some(60)),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            resolve_signal_timeout(Some(30), Some("120"), Some(60)),
+            Duration::from_secs(30)
         );
     }
 
@@ -2329,6 +2844,31 @@ mod tests {
         let mut cmd = Cli::command();
         let help = cmd.render_help().to_string();
         assert!(help.contains("--reconnect-timeout"));
+        assert!(help.contains("--connect-timeout"));
+        assert!(help.contains("--signal-timeout"));
+        assert!(help.contains("--list"));
+        assert!(help.contains("--clean"));
+        assert!(help.contains("--older-than"));
+    }
+
+    #[test]
+    fn test_new_cli_flags_and_constraints() {
+        let cli =
+            Cli::try_parse_from(["etrs", "--connect-timeout", "120", "--signal-timeout", "30"])
+                .unwrap();
+        assert_eq!(cli.connect_timeout, Some(120));
+        assert_eq!(cli.signal_timeout, Some(30));
+
+        let list_cli = Cli::try_parse_from(["etrs", "--list"]).unwrap();
+        assert!(list_cli.list);
+        assert!(!list_cli.clean);
+
+        let clean_cli = Cli::try_parse_from(["etrs", "--clean", "--older-than", "60"]).unwrap();
+        assert!(clean_cli.clean);
+        assert_eq!(clean_cli.older_than, Some(60));
+
+        assert!(Cli::try_parse_from(["etrs", "--list", "--clean"]).is_err());
+        assert!(Cli::try_parse_from(["etrs", "--older-than", "60"]).is_err());
     }
 
     /// Drive the shipped [`parse_bootstrap_line`] over a whole line sequence,
@@ -2343,6 +2883,7 @@ mod tests {
                 BootstrapLine::Command(c) => remote_command = Some(c),
                 BootstrapLine::X11 => x11_enabled = true,
                 BootstrapLine::Prefer(p) => client_pref = p,
+                BootstrapLine::ReconnectTimeout(_) | BootstrapLine::ConnectTimeout(_) => {}
                 BootstrapLine::Env(kv) => extra_env.push(kv),
             }
         }

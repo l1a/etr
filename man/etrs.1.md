@@ -28,10 +28,16 @@ parent process exits immediately (allowing the SSH connection to close
 cleanly). The child detaches from stdio, redirects stderr to its log file,
 and enters the session loop.
 
-The session loop keeps the PTY and shell alive across reconnects for up to
-30 minutes. If the client reconnects, it presents the same session ID and
-passkey to resume. When the client cleanly disconnects (or the reconnect
-window expires), the child exits.
+The session loop waits up to **60 seconds** (configurable via
+**\-\-connect\-timeout**) for the client's first authenticated QUIC connection,
+then keeps the PTY and shell alive across reconnects for up to **96 hours**
+(**4 days** / **345600** seconds by default; **0** disables the timeout so the
+session stays alive indefinitely). If the client reconnects, it presents the
+same session ID and passkey to resume. When the client cleanly disconnects, a
+timeout expires, or **SIGUSR1** arrives while disconnected (past
+**\-\-signal\-timeout**), the child exits. Use **\-\-list** and **\-\-clean**
+to inspect or safely terminate disconnected sessions without disturbing active
+connections.
 
 # OPTIONS
 
@@ -75,9 +81,41 @@ window expires), the child exits.
 
 **\-\-reconnect\-timeout** *SECS*
 :   How long (in seconds) to keep a session alive while the client is
-    disconnected. Defaults to **1800** (30 minutes). Override priority:
-    CLI flag > **ETR_SERVER_NETWORK_TMOUT** > **reconnect_timeout** under
+    disconnected. Set to **0** to stay alive indefinitely. Defaults to
+    **345600** (96 hours / 4 days). Override priority: server CLI flag >
+    client bootstrap override (**etr \-\-reconnect\-timeout** / **\[client\]**) >
+    **ETR_SERVER_NETWORK_TMOUT** > **reconnect_timeout** under **\[server\]**
+    in config file > default.
+
+**\-\-connect\-timeout** *SECS*
+:   How long (in seconds) to wait for the client's first authenticated QUIC
+    connection after SSH bootstrap before shutting down. Set to **0** to
+    disable the initial timeout. Defaults to **60**. Override priority:
+    server CLI flag > client bootstrap override (**etr \-\-connect\-timeout** /
+    **\[client\]**) > **ETR_SERVER_CONNECT_TMOUT** > **connect_timeout** under
     **\[server\]** in config file > default.
+
+**\-\-signal\-timeout** *SECS*
+:   Minimum number of seconds a session must have been waiting or disconnected
+    before **SIGUSR1** terminates it (connected sessions always ignore
+    **SIGUSR1**). Defaults to **0** (any disconnected session exits on
+    **SIGUSR1**). Override priority: CLI flag > **ETR_SERVER_SIGNAL_TMOUT** >
+    **signal_timeout** under **\[server\]** in config file > default.
+
+**\-\-list**
+:   List live **etrs** sessions recorded under
+    **\$XDG_STATE_HOME/etr/sessions/** (auto-pruning stale records from exited
+    processes), showing PID, state (**waiting**, **connected**, **disconnected**),
+    QUIC port, mode, uptime, peer IP, idle duration, and active timeout, then
+    exit.
+
+**\-\-clean**
+:   Terminate waiting/disconnected **etrs** sessions safely by sending
+    **SIGUSR1** (connected sessions ignore **SIGUSR1**), then exit.
+
+**\-\-older\-than** *SECS*
+:   When used with **\-\-clean**, only signal sessions that have been waiting
+    or disconnected for at least *SECS* seconds.
 
 **-h**, **\-\-help**
 :   Print help and exit.
@@ -91,17 +129,44 @@ window expires), the child exits.
 :   Server log file (XDG_STATE_HOME honoured). Written after the child
     forks. Follow with **tail -f** to monitor a running session.
 
+**~/.local/state/etr/sessions/**
+:   Per-user directory (mode 0700) holding active session metadata files
+    (`<pid>.toml`, mode 0600) used by **\-\-list** and **\-\-clean**.
+
 # ENVIRONMENT
 
 **SHELL**
 :   Shell to launch for the PTY session. Defaults to **/bin/bash** if unset.
 
 **ETR_SERVER_NETWORK_TMOUT**
-:   How long (in seconds) to keep a session alive while disconnected if
-    **\-\-reconnect\-timeout** is not specified.
+:   How long (in seconds, **0** = forever) to keep a session alive while
+    disconnected if **\-\-reconnect\-timeout** and a client override are not
+    specified.
+
+**ETR_SERVER_CONNECT_TMOUT**
+:   How long (in seconds, **0** = forever) to wait for the client's first
+    authenticated connection if **\-\-connect\-timeout** and a client override
+    are not specified.
+
+**ETR_SERVER_SIGNAL_TMOUT**
+:   Minimum seconds disconnected before **SIGUSR1** terminates the daemon, if
+    **\-\-signal\-timeout** is not specified.
 
 **XDG_STATE_HOME**
-:   Base directory for the log file. Defaults to **~/.local/state**.
+:   Base directory for the log file and session registry. Defaults to
+    **~/.local/state**.
+
+# SIGNALS
+
+**SIGTERM**, **SIGHUP**
+:   Cleanly shut down the **etrs** session immediately (closing any active
+    connection, hanging up the shell process group, and recording a utmp logout).
+
+**SIGUSR1**
+:   Terminate the daemon **only** if it is currently waiting or disconnected
+    (and has been disconnected for at least **signal_timeout** seconds).
+    Connected sessions ignore **SIGUSR1**, making `pkill -USR1 -x etrs` (or
+    `etrs --clean`) safe to run from inside an active session.
 
 # SECURITY
 

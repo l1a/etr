@@ -140,6 +140,8 @@ Options:
   -Y                             Enable trusted X11 forwarding
   -v, -vv, -vvv                  Verbosity: connection events / QUIC details / stream trace
       --env <KEY[=VALUE]>        Set or forward environment variables to the remote shell (repeatable)
+      --reconnect-timeout <SECS> Server reconnect timeout in seconds (0 = forever; default: 345600 / 96h)
+      --connect-timeout <SECS>   Server initial connect timeout in seconds (0 = forever; default: 60)
       --server-path <PATH>       Path to etrs on the remote host [default: etrs]
       --log-path <PATH>          Path to the client log file [default: $XDG_STATE_HOME/etr/etr.log]
       --server-log-path <PATH>   Path to the server log file on the remote host [default: $XDG_STATE_HOME/etr/etrs.log]
@@ -177,10 +179,12 @@ family and says so at `-v` rather than failing. Config equivalent: `address_fami
 
 ## Reconnect behaviour
 
-- Client detects a dropped connection after **15 seconds** of missed heartbeats.
-- Server keeps session state (PTY, stream history) alive for **30 minutes**.
+- Transport uses a **30-second** QUIC idle timeout with application heartbeats every **5 seconds** and QUIC keep-alives every **10 seconds**.
+- Server waits up to **60 seconds** after SSH bootstrap for the client's first authenticated connection (`--connect-timeout`, `0` = forever).
+- Server keeps session state (PTY, stream history) alive for **96 hours (4 days)** by default while disconnected (`--reconnect-timeout`, `0` = stay alive forever).
 - On reconnect the client sends its last-received sequence numbers; the server replays any unacknowledged data.
 - A new source IP/port is fine — the session is keyed by session ID and passkey, not address.
+- Inspect or safely clean up orphaned disconnected sessions on the remote host with `etrs --list`, `etrs --clean` (supports `--older-than <SECS>`), or `pkill -USR1 -x etrs` — connected sessions ignore `SIGUSR1`.
 
 ## Port forwarding
 
@@ -264,6 +268,13 @@ server_log_path = "/tmp/server.log"  # path to the server log file on remote hos
 env = ["COLORTERM", "EDITOR=nvim"]   # variables to set/forward in the remote shell
 x11 = false                          # enable X11 forwarding
 x11_trusted = false                  # enable trusted X11 forwarding
+reconnect_timeout = 345600           # per-session server reconnect timeout in seconds (0 = forever)
+connect_timeout = 60                 # per-session server initial connect timeout in seconds (0 = forever)
+
+[server]
+reconnect_timeout = 345600           # server default reconnect timeout in seconds (0 = forever)
+connect_timeout = 60                 # server initial connect timeout in seconds (0 = forever)
+signal_timeout = 0                   # min disconnected seconds before SIGUSR1 kills the session
 ```
 
 ## Limitations

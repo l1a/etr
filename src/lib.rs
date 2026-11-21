@@ -12,6 +12,7 @@
 //! - [`config`]: Config-file loading (`~/.config/etr/config.toml`).
 //! - [`forward`]: `-L` forwarding spec parser.
 //! - [`addrfam`]: `-4`/`-6` address-family preference and resolution helpers.
+//! - [`sessions`]: Per-user session registry for listing and safe cleanup.
 pub mod addrfam;
 pub mod config;
 pub mod forward;
@@ -19,3 +20,4 @@ pub mod login;
 pub mod protocol;
 pub mod quic;
 pub mod session;
+pub mod sessions;

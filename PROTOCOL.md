@@ -1,6 +1,6 @@
 # etr Wire Protocol
 
-This document is the authoritative reference for the etr wire protocol as of **v0.8.0**.
+This document is the authoritative reference for the etr wire protocol as of **v0.11.0**.
 The QUIC streams and messages are unchanged since v0.3.0; the SSH bootstrap in §2 has
 since gained optional lines, all of which older peers ignore.
 
@@ -31,6 +31,8 @@ SESSION_ID_HEX/PASSKEY/TERM\n
 [KEY=VALUE\n ...]
 [ETRX11:true\n]
 [ETRPREFER:<4|6>\n]
+[ETRRECONNECTTIMEOUT:<secs>\n]
+[ETRCONNECTTIMEOUT:<secs>\n]
 [ETRCMD:<command>\n]
 ```
 
@@ -43,6 +45,8 @@ terminated by `\n`, sent before `stdin` is closed:
 | Env var | `KEY=VALUE` | Optional, repeatable. Sets an environment variable in the remote shell/command. Automatically includes `LANG`, `LC_*`, `COLORTERM`, and `TERM_PROGRAM*` if set on the client. |
 | X11 | `ETRX11:true` | Optional, at most once. Requests X11 forwarding; the server allocates a display and listeners for the session. |
 | Address family | `ETRPREFER:<4\|6>` | Optional, at most once. The client's `-4`/`-6` preference. The server applies it when resolving the targets of `-L` forwards, which it resolves on its own side. A value the server does not recognise is treated as no preference. |
+| Reconnect timeout | `ETRRECONNECTTIMEOUT:<secs>` | Optional, at most once. Client's requested server reconnect timeout in seconds (`0` = stay alive forever). Ignored by older servers (contains no `=`). |
+| Connect timeout | `ETRCONNECTTIMEOUT:<secs>` | Optional, at most once. Client's requested initial connect timeout in seconds before first authenticated `SessionOpen` (`0` = stay alive forever). Ignored by older servers (contains no `=`). |
 | Remote command | `ETRCMD:<command>` | Optional, at most once. If present, the server runs `$SHELL -c <command>` instead of an interactive shell and sends `Disconnect` when the command exits. |
 
 **Forward compatibility rule:** a line the server does not recognise as one of
@@ -259,8 +263,9 @@ Client                                          Server
 
 ## 8. Reconnect
 
-When the client detects missed heartbeats (15-second idle timeout), any pending QUIC
-tasks fail and the client re-enters the connection loop:
+When either peer detects a dead transport (30-second QUIC `max_idle_timeout`, with
+application `Heartbeat` frames every 5 seconds and QUIC keep-alives every 10 seconds),
+any pending QUIC tasks fail and the client re-enters the connection loop:
 
 1. Opens a new QUIC connection to the same server address and port.
 2. Sends a new `SessionOpen` with the same `session_id` and `passkey`, and the
@@ -270,8 +275,12 @@ tasks fail and the client re-enters the connection loop:
 4. Both sides replay unacknowledged chunks (seq > peer's watermark) on the PTY stream.
 5. Port-forward streams are re-opened fresh; they are not replayed.
 
-The server keeps session state alive for **30 minutes** after the last packet. A
-reconnecting client may come from a different source IP/port.
+After SSH bootstrap, `etrs` waits up to **60 seconds** by default (`connect_timeout`;
+`0` = infinite) for the client's first authenticated `SessionOpen`. Once at least one
+authenticated connection has been established, the server keeps session state alive for
+up to **96 hours (4 days / 345,600 seconds)** by default (`reconnect_timeout`; `0` =
+infinite) after a disconnect. A reconnecting client may come from a different source
+IP/port.
 
 ---
 

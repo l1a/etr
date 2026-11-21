@@ -65,12 +65,30 @@ pub const DEFAULT_CONFIG: &str = r#"# etr configuration file
 # Enable trusted X11 forwarding (default: false).
 # x11_trusted = false
 
+# Per-session server reconnect timeout in seconds (default: 345600, i.e. 96h / 4 days;
+# 0 = stay alive forever). Passed to etrs over SSH; overridden by --reconnect-timeout.
+# reconnect_timeout = 345600
+
+# Per-session initial connect timeout in seconds before the first authenticated
+# connection (default: 60; 0 = forever). Passed to etrs over SSH; overridden by --connect-timeout.
+# connect_timeout = 60
+
 [server]
 
 # How long (seconds) the server keeps a session alive while the client is
-# disconnected (default: 1800, i.e. 30 minutes).
-# Overridden by --reconnect-timeout or the ETR_SERVER_NETWORK_TMOUT env var.
-# reconnect_timeout = 1800
+# disconnected (default: 345600, i.e. 96h / 4 days; 0 = stay alive forever).
+# Overridden by --reconnect-timeout, client override, or ETR_SERVER_NETWORK_TMOUT.
+# reconnect_timeout = 345600
+
+# How long (seconds) the server waits for the client's first authenticated QUIC
+# connection after SSH bootstrap (default: 60; 0 = stay alive forever).
+# Overridden by --connect-timeout, client override, or ETR_SERVER_CONNECT_TMOUT.
+# connect_timeout = 60
+
+# Minimum seconds a session must be disconnected before SIGUSR1 terminates it
+# (default: 0, i.e. reap any disconnected session immediately). Connected sessions
+# always ignore SIGUSR1. Overridden by --signal-timeout or ETR_SERVER_SIGNAL_TMOUT.
+# signal_timeout = 0
 
 # Which IP version etrs tries first when it resolves the targets of -L
 # forwards, and which wildcard address it binds by default ("ipv4" binds
@@ -125,13 +143,29 @@ const CLIENT_KEY_BLOCKS: &[(&str, &str)] = &[
         "x11_trusted",
         "# Enable trusted X11 forwarding (default: false).\n# x11_trusted = false",
     ),
+    (
+        "reconnect_timeout",
+        "# Per-session server reconnect timeout in seconds (default: 345600, i.e. 96h / 4 days;\n# 0 = stay alive forever). Passed to etrs over SSH; overridden by --reconnect-timeout.\n# reconnect_timeout = 345600",
+    ),
+    (
+        "connect_timeout",
+        "# Per-session initial connect timeout in seconds before the first authenticated\n# connection (default: 60; 0 = forever). Passed to etrs over SSH; overridden by --connect-timeout.\n# connect_timeout = 60",
+    ),
 ];
 
 /// Per-key comment blocks appended by `merge_defaults` for the `[server]` section.
 const SERVER_KEY_BLOCKS: &[(&str, &str)] = &[
     (
         "reconnect_timeout",
-        "# How long (seconds) the server keeps a session alive while the client is\n# disconnected (default: 1800, i.e. 30 minutes).\n# reconnect_timeout = 1800",
+        "# How long (seconds) the server keeps a session alive while the client is\n# disconnected (default: 345600, i.e. 96h / 4 days; 0 = stay alive forever).\n# reconnect_timeout = 345600",
+    ),
+    (
+        "connect_timeout",
+        "# How long (seconds) the server waits for the client's first authenticated QUIC\n# connection after SSH bootstrap (default: 60; 0 = stay alive forever).\n# connect_timeout = 60",
+    ),
+    (
+        "signal_timeout",
+        "# Minimum seconds a session must be disconnected before SIGUSR1 terminates it\n# (default: 0, i.e. reap any disconnected session immediately). Connected sessions\n# always ignore SIGUSR1.\n# signal_timeout = 0",
     ),
     (
         "address_family",
@@ -189,14 +223,34 @@ pub struct ClientConfig {
 
     /// Enable trusted X11 forwarding.
     pub x11_trusted: Option<bool>,
+
+    /// Per-session server reconnect timeout in seconds (`0` = stay alive forever).
+    /// Passed to `etrs` via SSH bootstrap; overridden by `etr --reconnect-timeout`.
+    pub reconnect_timeout: Option<u64>,
+
+    /// Per-session initial connect timeout in seconds (`0` = stay alive forever).
+    /// Passed to `etrs` via SSH bootstrap; overridden by `etr --connect-timeout`.
+    pub connect_timeout: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
 pub struct ServerConfig {
     /// How long (seconds) the server keeps a session alive while the client is
-    /// disconnected.  CLI `--reconnect-timeout` and the `ETR_SERVER_NETWORK_TMOUT`
-    /// env var override this; the compiled-in default is 1800 s (30 min).
+    /// disconnected (`0` = stay alive forever).  CLI `--reconnect-timeout`, client
+    /// bootstrap override, and `ETR_SERVER_NETWORK_TMOUT` override this; the
+    /// compiled-in default is 345600 s (96 hours / 4 days).
     pub reconnect_timeout: Option<u64>,
+
+    /// How long (seconds) the server waits for the client's first authenticated QUIC
+    /// connection after SSH bootstrap (`0` = stay alive forever).  CLI
+    /// `--connect-timeout`, client bootstrap override, and `ETR_SERVER_CONNECT_TMOUT`
+    /// override this; the compiled-in default is 60 s.
+    pub connect_timeout: Option<u64>,
+
+    /// Minimum seconds a session must be disconnected before `SIGUSR1` terminates it.
+    /// Connected sessions always ignore `SIGUSR1`.  CLI `--signal-timeout` and
+    /// `ETR_SERVER_SIGNAL_TMOUT` override this; the compiled-in default is 0 s.
+    pub signal_timeout: Option<u64>,
 
     /// Which IP version `etrs` tries first for `-L` forward targets, and which
     /// wildcard address it binds when `-b` is not given: `"ipv4"`, `"ipv6"`, or
@@ -252,37 +306,54 @@ pub fn config_path() -> std::path::PathBuf {
         .join("config.toml")
 }
 
+/// Return the default state directory: `$XDG_STATE_HOME/etr`.
+///
+/// Checks `XDG_STATE_HOME` explicitly first so overrides work consistently
+/// across both Linux and macOS (where `dirs::state_dir()` ignores `XDG_STATE_HOME`),
+/// then falls back to `dirs::state_dir()`, `~/.local/state/etr`, and finally
+/// [`fallback_tmp_state_dir`].
+pub fn state_dir() -> std::path::PathBuf {
+    std::env::var_os("XDG_STATE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(dirs::state_dir)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".local/state")))
+        .map(|d| d.join("etr"))
+        .unwrap_or_else(fallback_tmp_state_dir)
+}
+
 /// Insert commented blocks for any config keys not already present in `existing`.
 ///
-/// A key is considered present if any line in `existing` — after stripping a
-/// leading `#` and whitespace — begins with `key =`.  Both active settings and
-/// already-commented-out settings count as present, so re-running `--merge-config`
-/// is always idempotent.
+/// A key is considered present in a section if any line inside that `[section]` —
+/// after stripping a leading `#` and whitespace — begins with `key =`.  Both active
+/// settings and already-commented-out settings count as present, so re-running
+/// `--merge-config` is always idempotent.
 ///
 /// Missing keys are inserted immediately after their section header if that section
 /// already exists, or in a new section appended at the end of the file otherwise.
 /// The result is always valid TOML (no duplicate table headers).
 ///
-/// Returns the updated content and a list of the key names that were added.
+/// Returns the updated content and a deduplicated list of the key names that were added.
 /// If `existing` is empty the result is equivalent to [`DEFAULT_CONFIG`].
 pub fn merge_defaults(existing: &str) -> (String, Vec<&'static str>) {
     let missing_client: Vec<(&str, &str)> = CLIENT_KEY_BLOCKS
         .iter()
-        .filter(|(key, _)| !contains_key_line(existing, key))
+        .filter(|(key, _)| !contains_key_in_section(existing, "[client]", key))
         .map(|(k, b)| (*k, *b))
         .collect();
 
     let missing_server: Vec<(&str, &str)> = SERVER_KEY_BLOCKS
         .iter()
-        .filter(|(key, _)| !contains_key_line(existing, key))
+        .filter(|(key, _)| !contains_key_in_section(existing, "[server]", key))
         .map(|(k, b)| (*k, *b))
         .collect();
 
-    let additions: Vec<&'static str> = missing_client
-        .iter()
-        .chain(missing_server.iter())
-        .map(|(k, _)| *k)
-        .collect();
+    let mut additions: Vec<&'static str> = Vec::new();
+    for (k, _) in missing_client.iter().chain(missing_server.iter()) {
+        if !additions.contains(k) {
+            additions.push(*k);
+        }
+    }
 
     if additions.is_empty() {
         let mut s = existing.trim_end().to_string();
@@ -368,16 +439,29 @@ pub fn merge_defaults(existing: &str) -> (String, Vec<&'static str>) {
     (result, additions)
 }
 
-/// Returns true if `content` contains a line (active or commented) of the form `key = ...`.
-fn contains_key_line(content: &str, key: &str) -> bool {
-    content.lines().any(|line| {
+/// Returns true if `content` contains a line (active or commented) of the form `key = ...`
+/// inside `target_section` (e.g. `"[client]"` or `"[server]"`).
+fn contains_key_in_section(content: &str, target_section: &str, key: &str) -> bool {
+    let mut current_section = "";
+    for line in content.lines() {
         let trimmed = line.trim();
-        let without_comment = trimmed.strip_prefix('#').map(str::trim).unwrap_or(trimmed);
-        without_comment
-            .strip_prefix(key)
-            .map(str::trim)
-            .is_some_and(|rest| rest.starts_with('='))
-    })
+        let code = trimmed.split('#').next().unwrap_or("").trim();
+        if code.starts_with('[') && code.ends_with(']') {
+            current_section = code;
+            continue;
+        }
+        if current_section == target_section {
+            let without_comment = trimmed.strip_prefix('#').map(str::trim).unwrap_or(trimmed);
+            if without_comment
+                .strip_prefix(key)
+                .map(str::trim)
+                .is_some_and(|rest| rest.starts_with('='))
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Return a per-user fallback state directory under the system temporary directory.
@@ -459,13 +543,77 @@ fn verify_trusted_log_dir(
     ))
 }
 
+/// Open (or create with mode `0700`) a private directory, rejecting `..` traversal,
+/// symlinks, and untrusted or group/world-writable intermediate directories.
+///
+/// Walks every component of `dir_path` using `openat` with `O_NOFOLLOW | O_DIRECTORY`
+/// and verifies ownership/permissions via [`verify_trusted_log_dir`] before returning
+/// the opened directory handle.
+#[cfg(unix)]
+pub fn open_trusted_dir(dir_path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use nix::fcntl::{OFlag, open, openat};
+    use nix::sys::stat::{Mode, mkdirat};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Component;
+
+    for comp in dir_path.components() {
+        if matches!(comp, Component::ParentDir) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "refusing directory path containing '..' traversal",
+            ));
+        }
+    }
+
+    let euid = nix::unistd::geteuid().as_raw();
+    let start = if dir_path.is_absolute() { "/" } else { "." };
+    let start_fd = open(
+        start,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    let mut dir_file = std::fs::File::from(start_fd);
+    let mut under_sticky_dir = false;
+    verify_trusted_log_dir(&dir_file, euid, &mut under_sticky_dir)?;
+
+    for comp in dir_path.components() {
+        let Component::Normal(part) = comp else {
+            continue;
+        };
+        let dir_flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+        let (next_fd, created) = match openat(&dir_file, part, dir_flags, Mode::empty()) {
+            Ok(fd) => (fd, false),
+            Err(nix::errno::Errno::ENOENT) => {
+                let created = match mkdirat(&dir_file, part, Mode::from_bits_truncate(0o700)) {
+                    Ok(()) => true,
+                    Err(nix::errno::Errno::EEXIST) => false,
+                    Err(e) => return Err(std::io::Error::from(e)),
+                };
+                let fd = openat(&dir_file, part, dir_flags, Mode::empty())
+                    .map_err(std::io::Error::from)?;
+                (fd, created)
+            }
+            Err(e) => return Err(std::io::Error::from(e)),
+        };
+        let next_dir = std::fs::File::from(next_fd);
+        if created {
+            let _ = next_dir.set_permissions(std::fs::Permissions::from_mode(0o700));
+        }
+        verify_trusted_log_dir(&next_dir, euid, &mut under_sticky_dir)?;
+        dir_file = next_dir;
+    }
+
+    Ok(dir_file)
+}
+
 /// Open (or create) a private log file with `0600` permissions (and `0700` newly created parent
 /// directories).
 ///
 /// On Unix, this rejects `..` traversal components, walks every parent component from `/` (or `.`)
-/// using `openat` with `O_NOFOLLOW | O_DIRECTORY`, verifies ownership and write permissions of
-/// every intermediate directory descriptor via `fstat`, and opens the final file via `openat`
-/// (`O_NOFOLLOW | O_NONBLOCK`) from the verified parent directory descriptor.
+/// using [`open_trusted_dir`] with `O_NOFOLLOW | O_DIRECTORY`, verifies ownership and write
+/// permissions of every intermediate directory descriptor via `fstat`, and opens the final file
+/// via `openat` (`O_NOFOLLOW | O_NONBLOCK`) from the verified parent directory descriptor.
 pub fn open_private_log_file(log_path: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::path::Component;
 
@@ -486,8 +634,8 @@ pub fn open_private_log_file(log_path: &std::path::Path) -> std::io::Result<std:
 
     #[cfg(unix)]
     {
-        use nix::fcntl::{FcntlArg, OFlag, fcntl, open, openat};
-        use nix::sys::stat::{Mode, mkdirat};
+        use nix::fcntl::{FcntlArg, OFlag, fcntl, openat};
+        use nix::sys::stat::Mode;
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         let file_name = log_path.file_name().ok_or_else(|| {
@@ -502,44 +650,7 @@ pub fn open_private_log_file(log_path: &std::path::Path) -> std::io::Result<std:
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| std::path::Path::new("."));
-        let start = if parent.is_absolute() { "/" } else { "." };
-        let start_fd = open(
-            start,
-            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(std::io::Error::from)?;
-        let mut dir_file = std::fs::File::from(start_fd);
-        let mut under_sticky_dir = false;
-        verify_trusted_log_dir(&dir_file, euid, &mut under_sticky_dir)?;
-
-        for comp in parent.components() {
-            let Component::Normal(part) = comp else {
-                continue;
-            };
-            let dir_flags =
-                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
-            let (next_fd, created) = match openat(&dir_file, part, dir_flags, Mode::empty()) {
-                Ok(fd) => (fd, false),
-                Err(nix::errno::Errno::ENOENT) => {
-                    let created = match mkdirat(&dir_file, part, Mode::from_bits_truncate(0o700)) {
-                        Ok(()) => true,
-                        Err(nix::errno::Errno::EEXIST) => false,
-                        Err(e) => return Err(std::io::Error::from(e)),
-                    };
-                    let fd = openat(&dir_file, part, dir_flags, Mode::empty())
-                        .map_err(std::io::Error::from)?;
-                    (fd, created)
-                }
-                Err(e) => return Err(std::io::Error::from(e)),
-            };
-            let next_dir = std::fs::File::from(next_fd);
-            if created {
-                let _ = next_dir.set_permissions(std::fs::Permissions::from_mode(0o700));
-            }
-            verify_trusted_log_dir(&next_dir, euid, &mut under_sticky_dir)?;
-            dir_file = next_dir;
-        }
+        let dir_file = open_trusted_dir(parent)?;
 
         let file_fd = openat(
             &dir_file,
@@ -642,15 +753,42 @@ mod tests {
 
     #[test]
     fn test_parse_server_section() {
-        let toml = "[server]\nreconnect_timeout = 3600\n";
+        let toml =
+            "[server]\nreconnect_timeout = 3600\nconnect_timeout = 120\nsignal_timeout = 30\n";
         let cfg: Config = toml::from_str(toml).unwrap();
         assert_eq!(cfg.server.reconnect_timeout, Some(3600));
+        assert_eq!(cfg.server.connect_timeout, Some(120));
+        assert_eq!(cfg.server.signal_timeout, Some(30));
+    }
+
+    #[test]
+    fn test_parse_zero_and_client_timeout_options() {
+        let toml = r#"
+            [client]
+            reconnect_timeout = 0
+            connect_timeout = 90
+
+            [server]
+            reconnect_timeout = 0
+            connect_timeout = 0
+            signal_timeout = 0
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.client.reconnect_timeout, Some(0));
+        assert_eq!(cfg.client.connect_timeout, Some(90));
+        assert_eq!(cfg.server.reconnect_timeout, Some(0));
+        assert_eq!(cfg.server.connect_timeout, Some(0));
+        assert_eq!(cfg.server.signal_timeout, Some(0));
     }
 
     #[test]
     fn test_server_section_default() {
         let cfg: Config = toml::from_str("").unwrap();
         assert!(cfg.server.reconnect_timeout.is_none());
+        assert!(cfg.server.connect_timeout.is_none());
+        assert!(cfg.server.signal_timeout.is_none());
+        assert!(cfg.client.reconnect_timeout.is_none());
+        assert!(cfg.client.connect_timeout.is_none());
     }
 
     #[test]
@@ -727,8 +865,12 @@ reverse_forward = []\n\
 env = []\n\
 x11 = false\n\
 x11_trusted = false\n\
+reconnect_timeout = 345600\n\
+connect_timeout = 60\n\
 [server]\n\
-reconnect_timeout = 1800\n\
+reconnect_timeout = 345600\n\
+connect_timeout = 60\n\
+signal_timeout = 0\n\
 address_family = \"auto\"\n";
         let (merged, additions) = merge_defaults(existing);
         assert!(additions.is_empty(), "unexpected additions: {additions:?}");
@@ -751,11 +893,37 @@ address_family = \"auto\"\n";
 # env = []\n\
 # x11 = false\n\
 # x11_trusted = false\n\
+# reconnect_timeout = 345600\n\
+# connect_timeout = 60\n\
 [server]\n\
-# reconnect_timeout = 1800\n\
+# reconnect_timeout = 345600\n\
+# connect_timeout = 60\n\
+# signal_timeout = 0\n\
 # address_family = \"auto\"\n";
         let (_, additions) = merge_defaults(existing);
         assert!(additions.is_empty(), "unexpected additions: {additions:?}");
+    }
+
+    #[test]
+    fn test_merge_defaults_is_section_aware() {
+        // Having `reconnect_timeout` under `[server]` must NOT suppress adding
+        // `[client]`'s `reconnect_timeout` (and vice versa), and a second merge
+        // must be idempotent.
+        let existing = "[server]\nreconnect_timeout = 345600\n";
+        let (merged, additions) = merge_defaults(existing);
+        assert!(additions.contains(&"reconnect_timeout"));
+        assert!(additions.contains(&"connect_timeout"));
+        assert!(additions.contains(&"signal_timeout"));
+        let client_part = merged.split("[server]").next().unwrap();
+        let server_part = merged.split("[server]").nth(1).unwrap();
+        assert!(client_part.contains("reconnect_timeout = 345600"));
+        assert_eq!(
+            server_part.matches("reconnect_timeout").count(),
+            1,
+            "server section already had reconnect_timeout"
+        );
+        let (_, second_additions) = merge_defaults(&merged);
+        assert!(second_additions.is_empty());
     }
 
     #[test]

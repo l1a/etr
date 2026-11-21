@@ -1,4 +1,4 @@
-.TH "ETRS" "1" "" "etr 0.10.24" "User Commands"
+.TH "ETRS" "1" "" "etr 0.11.0" "User Commands"
 
 .SH "NAME"
 .PP
@@ -34,10 +34,16 @@ parent process exits immediately (allowing the SSH connection to close
 cleanly)\. The child detaches from stdio, redirects stderr to its log file,
 and enters the session loop\.
 .PP
-The session loop keeps the PTY and shell alive across reconnects for up to
-30 minutes\. If the client reconnects, it presents the same session ID and
-passkey to resume\. When the client cleanly disconnects (or the reconnect
-window expires), the child exits\.
+The session loop waits up to \fB60 seconds\fP (configurable via
+\fB\-\-connect\-timeout\fP) for the client's first authenticated QUIC connection,
+then keeps the PTY and shell alive across reconnects for up to \fB96 hours\fP
+(\fB4 days\fP / \fB345600\fP seconds by default; \fB0\fP disables the timeout so the
+session stays alive indefinitely)\. If the client reconnects, it presents the
+same session ID and passkey to resume\. When the client cleanly disconnects, a
+timeout expires, or \fBSIGUSR1\fP arrives while disconnected (past
+\fB\-\-signal\-timeout\fP), the child exits\. Use \fB\-\-list\fP and \fB\-\-clean\fP
+to inspect or safely terminate disconnected sessions without disturbing active
+connections\.
 
 .SH "OPTIONS"
 \fB\fB\-p\fP, \fB\-\-port\fP \fIPORT\fP\fP
@@ -94,9 +100,51 @@ Path to the server log file\. Defaults to \fB$XDG_STATE_HOME/etr/etrs\.log\fP\.
 .RS
 .PP
 How long (in seconds) to keep a session alive while the client is
-disconnected\. Defaults to \fB1800\fP (30 minutes)\. Override priority:
-CLI flag > \fBETR_SERVER_NETWORK_TMOUT\fP > \fBreconnect_timeout\fP under
+disconnected\. Set to \fB0\fP to stay alive indefinitely\. Defaults to
+\fB345600\fP (96 hours / 4 days)\. Override priority: server CLI flag >
+client bootstrap override (\fBetr \-\-reconnect\-timeout\fP / \fB[client]\fP) >
+\fBETR_SERVER_NETWORK_TMOUT\fP > \fBreconnect_timeout\fP under \fB[server]\fP
+in config file > default\.
+.RE
+\fB\fB\-\-connect\-timeout\fP \fISECS\fP\fP
+.RS
+.PP
+How long (in seconds) to wait for the client's first authenticated QUIC
+connection after SSH bootstrap before shutting down\. Set to \fB0\fP to
+disable the initial timeout\. Defaults to \fB60\fP\. Override priority:
+server CLI flag > client bootstrap override (\fBetr \-\-connect\-timeout\fP /
+\fB[client]\fP) > \fBETR_SERVER_CONNECT_TMOUT\fP > \fBconnect_timeout\fP under
 \fB[server]\fP in config file > default\.
+.RE
+\fB\fB\-\-signal\-timeout\fP \fISECS\fP\fP
+.RS
+.PP
+Minimum number of seconds a session must have been waiting or disconnected
+before \fBSIGUSR1\fP terminates it (connected sessions always ignore
+\fBSIGUSR1\fP)\. Defaults to \fB0\fP (any disconnected session exits on
+\fBSIGUSR1\fP)\. Override priority: CLI flag > \fBETR_SERVER_SIGNAL_TMOUT\fP >
+\fBsignal_timeout\fP under \fB[server]\fP in config file > default\.
+.RE
+\fB\fB\-\-list\fP\fP
+.RS
+.PP
+List live \fBetrs\fP sessions recorded under
+\fB$XDG_STATE_HOME/etr/sessions/\fP (auto\-pruning stale records from exited
+processes), showing PID, state (\fBwaiting\fP, \fBconnected\fP, \fBdisconnected\fP),
+QUIC port, mode, uptime, peer IP, idle duration, and active timeout, then
+exit\.
+.RE
+\fB\fB\-\-clean\fP\fP
+.RS
+.PP
+Terminate waiting/disconnected \fBetrs\fP sessions safely by sending
+\fBSIGUSR1\fP (connected sessions ignore \fBSIGUSR1\fP), then exit\.
+.RE
+\fB\fB\-\-older\-than\fP \fISECS\fP\fP
+.RS
+.PP
+When used with \fB\-\-clean\fP, only signal sessions that have been waiting
+or disconnected for at least \fISECS\fP seconds\.
 .RE
 \fB\fB\-h\fP, \fB\-\-help\fP\fP
 .RS
@@ -115,6 +163,11 @@ Print version and exit\.
 Server log file (XDG_STATE_HOME honoured)\. Written after the child
 forks\. Follow with \fBtail \-f\fP to monitor a running session\.
 .RE
+\fB\fB~/\.local/state/etr/sessions/\fP\fP
+.RS
+Per\-user directory (mode 0700) holding active session metadata files
+(`\f[CR]<pid>\.toml\fP`, mode 0600) used by \fB\-\-list\fP and \fB\-\-clean\fP\.
+.RE
 
 .SH "ENVIRONMENT"
 \fB\fBSHELL\fP\fP
@@ -123,12 +176,39 @@ Shell to launch for the PTY session\. Defaults to \fB/bin/bash\fP if unset\.
 .RE
 \fB\fBETR_SERVER_NETWORK_TMOUT\fP\fP
 .RS
-How long (in seconds) to keep a session alive while disconnected if
-\fB\-\-reconnect\-timeout\fP is not specified\.
+How long (in seconds, \fB0\fP = forever) to keep a session alive while
+disconnected if \fB\-\-reconnect\-timeout\fP and a client override are not
+specified\.
+.RE
+\fB\fBETR_SERVER_CONNECT_TMOUT\fP\fP
+.RS
+How long (in seconds, \fB0\fP = forever) to wait for the client's first
+authenticated connection if \fB\-\-connect\-timeout\fP and a client override
+are not specified\.
+.RE
+\fB\fBETR_SERVER_SIGNAL_TMOUT\fP\fP
+.RS
+Minimum seconds disconnected before \fBSIGUSR1\fP terminates the daemon, if
+\fB\-\-signal\-timeout\fP is not specified\.
 .RE
 \fB\fBXDG_STATE_HOME\fP\fP
 .RS
-Base directory for the log file\. Defaults to \fB~/\.local/state\fP\.
+Base directory for the log file and session registry\. Defaults to
+\fB~/\.local/state\fP\.
+.RE
+
+.SH "SIGNALS"
+\fB\fBSIGTERM\fP, \fBSIGHUP\fP\fP
+.RS
+Cleanly shut down the \fBetrs\fP session immediately (closing any active
+connection, hanging up the shell process group, and recording a utmp logout)\.
+.RE
+\fB\fBSIGUSR1\fP\fP
+.RS
+Terminate the daemon \fBonly\fP if it is currently waiting or disconnected
+(and has been disconnected for at least \fBsignal_timeout\fP seconds)\.
+Connected sessions ignore \fBSIGUSR1\fP, making `\f[CR]pkill \-USR1 \-x etrs\fP` (or
+`\f[CR]etrs \-\-clean\fP`) safe to run from inside an active session\.
 .RE
 
 .SH "SECURITY"
