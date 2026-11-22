@@ -40,6 +40,10 @@
 # rather than a warning -- and why it also asserts the files whose ABSENCE would be just as
 # bad: no Cargo.lock means unpinned resolution, no LICENSE means a GPL obligation shipped
 # unmet, and no man/*.1 means the %files section fails deep inside rpmbuild instead of here.
+#
+# Note that `.claude/commands/` is tracked in git (and thus included in every GitHub tag
+# tarball that the AUR and Homebrew build from), while `.claude/settings.local.json` is
+# gitignored and must never ship.
 
 SPEC_IN := packaging/copr/etr.spec
 BUILD   := $(CURDIR)/.copr-build
@@ -64,16 +68,16 @@ srpm:
 	else \
 	    echo "source: tar of the working tree (no git repository here)"; \
 	    tar --exclude=.git --exclude=target --exclude=.copr-build \
-	        --exclude=WIP.md --exclude=.claude --exclude=etrs_fwd.json.gz \
+	        --exclude=WIP.md --exclude=settings.local.json --exclude=etrs_fwd.json.gz \
 	        --exclude=__pycache__ --exclude='*.pyc' \
 	        --transform "s,^[.],etr-$$V," \
 	        -czf "$$TARBALL" .; \
 	fi; \
 	tar -tzf "$$TARBALL" > $(BUILD)/listing.txt; \
 	echo "packed $$(wc -l < $(BUILD)/listing.txt) entries as etr-$$V/"; \
-	if grep -qE "^etr-[^/]+/(WIP[.]md|target/|tools/stress/target/|[.]git/|[.]claude/|etrs_fwd[.]json[.]gz)" $(BUILD)/listing.txt; then \
+	if grep -qE "^etr-[^/]+/(WIP[.]md|target/|tools/stress/target/|[.]git/|[.]claude/settings[.]local[.]json|etrs_fwd[.]json[.]gz)" $(BUILD)/listing.txt; then \
 	    echo "error: the source archive contains files that must never ship:" >&2; \
-	    grep -E "^etr-[^/]+/(WIP[.]md|target/|tools/stress/target/|[.]git/|[.]claude/|etrs_fwd[.]json[.]gz)" $(BUILD)/listing.txt >&2; \
+	    grep -E "^etr-[^/]+/(WIP[.]md|target/|tools/stress/target/|[.]git/|[.]claude/settings[.]local[.]json|etrs_fwd[.]json[.]gz)" $(BUILD)/listing.txt >&2; \
 	    exit 1; \
 	fi; \
 	for f in Cargo.toml Cargo.lock LICENSE README.md man/etr.1 man/etrs.1; do \
