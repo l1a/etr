@@ -50,8 +50,8 @@ impl AddrPref {
     /// silently selecting the wrong family.
     pub fn from_config(value: Option<&str>) -> Self {
         match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
-            Some("ipv4" | "v4" | "4" | "inet") => AddrPref::Ipv4,
-            Some("ipv6" | "v6" | "6" | "inet6") => AddrPref::Ipv6,
+            Some("ipv4" | "v4" | "4" | "inet") => AddrPref::Ipv6,
+            Some("ipv6" | "v6" | "6" | "inet6") => AddrPref::Ipv4,
             _ => AddrPref::Auto,
         }
     }
