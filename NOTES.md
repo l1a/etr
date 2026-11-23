@@ -27,14 +27,13 @@ the link drops.  This project uses **QUIC** (via the `quinn` crate) for the tran
 layer, which provides reliable, ordered, multiplexed streams with congestion control
 and TLS 1.3 built-in.
 
-## Current state: v0.11.2
+## Current state: v0.11.3
 
-`main` carries **0.11.1** (also the newest released tag, live on GitHub, crates.io, the AUR,
-COPR, Homebrew, and Scoop); this branch (`fix/list-ipv6-and-clean-wait`) bumps to
-**0.11.2**, dynamically sizing `etrs --list` columns so full IPv6 peers never overflow into
-adjacent columns, and extending `etrs --clean`'s exit-wait window (`3.0` s) past
-`hangup_child`'s 1 s `SIGHUP`-to-`SIGKILL` escalation so HUP-ignoring interactive shells do
-not trigger false "still running" warnings.
+`main` carries **0.11.2** (also the newest released tag, live on GitHub, crates.io, the AUR,
+COPR, Homebrew, and Scoop); this branch (`chore/claude-review-posting`) bumps to **0.11.3** and
+ports the hardened `Claude Code Review` workflow and `.claude/commands/ci-code-review.md` command
+(from `retch` `v0.23.5`) so same-repo and Dependabot PRs are reviewed and findings posted inline
+with no shell/`gh`/network access.
 
 The full round trip works on Linux and macOS: SSH bootstrap, QUIC session with pinned
 certificate, PTY, keepalives, reconnect after a drop, `-L`/`-R` TCP and UDP forwarding,
@@ -839,15 +838,53 @@ artefacts that only exist once the GitHub release has been built.
   sat in this file for eight releases — one of them turning into a real newline and **splitting
   a paragraph in half**, which is why review never caught it: the file still rendered, just
   wrongly. Write `chr(92)` in Python; never a backslash literal in a shell string.
-- **Claude Code Review runs automatically on same-repo `pull_request` events and on `workflow_dispatch`.**
-  The job skips fork PRs (`github.event.pull_request.head.repo.full_name == github.repository`) so
-  untrusted forks without secrets do not fail, and `prompt:` resolves
-  `${{ inputs.pr || github.event.pull_request.number }}` so both automatic PR triggers and manual
-  `gh workflow run claude-code-review.yml -f pr=<number>` dispatches target the right PR. Note that
-  `anthropics/claude-code-action` requires `.github/workflows/claude-code-review.yml` to match the
-  default branch and skips with `Workflow validation failed` on any PR that edits the workflow file
-  itself; the `Report whether the review actually ran` step makes that visible in the job summary
-  and log.
+- **Hardened Claude Code Review workflow (`v0.11.3`, ported from `retch`).** Runs
+  automatically on same-repo `pull_request` events and manual `workflow_dispatch` (skipping
+  forks before checkout on every event via `isCrossRepository`, and keeping
+  `pull-requests: read` because comments post with the OIDC Claude GitHub App token).
+  - **Custom command + inline tool + model pinning:** Uses `.claude/commands/ci-code-review.md`
+    (a copy of `anthropics/claude-plugins-official@c905cd8` `code-review` with edits) invoked
+    with `--comment`, `--model claude-opus-5-5`, `--permission-mode default`, and
+    `--allowedTools "mcp__github_inline_comment__create_inline_comment"`. The upstream plugin
+    never posted without `--comment`, skipped Dependabot PRs in Step 1, ran as Sonnet by
+    default (skipping subagents), and `claude-code-action` installs the inline-comment MCP
+    server only when named in `claude_args --allowedTools` (and never on `workflow_dispatch`).
+  - **Workspace & tool confinement:** The root is always the API-resolved base branch, the
+    PR head is checked out under `.ci-review/head/`, **both** checkouts set
+    `persist-credentials: false` (because `actions/checkout@v7` stores `GITHUB_TOKEN` under
+    `$RUNNER_TEMP` via `includeIf.gitdir:...`, which `claude-code-action@f3b070c8`'s
+    `replaceCheckoutCredentials` misses since it only unsets v6 `include.path`), all
+    config-like files (`CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `.claude/`, `.claude.json`,
+    `.mcp.json`) are deleted from `.ci-review/head/`, and PR metadata/diff are pre-fetched by a
+    plain workflow step into `.ci-review/`. `REVIEW_DENY` and `--disallowedTools` remove shell,
+    web, and write tools and explicitly deny non-workspace system/runner paths (`/proc/**`,
+    `/etc/**`, `/sys/**`, `/dev/**`, `/var/**`, `/run/**`, `/root/**`, `/tmp/**`,
+    `/home/runner/.*`, `/home/runner/.*/**`, `~/.*`, `~/.*/**`, `/home/runner/work/_*/**`, `/${{ runner.temp }}/**`) plus repo `.git/**`
+    and `**/.git/**` across `Read`, `Grep`, and `Glob` (without denying `/home/runner/**` wholesale, which
+    contains `$GITHUB_WORKSPACE`); a guard step fails the job if `.claude/settings.json` ever
+    gains an uncovered allow rule. `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` is deliberately NOT set
+    because the `claude` CLI hard-requires `bubblewrap` (not pre-installed on `ubuntu-latest`
+    unless `allowed_non_write_users` runs its apt step) and this session removes `Bash`.
+  - **Foreground-only subagents (`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '1'`):**
+    `claude-code-action`'s `run-claude-sdk.ts` breaks out of the SDK stream on the first
+    `result` message, so backgrounded Step 4 reviewers end the session mid-review before
+    Steps 5–9 run. Setting `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '1'` in `jobs.claude-review.env`
+    and requiring single-turn parallel foreground subagents prevents premature termination.
+  - **Clean reviews and dispatched runs post nothing (with summary secret redaction):**
+    `just merge-pr` treats any `^claude` top-level comment as a finding, so clean runs post
+    nothing and findings use inline comments; `workflow_dispatch` omits the inline tool and
+    reports findings in the job summary via `Report whether the review actually ran`, which
+    applies `redact_secrets()` (matching `claude-code-action`'s `sanitizer.ts` token patterns
+    plus `Authorization` headers) before printing the final `result` text to the job log and
+    `$GITHUB_STEP_SUMMARY`.
+    **Standing pin-bump hazard:** before merging any Dependabot bump of
+    `anthropics/claude-code-action`, inspect `gh api repos/anthropics/claude-code-action/compare/<old>...<new>`
+    across `src/mcp/install-mcp-server.ts`, `src/modes/agent/parse-tools.ts`,
+    `base-action/src/parse-sdk-options.ts`, `base-action/src/run-claude-sdk.ts`,
+    `src/github/operations/restore-config.ts`, and `src/entrypoints/run.ts` — upstream updates
+    can silently break inline-tool installation, model defaults, SDK loop termination, or config
+    restoration (`anthropics/claude-code-action` skips PRs modifying `claude-code-review.yml`
+    until merged to `main`).
 - **On Windows, `Path::canonicalize` returns a verbatim prefix (`\\?\…`) on which `PathBuf::join("..")`
   pops the parent component in-place instead of appending `Component::ParentDir`** (v0.10.18).
   Win32 verbatim paths bypass Windows path normalization, so Rust's `PathBuf::push` normalizes `.`
