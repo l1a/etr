@@ -5,7 +5,7 @@
 # locally rather than after a push. This is a REAL git hook rather than editor or agent
 # configuration on purpose: it fires for a human, for Claude Code, for Gemini CLI and for
 # anything else that runs `git push`, because it is git plumbing. Anything under `.claude/`
-# binds one vendor's tool and is invisible to every other — see AGENTS.md Part 1 §1.
+# binds one vendor's tool and is invisible to every other — see AGENTS.md Part 1, STEP ONE item 3.
 #
 # To skip for a single push:  GIT_NO_CHECK=1 git push ...
 # To disable permanently:     remove .git/hooks/pre-push

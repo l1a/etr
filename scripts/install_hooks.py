@@ -9,7 +9,7 @@ an `sh` on PATH. This needs only an interpreter.
 
 **Why the hooks are tracked at all.** Until now etr had no `scripts/hooks/` directory: a
 `pre-push` hook existed in one machine's `.git/hooks/`, untracked, so it was unreproducible
-and no fresh clone got a gate. `AGENTS.md` Part 1 §1 leans on real git hooks as *the*
+and no fresh clone got a gate. `AGENTS.md` Part 1, STEP ONE item 3 leans on real git hooks as *the*
 agent-agnostic enforcement layer, which only holds if the hook is in the repository.
 
 Existing hooks are backed up rather than clobbered — someone may have a local hook that is

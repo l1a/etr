@@ -29,6 +29,7 @@ gh run watch "$(gh run list --workflow=release.yml --limit 1 --json databaseId -
 just publish                                                        # crates.io -> AUR -> Homebrew -> Scoop
                                                                     # refuses unless HEAD == tag v<VERSION>
 ```
+- **Before tagging:** Remove residual profiling/test artifacts (`.json.gz`, `*.profdata`, temporary logs; `just clean` removes `etrs_fwd.json.gz`).
 - **Prerequisites:** AUR SSH key for `etr-terminal-bin`, push access to `l1a/homebrew-etr` & `l1a/scoop-etr`, COPR `kentobias/etr` with **"Enable internet access during builds" ON** + non-empty `COPR_{LOGIN,USERNAME,TOKEN}` secrets (`copr.yml` skips on forks, fails on `l1a/etr`). COPR API token expires **2027-02-27** (renew CLI config and GitHub secrets together).
 - **Verify all 6 channels after publish:**
   - `gh release view vX.Y.Z`

@@ -336,7 +336,7 @@ open-pr *ARGS:
     #
     # This recipe is the only thing that can gate PR creation: neither `gh` nor `git` has a
     # hook for "a PR is about to open". Being a justfile recipe rather than editor or agent
-    # configuration, it binds every contributor and tool identically -- AGENTS.md Part 1 §1.
+    # configuration, it binds every contributor and tool identically -- AGENTS.md Part 1, STEP ONE item 3.
     # This repo previously asked for that discipline in prose instead, which binds nobody.
     just pr
 
