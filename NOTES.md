@@ -74,6 +74,10 @@ Standing project state for **etr**: architecture invariants, current status, kno
 - **`WIP.md` LF & markers:** `reset_wip.py` reads/writes bytes and anchors `<!-- BEGIN/END merge-pr state -->` to full lines; `just wip-check` catches CRLF in gitignored `WIP.md`.
 - *(Full 6-channel packaging, AUR clone verification, COPR `HOME=/builddir` + explicit tar rules, `--cleanup=verbatim`, and Claude Code Review specs live in `docs/RELEASE.md` & `~/.agents/docs/ops/rust-ci-packaging.md`.)*
 
+### 5. CI & Claude Code Review Hardening
+- **Two-checkout isolation & fork guard:** `claude-code-review.yml` checks out the API-resolved base branch at workspace root and PR head under `.ci-review/head/` with `persist-credentials: false` on both (narrower designs leaked credentials or workspace rules), refuses cross-repo PRs before checkout, and strips `CLAUDE*.md`, `AGENTS.md`, `.claude/`, `.claude.json`, and `.mcp.json` from head.
+- **Tool boundary & foreground subagents:** Pin `--model claude-opus-5-5` (Sonnet skips subagents while still reporting clean), `--permission-mode default` with `--allowedTools` scoped solely to inline comments, `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` (keeps subagents foregrounded so `claude-code-action` does not exit early), and `use_sticky_comment: false` (clean runs post no top-level comment). Interactive `claude.yml` pins `--permission-mode acceptEdits` explicitly so `--allowedTools` remains a strict boundary.
+
 ---
 
 ## Test coverage (182 tests)

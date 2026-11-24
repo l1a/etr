@@ -59,7 +59,7 @@ Run `just merge-pr` (standalone) once authorized: merges via `gh`, switches to `
 ---
 
 ## 5. Sandbox Exceptions (`BypassSandbox: true`)
-Per Part 1 and `~/AGENTS.md` §3, pass `BypassSandbox: true` on the **first** invocation of:
+Per `~/AGENTS.md` §3, pass `BypassSandbox: true` on the **first** invocation of:
 - **All `gh` / `ghpub` commands** (`gh pr`, `gh run`, `gh workflow`, `gh api`, `gh issue`, `gh release`).
 - **All `git` write or remote commands** (`checkout`, `switch`, `branch`, `add`, `rm`, `mv`, `commit`, `merge`, `rebase`, `tag`, `fetch`, `pull`, `push`).
 - **`just` shebang, network, and E2E/tmux recipes:** `just pr` / `PR_CONFIRM=y just pr`, `just open-pr` (always pass `--fill` or explicit `--title ... --body-file ...` in PTYs), `just merge-pr`, `just prune-branches`, `just github-metadata`, `just publish`, `just aur-publish`/`publish-aur`, `just brew-publish`/`publish-brew`, `just scoop-publish`/`publish-scoop`, `just audit`, `just install-tag`, `just clean`, `just clean-procs`, `just check-tools`, `just e2e-local`, `just e2e-env-local`, `just e2e-cmd-local`, `just e2e-family-local`, `just e2e-forward-local`, `just e2e-reverse-local`, `just e2e-udp-concurrent`, `just e2e-timeouts-local`, `just throughput-local`, `just throughput-remote`, `just stress-local`, `just stress-udp-rate`.

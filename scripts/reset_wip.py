@@ -3,7 +3,7 @@
 """Reset WIP.md's generated state block after merging a feature branch to main, and guard its line endings.
 
 WIP.md is the gitignored, Syncthing-synced cross-machine handoff file (`AGENTS.md` Part 1
-section 3). Two things follow from "gitignored" that make this script carry more than a
+§2). Two things follow from "gitignored" that make this script carry more than a
 couple of substitutions.
 
 WHY A MARKED BLOCK, AND NOT THE OLD TWO SUBSTITUTIONS. This script owns exactly ONE block of
