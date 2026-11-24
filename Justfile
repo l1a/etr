@@ -183,7 +183,7 @@ text-check:
 # `.gitattributes` pins `* text=auto eol=lf` and `text-check` refuses a carriage return in
 # tracked text -- but both work through git, and `git ls-files` never offers a gitignored
 # path. `WIP.md` is gitignored (it is the Syncthing-synced cross-machine handoff file that
-# AGENTS.md Part 1 section 3 mandates), and `scripts/reset_wip.py` rewrites it on every
+# AGENTS.md Part 1 §2 mandates), and `scripts/reset_wip.py` rewrites it on every
 # `just merge-pr`, so it is exactly the file most likely to pick up the wrong bytes and least
 # likely to be noticed doing it.
 #
@@ -217,7 +217,7 @@ scoop-check:
     @"{{PY}}" scripts/scoop_check.py
 
 # Pre-PR gate: run all automated checks and print manual checklist before opening a PR.
-# All items must pass before calling `gh pr create`. See AGENTS.md Part 2 §4.
+# All items must pass before calling `gh pr create`. See AGENTS.md Part 2 §3.
 pr:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -294,7 +294,7 @@ pr:
     echo "  [ ] README.md reviewed and updated (new features, install steps, platform notes)"
     echo "  [ ] NOTES.md: Current state, known gaps, hard-won lessons, test-coverage count"
     echo "  [ ] WIP.md reflects what is in flight (not a session log -- see its own header)"
-    echo "  [ ] GitHub wiki cloned and updated (etr.wiki.git — see AGENTS.md §4.11 for page list)"
+    echo "  [ ] GitHub wiki cloned and updated (etr.wiki.git — see docs/RELEASE.md §1 for page list)"
     echo ""
     # A bare `read` makes this gate unanswerable by anything that is not a human at a
     # terminal: a script, CI job or agent blocks on a stdin that will never answer, or dies
@@ -336,7 +336,7 @@ open-pr *ARGS:
     #
     # This recipe is the only thing that can gate PR creation: neither `gh` nor `git` has a
     # hook for "a PR is about to open". Being a justfile recipe rather than editor or agent
-    # configuration, it binds every contributor and tool identically -- AGENTS.md Part 1 §4.
+    # configuration, it binds every contributor and tool identically -- AGENTS.md Part 1, STEP ONE item 3.
     # This repo previously asked for that discipline in prose instead, which binds nobody.
     just pr
 
@@ -923,7 +923,7 @@ build-stress:
 # packaged page depend on which mandown build happened to run.
 #
 # The consequence to remember: the .TH line embeds the version, so EVERY version bump
-# dirties these two files. That is why AGENTS.md §4.10 says to re-run `just man` after the
+# dirties these two files. That is why AGENTS.md Part 2 §3 says to re-run `just man` after the
 # bump, and why `man-check` below is wired into `just check` — a stale committed page is now
 # a failing gate rather than an invisible wart.
 
@@ -2868,7 +2868,7 @@ clean:
     # build/dev output it leaves behind, so "clean" never actually cleaned them:
     rm -rf man/build                 # rebuilt by `just man`
     rm -rf tools/stress/target       # a separate crate, invisible to the root clean
-    rm -f etrs_fwd.json.gz           # profile capture; AGENTS.md 4.10 wants it gone before tagging
+    rm -f etrs_fwd.json.gz           # profile capture; docs/RELEASE.md §3 wants it gone before tagging
     # Plain `echo`, not `@echo`: the `@` line-suppression prefix is just's syntax for
     # NON-shebang recipes. Inside a `#!/usr/bin/env bash` recipe it is handed to bash
     # verbatim, which fails with `@echo: command not found` and exit 127 -- after the
