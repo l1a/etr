@@ -47,7 +47,7 @@ Welcome! This file governs all AI assistants (`Claude`, `Gemini`, etc.) contribu
 - **Tests & Docs:** Document new `pub` items with `///` and explain *why* in non-obvious bodies. Add unit tests for new/changed functions, regression tests for bug fixes, E2E/benchmark notes for lifecycle/protocol/perf changes, and `--help`/completions checks for CLI flags.
 
 ## 3. Pre-PR Gate (`just pr` / `just open-pr`)
-Before opening or updating a PR, run `just pr` (or `just open-pr`, passing `--fill` or `--title ... --body-file ...` in Antigravity PTYs). Two items are **unconditional** on every PR (including doc/test/chore PRs):
+Before opening or updating a PR, run `just pr` (or `just open-pr`, passing `--fill` or `--title ... --body-file ...` in Antigravity PTYs). All four items below are **unconditional** on every PR (including doc/test/chore PRs):
 1. **Version bump:** Bump `Cargo.toml` (patch for fixes/docs/tests/CI/deps, minor for new features) and commit `Cargo.lock` (`cargo check`).
 2. **Man page regen:** Run `just man` (requires `mandown`) and commit `man/etr.1` and `man/etrs.1` (`just man-check` verifies both worktree and `HEAD`).
 3. **`NOTES.md` header & rules:** Update `## Current state: v<version>` header at column 1 (enforced by `just pr`); update state/gaps/lessons/test-count **only** when enduring state or rules change (`NOTES.md` is not a changelog — delete finished gap items rather than striking through).
