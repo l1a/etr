@@ -5,9 +5,9 @@ Standing project state for **etr**: architecture invariants, current status, kno
 
 ---
 
-## Current state: v0.11.4
+## Current state: v0.11.5
 
-`main` carries **0.11.3** (newest released tag **`v0.11.2`** across GitHub, crates.io, AUR, COPR, Homebrew, and Scoop); this branch (`chore/compact-agent-docs`) bumps to **`0.11.4`** to compact `AGENTS.md` / `NOTES.md` and extract `docs/RELEASE.md`.
+`main` carries **0.11.5** (newest released tag **`v0.11.2`** across GitHub, crates.io, AUR, COPR, Homebrew, and Scoop).
 
 - **Working scope:** Full round trip works on Linux and macOS (SSH bootstrap, QUIC pinned-cert session, PTY, keepalives, seamless reconnect, `-L`/`-R` TCP & UDP forwarding, X11 forwarding, `-4`/`-6` family preference). Windows client works (`etrs` is Unix-only by design). **182 tests** (178 `etr` + 4 `tools/stress`).
 - **Security hardening (`v0.10.18`):** Validates server `StreamOpen` vs `-X`/`-Y` and `-R` specs (`is_authorized_reverse_stream`); `-X` generates untrusted X11 `SECURITY` cookies (`0700` dir) and exact-display `parse_xauth_list_for_display`; atomic free X11 socket bind (`0600`, no `remove_file` TOCTOU); 10s QUIC handshake & `SessionOpen` timeouts; constant-time passkey/cookie compares (`constant_time_eq`); `utmp` writes only post-auth; filters newline/NUL and linker/shell-init env vars (`LD_PRELOAD`, `BASH_ENV`, etc.); caps concurrent UDP senders (`MAX_UDP_SENDERS = 256`); `0600`/`O_NOFOLLOW` logs (`0700` state dir) with keystroke redaction at `-vvv`.
